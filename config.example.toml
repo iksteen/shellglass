@@ -1,0 +1,23 @@
+# tmuxsnitch example config. Pass with `--config config.toml`.
+
+# Base monospace family (used when no symbol_map entry matches a character).
+default_font = "monospace"
+font_size_px = 14.0
+line_height  = 1.2
+
+# Kitty-style symbol_map: map Unicode codepoint ranges to a specific font.
+# First matching entry wins. Ranges accept "U+XXXX", "U+XXXX-U+YYYY", or "0xXXXX".
+[[symbol_map]]
+ranges = ["U+E0A0-U+E0D4", "U+E0B0-U+E0BF"]  # Powerline glyphs
+font   = "Symbols Nerd Font"
+
+[[symbol_map]]
+ranges = ["U+F000-U+F2FF"]                    # Nerd Font private-use icons
+font   = "Symbols Nerd Font"
+
+# Font sources. A `path` is embedded into the page as a base64 @font-face
+# (self-contained output). Use `system = "..."` to reference an installed family
+# instead. A family named here but with neither key is used verbatim.
+[fonts."Symbols Nerd Font"]
+# path = "/usr/share/fonts/NerdFonts/SymbolsNerdFont-Regular.woff2"
+system = "Symbols Nerd Font"

@@ -1,0 +1,14 @@
+[package]
+name = "tmuxsnitch"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.103"
+axum = "0.8.9"
+base64 = "0.22.1"
+clap = { version = "4.6.1", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.52.3", features = ["full"] }
+toml = "1.1.2"
+vt100 = "0.16.2"

@@ -1,0 +1,28 @@
+# Replicates kitty's zero-config powerline/Nerd-Font rendering.
+#
+# kitty (>=0.36) has no font config of its own here: it uses the system
+# `monospace` (Noto Sans Mono on this box) and auto-falls-back to a bundled
+# Symbols Nerd Font Mono for symbol glyphs. This config reproduces that by
+# pointing the Nerd-Font codepoint ranges at kitty's own bundled font file.
+
+default_font = "Noto Sans Mono"   # matches kitty's `monospace` default here
+font_size_px = 14.0
+line_height  = 1.2
+
+# Nerd Fonts glyphs live in the Private Use Areas. Mapping the whole PUA (plus a
+# few stray symbols NF also provides) mirrors kitty's catch-all fallback.
+[[symbol_map]]
+ranges = [
+  "U+E000-U+F8FF",     # BMP Private Use Area: powerline, devicons, FA, codicons, ...
+  "U+F0000-U+FFFFD",   # Plane-15 PUA-A: Material Design Icons (Nerd Fonts v3)
+  "U+23FB-U+23FE",     # IEC power symbols
+  "U+2665",            # heart (octicons)
+  "U+26A1",            # zap (octicons)
+  "U+2B58",            # power circle
+  "U+276C-U+2771",     # heavy angle brackets
+]
+font = "Symbols Nerd Font Mono"
+
+# Embed kitty's own bundled file so the page is self-contained and pixel-matches.
+[fonts."Symbols Nerd Font Mono"]
+path = "/usr/lib/kitty/fonts/SymbolsNerdFontMono-Regular.ttf"
