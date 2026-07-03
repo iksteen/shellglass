@@ -93,12 +93,9 @@ fn run(
         let _ = writeln!(stdin, "refresh-client -C {}x{}", state.width, state.height);
     }
 
-    let stdout = match child.stdout.take() {
-        Some(s) => s,
-        None => {
-            let _ = tx.send(banner("control mode produced no stdout"));
-            return;
-        }
+    let Some(stdout) = child.stdout.take() else {
+        let _ = tx.send(banner("control mode produced no stdout"));
+        return;
     };
 
     // Reader thread: drain the control stream into a channel as fast as it arrives,
@@ -307,9 +304,9 @@ fn unescape(b: &[u8]) -> Vec<u8> {
             && i + 3 < b.len()
             && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c))
         {
-            let v = (b[i + 1] - b'0') as u16 * 64
-                + (b[i + 2] - b'0') as u16 * 8
-                + (b[i + 3] - b'0') as u16;
+            let v = u16::from(b[i + 1] - b'0') * 64
+                + u16::from(b[i + 2] - b'0') * 8
+                + u16::from(b[i + 3] - b'0');
             out.push(v as u8);
             i += 4;
         } else {

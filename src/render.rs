@@ -15,9 +15,9 @@ use std::fmt::Write as _;
 pub fn font_face_css(fonts: &[FontFile], url_prefix: &str) -> String {
     let mut css = String::new();
     for (i, f) in fonts.iter().enumerate() {
-        let _ = write!(
+        let _ = writeln!(
             css,
-            "@font-face {{ font-family:'{}'; src:url(\"{}{}\") format('{}'); }}\n",
+            "@font-face {{ font-family:'{}'; src:url(\"{}{}\") format('{}'); }}",
             crate::fonts::css_escape_family(&f.family),
             url_prefix,
             i,
@@ -81,7 +81,7 @@ pub fn page(template: &str, head_css: &str, fragment: &str, script: &str) -> Str
 }
 
 /// SSE updater: subscribe to `events_path` and swap `#screen` on each push.
-/// EventSource auto-reconnects if the stream drops, so no retry logic here.
+/// `EventSource` auto-reconnects if the stream drops, so no retry logic here.
 pub fn sse_script(events_path: &str) -> String {
     format!(
         "const es = new EventSource('{events_path}');\n\
@@ -387,6 +387,9 @@ fn palette(i: u8) -> (u8, u8, u8) {
 }
 
 #[cfg(test)]
+// Tests build a Config then tweak a field or two — the mutate-after-default form
+// reads better here than struct-update with ..Default::default().
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use crate::config::{Config, SymbolMap};

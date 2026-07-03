@@ -28,8 +28,7 @@ pub fn seed_parser(capture: &str, cols: u16, rows: u16, cursor: (u16, u16)) -> v
         let screen = parser.screen();
         screen
             .cell(row, col)
-            .map(pen_sgr)
-            .unwrap_or_else(|| "\x1b[m".to_string())
+            .map_or_else(|| "\x1b[m".to_string(), pen_sgr)
     };
     parser.process(format!("{pen}\x1b[{};{}H", row + 1, col + 1).as_bytes());
     parser

@@ -172,7 +172,7 @@ fn fontdb_locate(db: &Database, name: &str) -> Option<(Vec<u8>, &'static str, &'
     {
         return None;
     }
-    let (bytes, format) = db.with_face_data(id, |data, idx| sfnt_face(data, idx))??;
+    let (bytes, format) = db.with_face_data(id, sfnt_face)??;
     Some((bytes, mime_for(format), format))
 }
 
@@ -199,10 +199,10 @@ pub fn resolve_generics(config: &mut Config) {
 /// fontconfig — fall back to a cross-platform candidate list. fontdb serves the
 /// file either way, and the generic stays as the ultimate CSS fallback regardless.
 fn concrete_generic(db: &Database, generic: &str) -> Option<String> {
-    if let Some(fam) = fontconfig_default(generic) {
-        if family_installed(db, &fam) {
-            return Some(fam);
-        }
+    if let Some(fam) = fontconfig_default(generic)
+        && family_installed(db, &fam)
+    {
+        return Some(fam);
     }
     let candidates: &[&str] = match generic {
         "monospace" => &[
@@ -235,7 +235,7 @@ fn concrete_generic(db: &Database, generic: &str) -> Option<String> {
     candidates
         .iter()
         .find(|c| family_installed(db, c))
-        .map(|c| c.to_string())
+        .map(std::string::ToString::to_string)
 }
 
 /// The concrete family fontconfig resolves a CSS generic to — i.e. the OS/user
@@ -327,12 +327,12 @@ fn sfnt_face(data: &[u8], index: u32) -> Option<(Vec<u8>, &'static str)> {
     }
 
     // head.checkSumAdjustment = 0xB1B0AFBA − checksum(whole file, field zeroed).
-    if let Some(h) = head_off {
-        if out.len() >= h + 12 {
-            out[h + 8..h + 12].copy_from_slice(&[0; 4]);
-            let adj = 0xB1B0_AFBAu32.wrapping_sub(sfnt_checksum(&out));
-            out[h + 8..h + 12].copy_from_slice(&adj.to_be_bytes());
-        }
+    if let Some(h) = head_off
+        && out.len() >= h + 12
+    {
+        out[h + 8..h + 12].copy_from_slice(&[0; 4]);
+        let adj = 0xB1B0_AFBAu32.wrapping_sub(sfnt_checksum(&out));
+        out[h + 8..h + 12].copy_from_slice(&adj.to_be_bytes());
     }
 
     let format = if sfnt_ver == b"OTTO" {
@@ -392,18 +392,15 @@ fn parse_range(spec: &str) -> Result<RangeInclusive<u32>> {
             .unwrap_or(s);
         u32::from_str_radix(hex, 16).with_context(|| format!("bad codepoint {s:?}"))
     };
-    match spec.split_once('-') {
-        Some((a, b)) => {
-            let (lo, hi) = (parse_cp(a)?, parse_cp(b)?);
-            if lo > hi {
-                bail!("range start > end in {spec:?}");
-            }
-            Ok(lo..=hi)
+    if let Some((a, b)) = spec.split_once('-') {
+        let (lo, hi) = (parse_cp(a)?, parse_cp(b)?);
+        if lo > hi {
+            bail!("range start > end in {spec:?}");
         }
-        None => {
-            let cp = parse_cp(spec)?;
-            Ok(cp..=cp)
-        }
+        Ok(lo..=hi)
+    } else {
+        let cp = parse_cp(spec)?;
+        Ok(cp..=cp)
     }
 }
 
@@ -427,6 +424,9 @@ pub(crate) fn css_escape_family(name: &str) -> String {
 }
 
 #[cfg(test)]
+// Tests build a Config then tweak a field or two — the mutate-after-default form
+// reads better here than struct-update with ..Default::default().
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use crate::config::{FontSource, SymbolMap};
@@ -499,7 +499,7 @@ mod tests {
         let rec_start = sfnt.len();
         sfnt.resize(rec_start + n * 16, 0);
         for (i, (tag, body)) in tables.iter().enumerate() {
-            while (dir_off + sfnt.len()) % 4 != 0 {
+            while !(dir_off + sfnt.len()).is_multiple_of(4) {
                 sfnt.push(0);
             }
             let off = (dir_off + sfnt.len()) as u32;

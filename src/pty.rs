@@ -170,7 +170,7 @@ pub fn start(
             new_parser(rows, cols),
             config,
             resolver,
-        )
+        );
     });
 
     // When the command exits, tell the screen thread to restore the terminal + quit.
@@ -293,7 +293,7 @@ extern "C" fn on_sigwinch(_: libc::c_int) {
         // `write` is async-signal-safe; one byte, best-effort (ignore EAGAIN/etc.).
         let byte = [0u8; 1];
         unsafe {
-            libc::write(fd, byte.as_ptr() as *const libc::c_void, 1);
+            libc::write(fd, byte.as_ptr().cast::<libc::c_void>(), 1);
         }
     }
 }
@@ -323,8 +323,8 @@ impl Sigwinch {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = on_sigwinch as extern "C" fn(libc::c_int) as usize;
             sa.sa_flags = libc::SA_RESTART;
-            libc::sigemptyset(&mut sa.sa_mask);
-            libc::sigaction(libc::SIGWINCH, &sa, std::ptr::null_mut());
+            libc::sigemptyset(&raw mut sa.sa_mask);
+            libc::sigaction(libc::SIGWINCH, &raw const sa, std::ptr::null_mut());
             Sigwinch { read_fd }
         }
     }
@@ -343,11 +343,11 @@ impl Sigwinch {
                 revents: 0,
             };
             let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
-            libc::poll(&mut pfd, 1, ms);
+            libc::poll(&raw mut pfd, 1, ms);
             let mut buf = [0u8; 64];
             while libc::read(
                 self.read_fd,
-                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.as_mut_ptr().cast::<libc::c_void>(),
                 buf.len(),
             ) > 0
             {}
@@ -379,13 +379,13 @@ impl RawMode {
         // SAFETY: standard termios raw-mode dance on the real stdin fd.
         unsafe {
             let mut t: libc::termios = std::mem::zeroed();
-            if libc::tcgetattr(libc::STDIN_FILENO, &mut t) != 0 {
+            if libc::tcgetattr(libc::STDIN_FILENO, &raw mut t) != 0 {
                 return RawMode { orig: None }; // not a tty (e.g. piped) — leave as-is
             }
             let orig = t;
             let mut rawt = t;
-            libc::cfmakeraw(&mut rawt);
-            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &rawt);
+            libc::cfmakeraw(&raw mut rawt);
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const rawt);
             RawMode { orig: Some(orig) }
         }
     }
@@ -395,7 +395,7 @@ impl RawMode {
         if let Some(orig) = self.orig {
             // SAFETY: restoring the saved termios on the same fd.
             unsafe {
-                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &orig);
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const orig);
             }
         }
     }
@@ -406,8 +406,8 @@ impl RawMode {
             // SAFETY: applying a raw variant of the saved termios on the same fd.
             unsafe {
                 let mut rawt = orig;
-                libc::cfmakeraw(&mut rawt);
-                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &rawt);
+                libc::cfmakeraw(&raw mut rawt);
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const rawt);
             }
         }
     }

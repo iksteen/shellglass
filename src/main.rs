@@ -34,7 +34,7 @@ struct Args {
     #[arg(long, num_args = 1.., allow_hyphen_values = true, value_name = "CMD")]
     exec: Vec<String>,
 
-    /// Path to a TOML config (fonts + symbol_map). Optional.
+    /// Path to a TOML config (fonts + `symbol_map`). Optional.
     #[arg(short, long)]
     config: Option<PathBuf>,
 
@@ -56,7 +56,7 @@ struct Args {
     push: Option<String>,
 
     /// Secret key for `--push`. Its `argon2id` hash is the shareable session id.
-    /// (allow_hyphen_values: a secret may legitimately start with `-`.)
+    /// (`allow_hyphen_values`: a secret may legitimately start with `-`.)
     #[arg(long, env = "SHELLGLASS_KEY", allow_hyphen_values = true)]
     key: Option<String>,
 
@@ -196,7 +196,7 @@ async fn main() -> Result<()> {
 
     // Standalone live viewer: serve fonts at /fonts/<index>.
     let font_css = render::font_face_css(&fonts, "/fonts/");
-    let listener = bind(&args.bind).await?;
+    let listener = bind(&args.bind)?;
     // Print the URL before a PTY backend switches the terminal to raw mode.
     if interactive {
         println!(
@@ -250,7 +250,7 @@ fn start_backend(
 /// listener via `axum::serve`; the TLS paths hand the same reuseaddr listener to
 /// `axum-server`. ACME drives certificate issuance/renewal on a background task.
 async fn serve_hub(allowed: std::collections::HashSet<String>, addr: &str, tls: Tls) -> Result<()> {
-    let listener = bind(addr).await?;
+    let listener = bind(addr)?;
     let local = listener.local_addr()?;
     // Public base for the view URLs the hub logs. For ACME the cert is for the
     // domain, so use that; otherwise the bound address (as in the startup line).
@@ -260,7 +260,7 @@ async fn serve_hub(allowed: std::collections::HashSet<String>, addr: &str, tls: 
         Tls::Acme { domains, .. } => {
             format!(
                 "https://{}",
-                domains.first().map(String::as_str).unwrap_or("localhost")
+                domains.first().map_or("localhost", String::as_str)
             )
         }
     };
@@ -328,7 +328,7 @@ async fn serve_hub(allowed: std::collections::HashSet<String>, addr: &str, tls: 
 /// Bind with `SO_REUSEADDR` so a hub restart can rebind immediately — otherwise the
 /// previous run's client/browser connections linger in `TIME_WAIT` and the fresh
 /// bind fails with "address in use" for up to a minute.
-async fn bind(addr: &str) -> Result<tokio::net::TcpListener> {
+fn bind(addr: &str) -> Result<tokio::net::TcpListener> {
     use tokio::net::TcpSocket;
     let sockaddr: std::net::SocketAddr = addr
         .parse()

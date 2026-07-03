@@ -143,32 +143,29 @@ async fn register(
         .filter_map(|f| Some((f.key, (f.mime, B64.decode(f.b64).ok()?))))
         .collect();
     let mut map = st.sessions.lock().unwrap();
-    match map.get_mut(&id) {
-        Some(s) => {
-            s.css = reg.css;
-            s.template = reg.template;
-            s.fonts = fonts;
-        }
-        None => {
-            let (frame, _) = watch::channel(render::banner("waiting for client…"));
-            map.insert(
-                id.clone(),
-                Session {
-                    css: reg.css,
-                    template: reg.template,
-                    frame,
-                    fonts,
-                },
-            );
-            // First registration for this id (a new client, or after a hub
-            // restart) — announce where to watch it. Stream reconnects re-hit the
-            // Some branch, so this doesn't spam. Honor reverse-proxy headers so the
-            // URL matches the public address, not the hub's internal bind.
-            println!(
-                "shellglass: session connected — view at {}/s/{id}",
-                view_base(&headers, &st.base)
-            );
-        }
+    if let Some(s) = map.get_mut(&id) {
+        s.css = reg.css;
+        s.template = reg.template;
+        s.fonts = fonts;
+    } else {
+        let (frame, _) = watch::channel(render::banner("waiting for client…"));
+        map.insert(
+            id.clone(),
+            Session {
+                css: reg.css,
+                template: reg.template,
+                frame,
+                fonts,
+            },
+        );
+        // First registration for this id (a new client, or after a hub
+        // restart) — announce where to watch it. Stream reconnects re-hit the
+        // Some branch, so this doesn't spam. Honor reverse-proxy headers so the
+        // URL matches the public address, not the hub's internal bind.
+        println!(
+            "shellglass: session connected — view at {}/s/{id}",
+            view_base(&headers, &st.base)
+        );
     }
     (StatusCode::OK, id).into_response()
 }

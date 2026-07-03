@@ -65,8 +65,8 @@ pub fn capture(target: Option<&str>) -> Result<RawWindow> {
 
     let mut panes = Vec::new();
     for line in listing.lines().filter(|l| !l.trim().is_empty()) {
-        let (geom, cursor) = parse_pane_line(line)
-            .ok_or_else(|| anyhow!("unexpected list-panes line: {:?}", line))?;
+        let (geom, cursor) =
+            parse_pane_line(line).ok_or_else(|| anyhow!("unexpected list-panes line: {line:?}"))?;
         // Capture this pane with escape sequences (-e), to stdout (-p), and with
         // trailing spaces preserved (-N) so full-width colored bars (status
         // lines drawn via ESC[K background fill) keep their background to the
@@ -80,7 +80,7 @@ pub fn capture(target: Option<&str>) -> Result<RawWindow> {
     }
 
     if panes.is_empty() {
-        bail!("no panes found for target {:?}", target);
+        bail!("no panes found for target {target:?}");
     }
 
     Ok(RawWindow {
