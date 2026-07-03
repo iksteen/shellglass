@@ -56,9 +56,8 @@ pub fn head_css(font_css: &str, config: &Config) -> String {
          .pane {{ position:absolute; white-space:pre; overflow:hidden; \
          box-sizing:border-box; }}\n\
          .pane.active {{ box-shadow: inset 0 0 0 1px #3b3b3b; }}\n\
-         .row {{ height:var(--lh); }}\n\
-         .run {{ display:inline-block; height:var(--lh); vertical-align:top; \
-         overflow:hidden; }}\n",
+         .row {{ position:relative; height:var(--lh); }}\n\
+         .run {{ position:absolute; top:0; height:var(--lh); overflow:hidden; }}\n",
         stack = font_stack(config),
         fs = config.font_size_px,
         lh = config.line_height_px(),
@@ -162,8 +161,13 @@ fn render_row(
     resolver: &Resolver,
 ) {
     let mut col: u16 = 0;
-    // Accumulator for a run of plain (base-font) text cells.
+    // Accumulator for a run of plain (base-font) text cells, with the column it
+    // starts at — every run is positioned absolutely at `left:{run_col}ch` so its
+    // x is `round(run_col × ch)`, identical on every row. (Stacking inline-blocks
+    // instead sums each run's independently-rounded `ch` width, so the sub-pixel
+    // error accumulates and a column — e.g. a tmux pane divider — drifts per row.)
     let mut run_style: Option<String> = None;
+    let mut run_col: u16 = 0;
     let mut cols: u16 = 0;
     let mut text = String::new();
 
@@ -174,16 +178,19 @@ fn render_row(
         // Symbol cells (font override) render as a scaled SVG in their own box;
         // they never coalesce, so flush any pending text run first.
         if let Some(font) = svg_font(cell, resolver, config) {
-            flush_text_run(out, &run_style, cols, &mut text);
+            flush_text_run(out, &run_style, run_col, cols, &mut text);
             run_style = None;
             cols = 0;
-            emit_symbol_cell(out, cell, is_cursor, w, &font);
+            emit_symbol_cell(out, cell, is_cursor, col, w, &font);
         } else {
             let style = cell_box_style(cell, is_cursor);
             if run_style.as_ref() != Some(&style) {
-                flush_text_run(out, &run_style, cols, &mut text);
+                flush_text_run(out, &run_style, run_col, cols, &mut text);
                 run_style = Some(style);
                 cols = 0;
+            }
+            if cols == 0 {
+                run_col = col; // first cell of this run fixes its left edge
             }
             let ch = if cell.text.is_empty() {
                 " "
@@ -195,19 +202,19 @@ fn render_row(
         }
         col += w;
     }
-    flush_text_run(out, &run_style, cols, &mut text);
+    flush_text_run(out, &run_style, run_col, cols, &mut text);
 }
 
 /// Emit a run of plain text as one fixed-width `inline-block` box that occupies
 /// exactly `cols` base-font columns.
-fn flush_text_run(out: &mut String, style: &Option<String>, cols: u16, text: &mut String) {
+fn flush_text_run(out: &mut String, style: &Option<String>, col: u16, cols: u16, text: &mut String) {
     if text.is_empty() {
         return;
     }
     let s = style.as_deref().unwrap_or("");
     let _ = write!(
         out,
-        "<span class=\"run\" style=\"width:{cols}ch;{s}\">{text}</span>"
+        "<span class=\"run\" style=\"left:{col}ch;width:{cols}ch;{s}\">{text}</span>"
     );
     text.clear();
 }
@@ -217,7 +224,14 @@ fn flush_text_run(out: &mut String, style: &Option<String>, cols: u16, text: &mu
 /// `ch`; rendering them natively clips/misaligns them. Scaling via SVG matches
 /// what kitty does: powerline/box separators **stretch** to fill the cell (so
 /// they tile seamlessly), other icons **fit** proportionally and centered.
-fn emit_symbol_cell(out: &mut String, cell: &StyledCell, is_cursor: bool, w: u16, font: &str) {
+fn emit_symbol_cell(
+    out: &mut String,
+    cell: &StyledCell,
+    is_cursor: bool,
+    col: u16,
+    w: u16,
+    font: &str,
+) {
     let box_style = cell_box_style(cell, is_cursor);
     let first = cell.text.chars().next().unwrap_or(' ');
     let par = if is_fill_glyph(first) {
@@ -231,7 +245,7 @@ fn emit_symbol_cell(out: &mut String, cell: &StyledCell, is_cursor: bool, w: u16
     // maps it onto the actual cell box (width:{w}ch × --lh).
     let _ = write!(
         out,
-        "<span class=\"run\" style=\"width:{w}ch;{box_style}\">\
+        "<span class=\"run\" style=\"left:{col}ch;width:{w}ch;{box_style}\">\
          <svg viewBox=\"0 0 14 14\" preserveAspectRatio=\"{par}\" \
          style=\"display:block;width:100%;height:100%\">\
          <text x=\"0\" y=\"12\" font-family=\"{font}\" font-size=\"14\" \
@@ -472,7 +486,7 @@ mod tests {
         let html = render_fragment(&window_from("\u{E0B0}ab", 10, 1), &cfg, &res);
         // The glyph is a 1ch box holding a stretch-to-fill SVG (E0B0 is a separator)...
         assert!(
-            html.contains("<span class=\"run\" style=\"width:1ch;\"><svg viewBox=\"0 0 14 14\" preserveAspectRatio=\"none\""),
+            html.contains("<span class=\"run\" style=\"left:0ch;width:1ch;\"><svg viewBox=\"0 0 14 14\" preserveAspectRatio=\"none\""),
             "separator glyph not stretch-filled in a 1ch box: {html}"
         );
         // ...and the run widths across the row sum to exactly the 10 columns, so
@@ -503,6 +517,24 @@ mod tests {
         assert!(
             sextant.contains("preserveAspectRatio=\"none\""),
             "legacy sextant not stretch-filled: {sextant}"
+        );
+    }
+
+    #[test]
+    fn runs_are_positioned_at_their_column() {
+        // Each run's `left` is its absolute column, not its flow position — so a
+        // column (e.g. a divider) lands at the same x on every row regardless of
+        // what precedes it. Here `ab│` puts the divider at column 2.
+        let cfg = Config::default();
+        let res = Resolver::build(&cfg).unwrap();
+        let html = render_fragment(&window_from("ab\u{2502}", 5, 1), &cfg, &res);
+        assert!(
+            html.contains("style=\"left:0ch;width:2ch;"),
+            "leading text run not at column 0: {html}"
+        );
+        assert!(
+            html.contains("style=\"left:2ch;width:1ch;"),
+            "divider not positioned at its column: {html}"
         );
     }
 
