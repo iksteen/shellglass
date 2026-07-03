@@ -18,6 +18,7 @@ use crate::render;
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -120,15 +121,16 @@ pub fn start(
         }
     });
 
-    // Size poller: reflect terminal resizes into the PTY + parser. ponytail: a 1s
-    // poll instead of a SIGWINCH handler (async-signal-safety); resize shows within
-    // a second — swap in a signal handler if that lag ever matters.
+    // Size watcher: reflect terminal resizes into the PTY + parser — immediately on
+    // SIGWINCH, with a 1s poll as a fallback. `master` isn't `Sync`, so it stays in
+    // this one thread rather than being shared with a separate signal thread.
     {
         let msg_tx = msg_tx.clone();
+        let winch = Sigwinch::install();
         std::thread::spawn(move || {
             let mut last = (cols, rows);
             loop {
-                std::thread::sleep(Duration::from_secs(1));
+                winch.wait(Duration::from_secs(1)); // wakes on SIGWINCH or timeout
                 match term_size() {
                     Some(size) if size != last => {
                         last = size;
@@ -253,6 +255,68 @@ fn render_screen(parser: &vt100::Parser, config: &Config, resolver: &Resolver) -
         }],
     };
     render::render_fragment(&window, config, resolver)
+}
+
+/// Write end of the SIGWINCH self-pipe, read by the async-signal-safe handler.
+static SIGWINCH_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+
+extern "C" fn on_sigwinch(_: libc::c_int) {
+    let fd = SIGWINCH_WRITE_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        // `write` is async-signal-safe; one byte, best-effort (ignore EAGAIN/etc.).
+        let byte = [0u8; 1];
+        unsafe {
+            libc::write(fd, byte.as_ptr() as *const libc::c_void, 1);
+        }
+    }
+}
+
+/// A self-pipe woken by SIGWINCH: the handler writes a byte and [`Sigwinch::wait`]
+/// blocks on the read end (with a fallback timeout) so terminal resizes are picked
+/// up instantly instead of only on the next poll tick.
+struct Sigwinch {
+    read_fd: i32,
+}
+
+impl Sigwinch {
+    fn install() -> Sigwinch {
+        // SAFETY: create a non-blocking pipe and register a SIGWINCH handler that
+        // only writes to its write end. SA_RESTART so the signal doesn't turn the
+        // other threads' blocking reads into EINTR errors (which would kill them).
+        unsafe {
+            let mut fds = [0i32; 2];
+            if libc::pipe(fds.as_mut_ptr()) != 0 {
+                return Sigwinch { read_fd: -1 }; // fall back to pure polling
+            }
+            let (read_fd, write_fd) = (fds[0], fds[1]);
+            libc::fcntl(read_fd, libc::F_SETFL, libc::O_NONBLOCK);
+            libc::fcntl(write_fd, libc::F_SETFL, libc::O_NONBLOCK);
+            SIGWINCH_WRITE_FD.store(write_fd, Ordering::Relaxed);
+
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_sigwinch as extern "C" fn(libc::c_int) as usize;
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(libc::SIGWINCH, &sa, std::ptr::null_mut());
+            Sigwinch { read_fd }
+        }
+    }
+
+    /// Block until SIGWINCH fires or `timeout` elapses, then drain the pipe.
+    fn wait(&self, timeout: Duration) {
+        if self.read_fd < 0 {
+            std::thread::sleep(timeout);
+            return;
+        }
+        // SAFETY: poll then drain our own non-blocking pipe fd.
+        unsafe {
+            let mut pfd = libc::pollfd { fd: self.read_fd, events: libc::POLLIN, revents: 0 };
+            let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+            libc::poll(&mut pfd, 1, ms);
+            let mut buf = [0u8; 64];
+            while libc::read(self.read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) > 0 {}
+        }
+    }
 }
 
 /// Our controlling terminal's size as (cols, rows), if stdin is a tty.
