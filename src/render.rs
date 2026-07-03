@@ -10,9 +10,10 @@ use std::fmt::Write as _;
 const DEFAULT_FG: (u8, u8, u8) = (0xd0, 0xd0, 0xd0);
 const DEFAULT_BG: (u8, u8, u8) = (0x00, 0x00, 0x00);
 
-/// Full page: base CSS + embedded `@font-face` + the initial fragment + a JS
-/// loop that polls `/snapshot` and swaps `#screen` innerHTML.
-pub fn render_page(fragment: &str, font_css: &str, config: &Config, interval_ms: u64) -> String {
+/// Everything that goes inside `<style>`: embedded `@font-face` plus the config-
+/// derived base CSS. Computed by whoever owns the config (the standalone server or
+/// a push client); the hub just stores and re-emits it, so it renders nothing.
+pub fn head_css(font_css: &str, config: &Config) -> String {
     let base_css = format!(
         "html,body {{ margin:0; background:#000; }}\n\
          #screen {{ font-family:{stack}; font-size:{fs}px; --lh:{lh}px; \
@@ -29,21 +30,41 @@ pub fn render_page(fragment: &str, font_css: &str, config: &Config, interval_ms:
         lh = config.line_height_px(),
         fg = hex(DEFAULT_FG),
     );
+    format!("{font_css}{base_css}")
+}
 
+/// Assemble the full page from a ready `<style>` body, the initial `#screen`
+/// fragment, and the updater `<script>`.
+pub fn page(head_css: &str, fragment: &str, script: &str) -> String {
     format!(
         "<!doctype html>\n<html><head><meta charset=\"utf-8\">\n\
-         <title>tmuxsnitch</title>\n<style>\n{font_css}{base_css}</style>\n</head>\n\
+         <title>tmuxsnitch</title>\n<style>\n{head_css}</style>\n</head>\n\
          <body>\n<div id=\"screen\">{fragment}</div>\n\
-         <script>\n\
-         async function tick() {{\n\
-         try {{\n\
-         const r = await fetch('/snapshot', {{cache:'no-store'}});\n\
-         if (r.ok) document.getElementById('screen').innerHTML = await r.text();\n\
-         }} catch (e) {{}}\n\
-         }}\n\
-         setInterval(tick, {interval_ms});\n\
-         </script>\n\
+         <script>\n{script}\n</script>\n\
          </body></html>",
+    )
+}
+
+/// SSE updater: subscribe to `events_path` and swap `#screen` on each push.
+/// EventSource auto-reconnects if the stream drops, so no retry logic here.
+pub fn sse_script(events_path: &str) -> String {
+    format!(
+        "const es = new EventSource('{events_path}');\n\
+         es.onmessage = e => {{ document.getElementById('screen').innerHTML = e.data; }};"
+    )
+}
+
+/// Standalone page (local tmux → local viewer): streams live from `/events`.
+pub fn render_page(fragment: &str, font_css: &str, config: &Config) -> String {
+    page(&head_css(font_css, config), fragment, &sse_script("/events"))
+}
+
+/// Red in-page error banner (shared by every mode's failure path).
+pub fn banner(msg: &str) -> String {
+    let esc = msg.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    format!(
+        "<div style=\"color:#ff6b6b;font-family:monospace;padding:8px;\">\
+         tmuxsnitch: {esc}</div>"
     )
 }
 
@@ -301,12 +322,14 @@ mod tests {
     use crate::parse::grid_from_capture;
 
     fn window_from(cap: &str, w: u16, h: u16) -> Window {
+        let mut grid = grid_from_capture(cap, w, h);
+        grid.cursor = None; // these tests check cell styling, not cursor rendering
         Window {
             width: w,
             height: h,
             panes: vec![Pane {
                 geom: PaneGeom { id: "%0".into(), left: 0, top: 0, width: w, height: h, active: true },
-                grid: grid_from_capture(cap, w, h),
+                grid,
             }],
         }
     }

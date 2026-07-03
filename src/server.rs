@@ -1,70 +1,45 @@
-//! axum server: `GET /` serves the shell page + poller, `GET /snapshot` returns a
-//! freshly captured fragment. tmux capture is blocking, so it runs on a blocking
-//! thread.
+//! Standalone live viewer: mirror local tmux to a local browser. A background
+//! control-mode task (see [`crate::live`]) publishes fragments on a `watch`
+//! channel; `GET /` serves the page and `GET /events` streams updates over SSE.
 
 use crate::config::Config;
-use crate::fonts::Resolver;
-use crate::{parse, render, tmux};
+use crate::render;
 use axum::extract::State;
-use axum::response::Html;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use std::convert::Infallible;
 use std::sync::Arc;
+use tokio::sync::watch;
+use tokio_stream::wrappers::WatchStream;
+use tokio_stream::StreamExt;
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
-    pub resolver: Arc<Resolver>,
     pub font_css: Arc<String>,
-    pub target: Option<String>,
-    pub interval_ms: u64,
+    /// Latest rendered fragment, pushed by the live control task.
+    pub live_rx: watch::Receiver<String>,
 }
 
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
-        .route("/snapshot", get(snapshot))
+        .route("/events", get(events))
         .with_state(state)
 }
 
-/// Capture + parse + render the pane fragment. Blocking; call via spawn_blocking.
-fn capture_fragment(state: &AppState) -> anyhow::Result<String> {
-    let raw = tmux::capture(state.target.as_deref())?;
-    let window = parse::parse_window(raw);
-    Ok(render::render_fragment(&window, &state.config, &state.resolver))
-}
-
-async fn fragment_or_banner(state: &AppState) -> String {
-    let st = state.clone();
-    let result = tokio::task::spawn_blocking(move || capture_fragment(&st)).await;
-    match result {
-        Ok(Ok(html)) => html,
-        Ok(Err(e)) => banner(&e.to_string()),
-        Err(e) => banner(&format!("capture task failed: {e}")),
-    }
-}
-
-fn banner(msg: &str) -> String {
-    let esc = msg
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
-    format!(
-        "<div style=\"color:#ff6b6b;font-family:monospace;padding:8px;\">\
-         tmuxsnitch: {esc}</div>"
-    )
-}
-
 async fn index(State(state): State<AppState>) -> Html<String> {
-    let fragment = fragment_or_banner(&state).await;
     Html(render::render_page(
-        &fragment,
+        &state.live_rx.borrow(),
         &state.font_css,
         &state.config,
-        state.interval_ms,
     ))
 }
 
-async fn snapshot(State(state): State<AppState>) -> Html<String> {
-    Html(fragment_or_banner(&state).await)
+async fn events(State(state): State<AppState>) -> Response {
+    let stream = WatchStream::new(state.live_rx.clone())
+        .map(|html| Ok::<_, Infallible>(Event::default().data(html)));
+    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
 }

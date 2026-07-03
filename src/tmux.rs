@@ -5,11 +5,14 @@ use crate::model::PaneGeom;
 use anyhow::{Context, Result, anyhow, bail};
 use std::process::Command;
 
-/// Raw (unparsed) capture for one pane: its placement plus the `capture-pane -e`
-/// output bytes.
+/// Raw (unparsed) capture for one pane: its placement, the `capture-pane -e`
+/// output bytes, and the pane cursor (col, row), 0-based. `capture-pane` carries
+/// no cursor, so we track it separately and restore it when seeding the parser —
+/// otherwise relative `%output` (e.g. interactive echo) lands at the wrong place.
 pub struct RawPane {
     pub geom: PaneGeom,
     pub capture: String,
+    pub cursor: (u16, u16),
 }
 
 /// A window snapshot before terminal parsing.
@@ -48,8 +51,8 @@ pub fn capture(target: Option<&str>) -> Result<RawWindow> {
     let (width, height) = parse_size(size.trim())
         .ok_or_else(|| anyhow!("unexpected window size from tmux: {:?}", size.trim()))?;
 
-    // Pane geometry. Fields are space-separated in a fixed order.
-    let pane_fmt = "#{pane_id} #{pane_left} #{pane_top} #{pane_width} #{pane_height} #{pane_active}";
+    // Pane geometry + cursor. Fields are space-separated in a fixed order.
+    let pane_fmt = "#{pane_id} #{pane_left} #{pane_top} #{pane_width} #{pane_height} #{pane_active} #{cursor_x} #{cursor_y}";
     let mut list_args = vec!["list-panes"];
     if let Some(t) = target {
         list_args.push("-t");
@@ -61,14 +64,14 @@ pub fn capture(target: Option<&str>) -> Result<RawWindow> {
 
     let mut panes = Vec::new();
     for line in listing.lines().filter(|l| !l.trim().is_empty()) {
-        let geom = parse_pane_line(line)
+        let (geom, cursor) = parse_pane_line(line)
             .ok_or_else(|| anyhow!("unexpected list-panes line: {:?}", line))?;
         // Capture this pane with escape sequences (-e), to stdout (-p), and with
         // trailing spaces preserved (-N) so full-width colored bars (status
         // lines drawn via ESC[K background fill) keep their background to the
         // pane edge instead of being trimmed.
         let capture = run(&["capture-pane", "-e", "-N", "-p", "-t", &geom.id])?;
-        panes.push(RawPane { geom, capture });
+        panes.push(RawPane { geom, capture, cursor });
     }
 
     if panes.is_empty() {
@@ -87,7 +90,7 @@ fn parse_size(s: &str) -> Option<(u16, u16)> {
     Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
 }
 
-fn parse_pane_line(line: &str) -> Option<PaneGeom> {
+fn parse_pane_line(line: &str) -> Option<(PaneGeom, (u16, u16))> {
     let mut it = line.split_whitespace();
     let id = it.next()?.to_string();
     let left = it.next()?.parse().ok()?;
@@ -95,12 +98,10 @@ fn parse_pane_line(line: &str) -> Option<PaneGeom> {
     let width = it.next()?.parse().ok()?;
     let height = it.next()?.parse().ok()?;
     let active = it.next()? == "1";
-    Some(PaneGeom {
-        id,
-        left,
-        top,
-        width,
-        height,
-        active,
-    })
+    let cursor_x = it.next()?.parse().ok()?;
+    let cursor_y = it.next()?.parse().ok()?;
+    Some((
+        PaneGeom { id, left, top, width, height, active },
+        (cursor_x, cursor_y),
+    ))
 }

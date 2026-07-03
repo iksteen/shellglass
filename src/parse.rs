@@ -1,28 +1,12 @@
 //! Turn `capture-pane -e` output into a parser-agnostic [`Grid`] by driving a
 //! throwaway `vt100` terminal emulator.
 
-use crate::model::{Color, Grid, Pane, StyledCell, Window};
-use crate::tmux::RawWindow;
+use crate::model::{Color, Grid, StyledCell};
 
-/// Parse a whole window snapshot.
-pub fn parse_window(raw: RawWindow) -> Window {
-    let panes = raw
-        .panes
-        .into_iter()
-        .map(|p| Pane {
-            grid: grid_from_capture(&p.capture, p.geom.width, p.geom.height),
-            geom: p.geom,
-        })
-        .collect();
-    Window {
-        width: raw.width,
-        height: raw.height,
-        panes,
-    }
-}
-
-/// Render `capture` (SGR-annotated text) into a fixed `cols`×`rows` grid.
-pub fn grid_from_capture(capture: &str, cols: u16, rows: u16) -> Grid {
+/// Build a persistent vt100 parser seeded with a `capture-pane -e` snapshot, with
+/// the cursor placed at `cursor` (col, row), 0-based. The returned parser is then
+/// fed incremental control-mode `%output` bytes as the live pane produces them.
+pub fn seed_parser(capture: &str, cols: u16, rows: u16, cursor: (u16, u16)) -> vt100::Parser {
     let mut parser = vt100::Parser::new(rows, cols, 0);
 
     // capture-pane separates lines with '\n' and has no cursor motion. Feed a
@@ -32,7 +16,27 @@ pub fn grid_from_capture(capture: &str, cols: u16, rows: u16) -> Grid {
     let feed = lines.join("\r\n");
     parser.process(feed.as_bytes());
 
-    let screen = parser.screen();
+    // Feeding the snapshot leaves the cursor at the end of the last line and the
+    // pen in whatever SGR that last cell used; capture-pane carries neither the
+    // real cursor nor pen. Reset attributes (`\x1b[m`) and restore the cursor
+    // (1-based CUP) so relative `%output` — e.g. a shell/irssi echoing keystrokes
+    // — lands at the right place with default colors, not the bottom-right corner
+    // wearing a stale background.
+    let (col, row) = cursor;
+    parser.process(format!("\x1b[m\x1b[{};{}H", row + 1, col + 1).as_bytes());
+    parser
+}
+
+/// Render `capture` (SGR-annotated text) into a fixed `cols`×`rows` grid. Only the
+/// tests exercise this one-shot form; live code seeds then feeds a parser instead.
+#[cfg(test)]
+pub fn grid_from_capture(capture: &str, cols: u16, rows: u16) -> Grid {
+    grid_from_screen(seed_parser(capture, cols, rows, (0, 0)).screen())
+}
+
+/// Extract a parser-agnostic [`Grid`] from a live vt100 screen. Shared by the
+/// snapshot path and the control-mode live path (which reads a long-lived screen).
+pub fn grid_from_screen(screen: &vt100::Screen) -> Grid {
     let (srows, scols) = screen.size();
 
     let mut grid_rows: Vec<Vec<StyledCell>> = Vec::with_capacity(srows as usize);
@@ -73,7 +77,7 @@ pub fn grid_from_capture(capture: &str, cols: u16, rows: u16) -> Grid {
     };
 
     Grid {
-        cols,
+        cols: scols,
         rows: grid_rows,
         cursor,
     }
