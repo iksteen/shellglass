@@ -239,17 +239,27 @@ fn emit_symbol_cell(out: &mut String, cell: &StyledCell, is_cursor: bool, w: u16
     );
 }
 
-/// Powerline separators and box-drawing glyphs must fill the whole cell so
-/// adjacent segments tile without gaps; everything else scales proportionally.
+/// Powerline separators, box-drawing lines, and block elements must fill the whole
+/// cell so adjacent segments tile without gaps — the page's `line-height` > 1 gives
+/// a plain-text `│` vertical leading between rows, so a stack of them (e.g. a tmux
+/// pane divider) renders dashed. Everything else scales proportionally.
 fn is_fill_glyph(c: char) -> bool {
-    ('\u{E0B0}'..='\u{E0D4}').contains(&c)
+    matches!(c,
+        '\u{E0B0}'..='\u{E0D4}'     // powerline separators
+        | '\u{2500}'..='\u{259F}'   // box drawing + block elements
+        | '\u{1FB00}'..='\u{1FBAF}' // legacy computing: sextants, eighth-blocks, wedges
+    )
+    // ponytail: braille (U+2800–28FF) is deliberately out — a dot matrix that must
+    // scale proportionally, not stretch. Octants (U+1CD00+) omitted until a font/tool
+    // in the wild needs them; base fonts rarely carry the glyphs, so SVG'ing them
+    // would just stretch tofu.
 }
 
 /// Font stack for rendering `cell` as a scaled SVG glyph, or `None` for plain text.
-/// A `symbol_map` override wins. Otherwise powerline *fill* separators still need
-/// SVG cell-locking even with no `symbol_map`: rendered as text their glyph is
-/// wider than a cell and gets clipped to a block, so route them through the base
-/// fallback stack (the browser picks whichever family has the glyph).
+/// A `symbol_map` override wins. Otherwise *fill* glyphs still need SVG cell-locking
+/// even with no `symbol_map` — powerline separators are wider than a cell and clip;
+/// box-drawing lines gap vertically under `line-height` > 1 — so route them through
+/// the base fallback stack (the browser picks whichever family has the glyph).
 fn svg_font(cell: &StyledCell, resolver: &Resolver, config: &Config) -> Option<String> {
     if let Some(font) = cell_font(cell, resolver, config) {
         return Some(font);
@@ -474,6 +484,26 @@ mod tests {
             .filter_map(|s| s.split("ch").next()?.parse::<u16>().ok())
             .sum();
         assert_eq!(sum, 10, "run widths don't tile the row: {html}");
+    }
+
+    #[test]
+    fn box_drawing_divider_stretch_fills() {
+        // A tmux pane divider is a column of `│` (U+2502). Rendered as plain text
+        // it gaps vertically under line-height > 1; it must go through the same
+        // stretch-to-fill SVG path as powerline separators so it reads solid.
+        let cfg = Config::default();
+        let res = Resolver::build(&cfg).unwrap();
+        let html = render_fragment(&window_from("\u{2502}", 2, 1), &cfg, &res);
+        assert!(
+            html.contains("preserveAspectRatio=\"none\""),
+            "box-drawing divider not stretch-filled: {html}"
+        );
+        // A legacy-computing sextant (U+1FB00) tiles like a block element too.
+        let sextant = render_fragment(&window_from("\u{1FB00}", 2, 1), &cfg, &res);
+        assert!(
+            sextant.contains("preserveAspectRatio=\"none\""),
+            "legacy sextant not stretch-filled: {sextant}"
+        );
     }
 
     #[test]
