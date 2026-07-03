@@ -65,23 +65,35 @@ fn parse_range(spec: &str) -> Result<RangeInclusive<u32>> {
 
 /// Build `@font-face` blocks for every font source that points at a file.
 /// System-referenced fonts (or bare family names) produce no `@font-face`.
-pub fn font_face_css(config: &Config) -> Result<String> {
+///
+/// An unavailable embedded font (missing/unreadable file, bad extension) is a
+/// soft failure: warn and skip its `@font-face` so the family name simply falls
+/// through to an installed copy or the next font in the stack, rather than
+/// aborting the whole page. Configs can therefore point at optional local files.
+pub fn font_face_css(config: &Config) -> String {
     let mut css = String::new();
     for (name, src) in &config.fonts {
         let Some(path) = &src.path else { continue };
-        let (mime, format) = font_format(path)?;
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("reading font file {}", path.display()))?;
-        let b64 = B64.encode(&bytes);
-        css.push_str(&format!(
-            "@font-face {{ font-family: '{}'; src: url(data:{};base64,{}) format('{}'); }}\n",
-            css_escape_family(name),
-            mime,
-            b64,
-            format,
-        ));
+        match font_face(name, path) {
+            Ok(face) => css.push_str(&face),
+            Err(e) => eprintln!("tmuxsnitch: skipping font {name:?}: {e:#}"),
+        }
     }
-    Ok(css)
+    css
+}
+
+fn font_face(name: &str, path: &Path) -> Result<String> {
+    let (mime, format) = font_format(path)?;
+    let bytes =
+        std::fs::read(path).with_context(|| format!("reading font file {}", path.display()))?;
+    let b64 = B64.encode(&bytes);
+    Ok(format!(
+        "@font-face {{ font-family: '{}'; src: url(data:{};base64,{}) format('{}'); }}\n",
+        css_escape_family(name),
+        mime,
+        b64,
+        format,
+    ))
 }
 
 fn font_format(path: &Path) -> Result<(&'static str, &'static str)> {
@@ -102,4 +114,26 @@ fn font_format(path: &Path) -> Result<(&'static str, &'static str)> {
 /// Family names go inside a single-quoted CSS string; neutralize quotes/backslashes.
 fn css_escape_family(name: &str) -> String {
     name.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::FontSource;
+
+    #[test]
+    fn missing_embedded_font_soft_fails() {
+        // A path that doesn't exist must not abort — it's skipped, other fonts kept.
+        let mut cfg = Config::default();
+        cfg.fonts.insert(
+            "Ghost".into(),
+            FontSource { path: Some("/no/such/font.ttf".into()), system: None },
+        );
+        cfg.fonts.insert(
+            "Named".into(),
+            FontSource { path: None, system: Some("Named".into()) },
+        );
+        let css = font_face_css(&cfg);
+        assert!(!css.contains("Ghost"), "missing font should be skipped: {css}");
+    }
 }

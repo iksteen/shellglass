@@ -151,7 +151,7 @@ async fn main() -> Result<()> {
         None => Config::default(),
     };
     let resolver = Arc::new(Resolver::build(&config).context("building font resolver")?);
-    let font_css = fonts::font_face_css(&config).context("embedding fonts")?;
+    let font_css = fonts::font_face_css(&config);
     let config = Arc::new(config);
 
     if let Some(url) = args.push {

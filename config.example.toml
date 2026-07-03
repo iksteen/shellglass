@@ -2,11 +2,10 @@
 
 # Base font: one family, or a fallback stack tried in order. With a list, the
 # browser picks per character the first family that has the glyph — list a Nerd
-# Font after your text font to get Kitty-style fallback with no symbol_map, e.g.
-#   default_font = ["Noto Sans Mono", "Symbols Nerd Font Mono"]
-# (see config.kitty.toml). symbol_map below is still available when you want the
+# Font after your text font to get Kitty-style fallback with no symbol_map (see
+# config.kitty.toml). symbol_map below is still available when you want the
 # override glyphs SVG-scaled to lock to exactly one cell.
-default_font = "monospace"
+default_font = ["monospace", "Symbols Nerd Font Mono"]
 font_size_px = 14.0
 line_height  = 1.2
 
@@ -26,3 +25,10 @@ font   = "Symbols Nerd Font"
 [fonts."Symbols Nerd Font"]
 # path = "/usr/share/fonts/NerdFonts/SymbolsNerdFont-Regular.woff2"
 system = "Symbols Nerd Font"
+
+# Fallback family used by the default_font stack above — a system-installed
+# Symbols Nerd Font Mono. If it isn't installed, the browser just falls through
+# to the next stack entry (no error). To embed a local copy for a self-contained
+# page instead, set `path = "..."`; a missing path warns and is skipped.
+[fonts."Symbols Nerd Font Mono"]
+system = "Symbols Nerd Font Mono"
