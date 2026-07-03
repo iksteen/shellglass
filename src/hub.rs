@@ -42,13 +42,17 @@ pub struct HubState {
     /// Pre-registered session ids (`session_id(secret)`) permitted to push. The
     /// operator adds ids, never secrets — the hub screens by hash.
     allowed: Arc<HashSet<String>>,
+    /// Public base URL (`scheme://host:port`, no trailing slash) for logging the
+    /// view URL when a new session connects.
+    base: Arc<str>,
 }
 
 impl HubState {
-    pub fn new(allowed: HashSet<String>) -> Self {
+    pub fn new(allowed: HashSet<String>, base: String) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             allowed: Arc::new(allowed),
+            base: base.into(),
         }
     }
 }
@@ -117,6 +121,10 @@ async fn register(
         None => {
             let (frame, _) = watch::channel(render::banner("waiting for client…"));
             map.insert(id.clone(), Session { css: reg.css, frame, fonts });
+            // First registration for this id (a new client, or after a hub
+            // restart) — announce where to watch it. Stream reconnects re-hit the
+            // Some branch, so this doesn't spam.
+            println!("tmuxsnitch: session connected — view at {}/s/{id}", st.base);
         }
     }
     (StatusCode::OK, id).into_response()
@@ -209,11 +217,11 @@ mod tests {
 
     #[test]
     fn only_preregistered_keys_are_allowed() {
-        let st = HubState::new(HashSet::from([session_id("good-secret")]));
+        let st = HubState::new(HashSet::from([session_id("good-secret")]), String::new());
         assert!(st.allowed.contains(&session_id("good-secret")), "registered key allowed");
         assert!(!st.allowed.contains(&session_id("other-secret")), "unregistered key rejected");
         // An empty allowlist rejects everything (no implicit open hub).
-        let empty = HubState::new(HashSet::new());
+        let empty = HubState::new(HashSet::new(), String::new());
         assert!(!empty.allowed.contains(&session_id("good-secret")));
     }
 }

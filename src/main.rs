@@ -148,7 +148,7 @@ async fn main() -> Result<()> {
                 "tmuxsnitch: warning — no --allow session ids; the hub will reject all pushes (403)"
             );
         }
-        serve_hub(hub::app(hub::HubState::new(allowed)), &args.bind, tls).await?;
+        serve_hub(allowed, &args.bind, tls).await?;
         return Ok(());
     }
 
@@ -229,9 +229,23 @@ fn start_backend(
 /// Serve the hub, terminating TLS per `tls`. Plain HTTP keeps the `SO_REUSEADDR`
 /// listener via `axum::serve`; the TLS paths hand the same reuseaddr listener to
 /// `axum-server`. ACME drives certificate issuance/renewal on a background task.
-async fn serve_hub(app: axum::Router, addr: &str, tls: Tls) -> Result<()> {
+async fn serve_hub(
+    allowed: std::collections::HashSet<String>,
+    addr: &str,
+    tls: Tls,
+) -> Result<()> {
     let listener = bind(addr).await?;
     let local = listener.local_addr()?;
+    // Public base for the view URLs the hub logs. For ACME the cert is for the
+    // domain, so use that; otherwise the bound address (as in the startup line).
+    let base = match &tls {
+        Tls::None => format!("http://{local}"),
+        Tls::Static { .. } => format!("https://{local}"),
+        Tls::Acme { domains, .. } => {
+            format!("https://{}", domains.first().map(String::as_str).unwrap_or("localhost"))
+        }
+    };
+    let app = hub::app(hub::HubState::new(allowed, base));
     match tls {
         Tls::None => {
             println!("tmuxsnitch hub at http://{local}/");
