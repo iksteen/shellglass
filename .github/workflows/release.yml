@@ -1,0 +1,50 @@
+name: release
+
+# Build release binaries for each target on a version tag and attach them to a
+# GitHub Release. Linux aarch64 goes through `cross` (its container carries the
+# cross toolchain + cmake that aws-lc-rs needs); everything else builds natively.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-latest, cross: true  }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-latest, cross: true  }
+          # Both macOS targets build on an arm64 runner; x86_64 cross-compiles
+          # (avoids the retiring Intel macos-13 image, no Docker needed).
+          - { target: x86_64-apple-darwin,       os: macos-14,      cross: false }
+          - { target: aarch64-apple-darwin,      os: macos-14,      cross: false }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - if: matrix.cross
+        uses: taiki-e/install-action@cross
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --locked --target ${{ matrix.target }}
+          else
+            cargo build --release --locked --target ${{ matrix.target }}
+          fi
+
+      - name: Package
+        run: tar -czf tmuxsnitch-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release tmuxsnitch
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: tmuxsnitch-${{ matrix.target }}.tar.gz
