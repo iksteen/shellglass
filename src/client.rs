@@ -67,7 +67,7 @@ pub async fn run(
             }
             Reg::Forbidden => bail!(
                 "hub rejected this key: register its session id on the hub \
-                 (run `--key <secret> --print-id`, add it to the hub's --allow)"
+                 (run `print-id --key <secret>`, add it to the hub's --allow)"
             ),
             Reg::Unreachable(e) if first => return Err(e).context("registering with hub"),
             Reg::Rejected(s) if first => bail!("hub rejected the registration (HTTP {s})"),

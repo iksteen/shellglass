@@ -21,7 +21,7 @@ EXPOSE 443
 ENTRYPOINT ["shellglass"]
 # Override with your own flags, e.g.:
 #   docker run -p 443:443 -v shellglass-acme:/data IMAGE \
-#     --serve --bind 0.0.0.0:443 --allow <ID> \
+#     hub --bind 0.0.0.0:443 --allow <ID> \
 #     --acme-domain hub.example.com --acme-email you@example.com \
 #     --acme-cache /data/acme --acme-production
 CMD ["--help"]

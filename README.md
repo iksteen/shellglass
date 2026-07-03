@@ -20,12 +20,14 @@ Two ways to serve it:
   the session at a URL. Good for sharing off-box.
 
 ```sh
-shellglass --target work                              # mirror tmux session "work", watch at :8080
-shellglass --exec bash -l                             # or mirror a PTY: work in this shell, watch it
-shellglass --push https://hub … --key … --exec bash  # or stream it to a hub
+shellglass serve --target work                         # mirror tmux session "work", watch at :8080
+shellglass serve --exec bash -l                        # or mirror a PTY: work in this shell, watch it
+shellglass push https://hub --key … --exec bash        # or stream it to a hub
 ```
 
-For `--exec`, the command plus its args go **last**. The terminal is switched to raw mode
+Each mode is a subcommand: `serve` (self-contained local viewer), `push` (stream to a
+hub), `hub` (run a hub), plus `gen-key` / `print-id` helpers. Run `shellglass <cmd>
+--help` for a command's flags. For `--exec`, the command plus its args go **last**. The terminal is switched to raw mode
 for the session and restored when the command exits (which also quits shellglass). Unix
 only.
 
@@ -40,7 +42,7 @@ cargo build --release
 
 ```sh
 tmux new-session -d -s demo                       # a session to mirror
-./target/release/shellglass --target demo --bind 127.0.0.1:8080
+./target/release/shellglass serve --target demo --bind 127.0.0.1:8080
 # open http://127.0.0.1:8080/
 ```
 
@@ -54,12 +56,15 @@ with `--allow`.
 ### Shell A — the hub
 
 ```sh
-# 1. pick a secret and compute its session id (needed for the hub's --allow)
-SECRET='change-me-to-a-long-random-secret'
-ID=$(./target/release/shellglass --key "$SECRET" --print-id)
+# 1. mint a secret and its session id (the id is needed for the hub's --allow)
+./target/release/shellglass gen-key
+#   key: <secret>   -> keep private; the client pushes with it
+#   id:  <id>       -> public; add to the hub's --allow
+SECRET='<the printed key>'
+ID='<the printed id>'
 
 # 2. run the hub, allowing that id (repeat --allow per client)
-./target/release/shellglass --serve --bind 127.0.0.1:8080 --allow "$ID"
+./target/release/shellglass hub --bind 127.0.0.1:8080 --allow "$ID"
 ```
 
 The hub needs no tmux and no config — it just relays what clients push.
@@ -72,7 +77,7 @@ tmux new-session -d -s demo                       # skip if you have a session
 
 # same secret as the hub was configured for
 export SHELLGLASS_KEY='change-me-to-a-long-random-secret'
-./target/release/shellglass --push http://127.0.0.1:8080 --target demo
+./target/release/shellglass push http://127.0.0.1:8080 --target demo
 ```
 
 The client prints its view URL on startup:
@@ -85,22 +90,32 @@ Open that `/s/<id>` URL in a browser. Viewing needs only the id (in the URL); pu
 needs the secret. A client whose key isn't on the hub's `--allow` list is rejected with
 `403` at startup.
 
-> Generate a real secret instead of the placeholder, e.g.
-> `SECRET=$(head -c32 /dev/urandom | base64)`, and set the same value in both shells.
+> `gen-key` mints a secure 256-bit secret and prints its session id in one step;
+> use the printed key as `SHELLGLASS_KEY` on the client and the printed id in the
+> hub's `--allow`.
 
-## Flags
+## Commands
 
-| Flag | Applies to | Meaning |
-|------|------------|---------|
-| `--target <t>` | standalone, client | tmux target (`session` or `session:window`); default = current window |
-| `--exec <cmd>…` | standalone, client | mirror an interactive PTY command instead of tmux (put last) |
-| `--config <path>` | standalone, client | TOML config (fonts, `symbol_map`, `template`); omit for defaults |
-| `--bind <addr>` | standalone, hub | HTTP listen address (default `127.0.0.1:8080`) |
-| `--serve` | hub | run as a hub (no tmux/config needed) |
+`shellglass <command>` — run `shellglass <command> --help` for its full flags.
+
+| Command | What it does |
+|---------|--------------|
+| `serve` | self-contained: render locally and serve the viewer over HTTP |
+| `push <url>` | client: render locally, stream frames to the hub at `<url>` |
+| `hub` | run as a hub: relay clients' pushes (no tmux/config needed) |
+| `gen-key` | generate a random secret key, print it with its session id, and exit |
+| `print-id` | print the session id for `--key` and exit |
+
+Flags by command:
+
+| Flag | Commands | Meaning |
+|------|----------|---------|
+| `--target <t>` | serve, push | tmux target (`session` or `session:window`); default = current window |
+| `--exec <cmd>…` | serve, push | mirror an interactive PTY command instead of tmux (put last) |
+| `--config <path>` | serve, push | TOML config (fonts, `symbol_map`, `template`); omit for defaults |
+| `--bind <addr>` | serve, hub | HTTP listen address (default `127.0.0.1:8080`) |
+| `--key <secret>` | push, print-id | secret key (or `SHELLGLASS_KEY` env var) |
 | `--allow <id>` | hub | a session id permitted to push; repeat per client. Others get `403` |
-| `--push <url>` | client | hub base URL to push to |
-| `--key <secret>` | client, `--print-id` | secret key (or `SHELLGLASS_KEY` env var) |
-| `--print-id` | — | print the session id for `--key` and exit |
 | `--tls-cert <path>` / `--tls-key <path>` | hub | serve HTTPS with your own PEM cert chain + key |
 | `--acme-domain <d>` | hub | auto-obtain a cert via ACME/Let's Encrypt (repeat per domain) |
 | `--acme-email <e>` | hub | contact email for the ACME account |
@@ -110,7 +125,7 @@ needs the secret. A client whose key isn't on the hub's `--allow` list is reject
 The session id is `hex(argon2id(secret))` with a fixed application salt — a
 memory-hard derivation, so a weak secret can't be cheaply brute-forced from the
 public id. It's computed once per client connection, not per frame. Use
-`--print-id` to obtain the id for a secret (there's no one-line shell equivalent).
+`print-id` to obtain the id for a secret (there's no one-line shell equivalent).
 
 ## How it works
 
@@ -207,12 +222,12 @@ custom themes work off-box too.
 
   ```sh
   # your own certificate
-  shellglass --serve --bind 0.0.0.0:443 --allow "$ID" \
+  shellglass hub --bind 0.0.0.0:443 --allow "$ID" \
     --tls-cert /etc/ssl/hub.crt --tls-key /etc/ssl/hub.key
 
   # or automatic Let's Encrypt (needs a public DNS name resolving to this host,
   # and port 443 reachable — the TLS-ALPN-01 challenge is served on the same socket)
-  shellglass --serve --bind 0.0.0.0:443 --allow "$ID" \
+  shellglass hub --bind 0.0.0.0:443 --allow "$ID" \
     --acme-domain hub.example.com --acme-email you@example.com \
     --acme-cache /var/lib/shellglass/acme --acme-production
   ```
@@ -221,7 +236,7 @@ custom themes work off-box too.
   so you can test the plumbing; add `--acme-production` for real certs. Always set
   `--acme-cache` or the account + certificate are re-issued on every restart.
   Otherwise, run behind a TLS-terminating reverse proxy (Traefik, nginx, …). The
-  client's `--push` URL just needs to be `https://…`, and the hub honors
+  client's `push` URL just needs to be `https://…`, and the hub honors
   `X-Forwarded-Proto`/`X-Forwarded-Host` so the view URL it prints on connect
   matches the proxy's public address, not the hub's internal bind.
 - The hub trusts allowed clients: it caps the `/register` body at 64 MB (uploaded fonts

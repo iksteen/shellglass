@@ -2193,6 +2193,7 @@ dependencies = [
  "bytes",
  "clap",
  "fontdb",
+ "getrandom 0.3.4",
  "libc",
  "portable-pty",
  "reqwest",

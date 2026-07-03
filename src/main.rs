@@ -16,14 +16,60 @@ mod tmux;
 use anyhow::{Context, Result};
 use clap::Parser;
 use config::Config;
-use fonts::Resolver;
+use fonts::{FontFile, Resolver};
 use server::AppState;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(name = "shellglass", about = "Mirror a tmux window as live HTML")]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    action: Action,
+}
+
+/// Each variant is one self-contained mode; clap only accepts the flags that belong
+/// to the chosen subcommand, so incompatible options can't be combined by construction.
+#[derive(clap::Subcommand, Debug)]
+enum Action {
+    /// Generate a secure random secret key, print it with its session id, and exit.
+    GenKey,
+
+    /// Print the session id for a key (to add to a hub's `hub --allow`).
+    PrintId {
+        #[command(flatten)]
+        key: KeyArg,
+    },
+
+    /// Mirror a terminal locally: serve the live HTML viewer over HTTP (self-contained).
+    Serve {
+        #[command(flatten)]
+        source: SourceArgs,
+
+        /// Address to bind the HTTP server.
+        #[arg(short, long, default_value = "127.0.0.1:8080")]
+        bind: String,
+    },
+
+    /// Mirror a terminal and push frames to a remote hub instead of serving locally.
+    Push {
+        /// Hub base URL to push to (e.g. `https://hub.example.com`).
+        url: String,
+
+        #[command(flatten)]
+        key: KeyArg,
+
+        #[command(flatten)]
+        source: SourceArgs,
+    },
+
+    /// Run as a hub: receive pushes from clients and re-serve their sessions.
+    Hub(HubArgs),
+}
+
+/// The terminal source, shared by `view` and `push` (both render locally).
+#[derive(clap::Args, Debug)]
+struct SourceArgs {
     /// tmux target (e.g. `session` or `session:window`); default = current window.
     #[arg(short, long)]
     target: Option<String>,
@@ -37,56 +83,50 @@ struct Args {
     /// Path to a TOML config (fonts + `symbol_map`). Optional.
     #[arg(short, long)]
     config: Option<PathBuf>,
+}
 
-    /// Address to bind the HTTP server (standalone viewer or `--serve` hub).
+/// Secret key whose `argon2id` hash is the shareable session id, shared by
+/// `print-id` and `push`. (`allow_hyphen_values`: a secret may start with `-`.)
+#[derive(clap::Args, Debug)]
+struct KeyArg {
+    #[arg(long, env = "SHELLGLASS_KEY", allow_hyphen_values = true)]
+    key: String,
+}
+
+#[derive(clap::Args, Debug)]
+struct HubArgs {
+    /// Address to bind the hub's HTTP(S) server.
     #[arg(short, long, default_value = "127.0.0.1:8080")]
     bind: String,
 
-    /// Run as a hub: receive pushes from clients and serve their sessions.
-    #[arg(long)]
-    serve: bool,
-
-    /// (Hub) A session id permitted to push; repeat for several. Pushes whose key
-    /// doesn't hash to a listed id get 403. Compute an id with `--key K --print-id`.
+    /// A session id permitted to push; repeat for several. Pushes whose key doesn't
+    /// hash to a listed id get 403. Compute an id with `print-id --key K`.
     #[arg(long = "allow", value_name = "SESSION_ID")]
     allow: Vec<String>,
 
-    /// Push to a hub at this base URL instead of serving locally (client mode).
-    #[arg(long)]
-    push: Option<String>,
-
-    /// Secret key for `--push`. Its `argon2id` hash is the shareable session id.
-    /// (`allow_hyphen_values`: a secret may legitimately start with `-`.)
-    #[arg(long, env = "SHELLGLASS_KEY", allow_hyphen_values = true)]
-    key: Option<String>,
-
-    /// Print the session id for `--key` and exit (to add to a hub's `--allow`).
-    #[arg(long)]
-    print_id: bool,
-
-    /// (Hub) Serve HTTPS with this certificate chain (PEM). Requires --tls-key.
+    /// Serve HTTPS with this certificate chain (PEM). Requires --tls-key.
     #[arg(long, requires = "tls_key")]
     tls_cert: Option<PathBuf>,
 
-    /// (Hub) Private key (PEM) for --tls-cert.
+    /// Private key (PEM) for --tls-cert.
     #[arg(long, requires = "tls_cert")]
     tls_key: Option<PathBuf>,
 
-    /// (Hub) Obtain/renew a certificate automatically via ACME for this domain;
+    /// Obtain/renew a certificate automatically via ACME for this domain;
     /// repeat for several. Mutually exclusive with --tls-cert.
     #[arg(long = "acme-domain", value_name = "DOMAIN")]
     acme_domain: Vec<String>,
 
-    /// (Hub) Contact email for the ACME account.
+    /// Contact email for the ACME account.
     #[arg(long)]
     acme_email: Option<String>,
 
-    /// (Hub) Directory to persist the ACME account + issued certificates across
+    /// Directory to persist the ACME account + issued certificates across
     /// restarts. Strongly recommended — without it certs are re-issued every run.
     #[arg(long)]
     acme_cache: Option<PathBuf>,
 
-    /// (Hub) Use the Let's Encrypt production directory (default: staging).
+    /// Use the Let's Encrypt production directory (default: staging).
     #[arg(long)]
     acme_production: bool,
 }
@@ -107,7 +147,7 @@ enum Tls {
 }
 
 impl Tls {
-    fn from_args(a: &Args) -> Result<Tls> {
+    fn from_args(a: &HubArgs) -> Result<Tls> {
         let static_tls = a.tls_cert.is_some(); // clap guarantees tls_key is paired
         let acme = !a.acme_domain.is_empty();
         if static_tls && acme {
@@ -133,32 +173,56 @@ impl Tls {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
-
-    // Helper: print a key's session id (for a hub operator's --allow list) and exit.
-    if args.print_id {
-        let key = args
-            .key
-            .context("--print-id requires --key (or SHELLGLASS_KEY)")?;
-        println!("{}", proto::session_id(&key));
-        return Ok(());
-    }
-
-    // Hub needs no tmux/config: it only stores and re-serves what clients push.
-    if args.serve {
-        let tls = Tls::from_args(&args)?;
-        let allowed: std::collections::HashSet<String> = args.allow.into_iter().collect();
-        if allowed.is_empty() {
-            eprintln!(
-                "shellglass: warning — no --allow session ids; the hub will reject all pushes (403)"
-            );
+    match Cli::parse().action {
+        Action::GenKey => gen_key(),
+        Action::PrintId { key } => {
+            println!("{}", proto::session_id(&key.key));
+            Ok(())
         }
-        serve_hub(allowed, &args.bind, tls).await?;
-        return Ok(());
+        Action::Serve { source, bind } => run_serve(source, &bind).await,
+        Action::Push { url, key, source } => run_push(url, key.key, source).await,
+        Action::Hub(hub) => {
+            let tls = Tls::from_args(&hub)?;
+            let allowed: std::collections::HashSet<String> = hub.allow.into_iter().collect();
+            if allowed.is_empty() {
+                eprintln!(
+                    "shellglass: warning — no --allow session ids; the hub will reject all pushes (403)"
+                );
+            }
+            serve_hub(allowed, &hub.bind, tls).await
+        }
     }
+}
 
-    // Standalone and client both render locally, so both load config + fonts.
-    let mut config = match &args.config {
+/// Mint a new secret key (32 bytes of OS randomness, URL-safe base64) and print it
+/// with its session id. The key is the write capability (keep it secret); the id is
+/// the read capability to put on the hub's `hub --allow`.
+fn gen_key() -> Result<()> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| anyhow::anyhow!("reading OS randomness for the new key: {e}"))?;
+    let key = base64::Engine::encode(&URL_SAFE_NO_PAD, bytes);
+    println!("key: {key}");
+    println!("id:  {}", proto::session_id(&key));
+    Ok(())
+}
+
+/// The shared render setup for `view` and `push`: load config, resolve fonts, and
+/// build the input backend. Returns everything the two modes need to run.
+struct Rendered {
+    config: Arc<Config>,
+    fonts: Arc<Vec<FontFile>>,
+    template: Arc<String>,
+    rx: tokio::sync::watch::Receiver<String>,
+    notifier: Option<pty::Notifier>,
+}
+
+/// Load config + fonts and start the input backend (PTY if `--exec`, else tmux). The
+/// caller prints its URL *before* this returns a PTY backend, because a PTY switches
+/// the terminal to raw mode and anything printed after would corrupt the session.
+fn render_setup(source: SourceArgs) -> Result<Rendered> {
+    let mut config = match &source.config {
         Some(path) => Config::load(path)?,
         None => Config::default(),
     };
@@ -166,83 +230,69 @@ async fn main() -> Result<()> {
     // Pin any generic (monospace/…) in default_font to the host's concrete font so
     // viewers see the same face, then locate + read every referenced font on this
     // host (which has them installed) so we can serve them to viewers that don't.
-    // Done once here for both modes.
     fonts::resolve_generics(&mut config);
     let fonts = Arc::new(fonts::collect_fonts(&config));
     let template = Arc::new(config.template_html().context("loading viewer template")?);
     let config = Arc::new(config);
 
-    let interactive = !args.exec.is_empty();
-
-    if let Some(url) = args.push {
-        let key = args
-            .key
-            .context("--push requires --key (or the SHELLGLASS_KEY env var)")?;
-        // Print the view URL *before* starting the backend: a PTY backend switches
-        // the terminal to raw mode, so anything printed after would land in — and
-        // corrupt — the mirrored session.
-        let id = proto::session_id(&key);
-        let base = url.trim_end_matches('/');
-        println!("shellglass: pushing live to {base}; view at {base}/s/{id}");
-        let (rx, notifier) = start_backend(
-            interactive,
-            &args.exec,
-            args.target.clone(),
-            config.clone(),
-            resolver,
-        )?;
-        return client::run(url, key, id, config, fonts, template, rx, notifier).await;
-    }
-
-    // Standalone live viewer: serve fonts at /fonts/<index>.
-    let font_css = render::font_face_css(&fonts, "/fonts/");
-    let listener = bind(&args.bind)?;
-    // Print the URL before a PTY backend switches the terminal to raw mode.
-    if interactive {
-        println!(
-            "shellglass: mirroring `{}` (pty) at http://{}/",
-            args.exec.join(" "),
-            listener.local_addr()?
-        );
+    let (rx, notifier) = if source.exec.is_empty() {
+        (live::start(source.target, config.clone(), resolver), None)
     } else {
-        println!(
-            "shellglass: mirroring tmux target {:?} (live) at http://{}/",
-            args.target.as_deref().unwrap_or("<current>"),
-            listener.local_addr()?
-        );
-    }
-    let (live_rx, _notifier) = start_backend(
-        interactive,
-        &args.exec,
-        args.target.clone(),
-        config.clone(),
-        resolver,
-    )?;
-    let state = AppState {
+        let (rx, n) = pty::start(&source.exec, config.clone(), resolver)?;
+        (rx, Some(n))
+    };
+    Ok(Rendered {
         config,
-        font_css: Arc::new(font_css),
         fonts,
         template,
-        live_rx,
+        rx,
+        notifier,
+    })
+}
+
+/// Standalone live viewer: render locally and serve the page + SSE over HTTP.
+async fn run_serve(source: SourceArgs, bind_addr: &str) -> Result<()> {
+    let listener = bind(bind_addr)?;
+    let desc = describe_source(&source);
+    let r = render_setup(source)?;
+    // Print the URL before a PTY backend switches the terminal to raw mode.
+    println!(
+        "shellglass: mirroring {desc} at http://{}/",
+        listener.local_addr()?
+    );
+    let state = AppState {
+        font_css: Arc::new(render::font_face_css(&r.fonts, "/fonts/")),
+        config: r.config,
+        fonts: r.fonts,
+        template: r.template,
+        live_rx: r.rx,
     };
     axum::serve(listener, server::app(state)).await?;
     Ok(())
 }
 
-/// Pick the input backend: an interactive PTY command (`--exec`) or tmux control
-/// mode. Both yield a `watch::Receiver` of the latest rendered `#screen` fragment.
-fn start_backend(
-    interactive: bool,
-    exec: &[String],
-    target: Option<String>,
-    config: Arc<Config>,
-    resolver: Arc<Resolver>,
-) -> Result<(tokio::sync::watch::Receiver<String>, Option<pty::Notifier>)> {
-    if interactive {
-        let (rx, notifier) = pty::start(exec, config, resolver)?;
-        Ok((rx, Some(notifier)))
+/// Client mode: render locally and push frames to a remote hub.
+async fn run_push(url: String, key: String, source: SourceArgs) -> Result<()> {
+    let id = proto::session_id(&key);
+    let base = url.trim_end_matches('/');
+    // Print the view URL before starting the backend (PTY raw mode) — see render_setup.
+    println!("shellglass: pushing live to {base}; view at {base}/s/{id}");
+    let r = render_setup(source)?;
+    client::run(
+        url, key, id, r.config, r.fonts, r.template, r.rx, r.notifier,
+    )
+    .await
+}
+
+/// One-line description of what a source mirrors, for the startup log.
+fn describe_source(source: &SourceArgs) -> String {
+    if source.exec.is_empty() {
+        format!(
+            "tmux target {:?} (live)",
+            source.target.as_deref().unwrap_or("<current>")
+        )
     } else {
-        Ok((live::start(target, config, resolver), None))
+        format!("`{}` (pty)", source.exec.join(" "))
     }
 }
 
