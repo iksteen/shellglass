@@ -146,13 +146,16 @@ async fn main() -> Result<()> {
     }
 
     // Standalone and client both render locally, so both load config + fonts.
-    let config = match &args.config {
+    let mut config = match &args.config {
         Some(path) => Config::load(path)?,
         None => Config::default(),
     };
     let resolver = Arc::new(Resolver::build(&config).context("building font resolver")?);
-    // Locate + read referenced fonts on this host (which has them installed) so we
-    // can serve them to viewers that don't. Done once here for both modes.
+    // Pin any generic (monospace/…) in default_font to the host's concrete font so
+    // viewers see the same face, then locate + read every referenced font on this
+    // host (which has them installed) so we can serve them to viewers that don't.
+    // Done once here for both modes.
+    fonts::resolve_generics(&mut config);
     let fonts = Arc::new(fonts::collect_fonts(&config));
     let config = Arc::new(config);
 

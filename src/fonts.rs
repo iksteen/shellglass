@@ -108,6 +108,19 @@ fn load_font(family: &str, path: &Path) -> Result<FontFile> {
 /// ponytail: shells out to fc-match (the system font DB on Linux); absent or no
 /// match → None and the caller falls back to browser rendering.
 fn locate_font(name: &str) -> Option<std::path::PathBuf> {
+    let (families, path) = fc_query(name)?;
+    // %{family} is a comma-separated alias list; accept only an exact
+    // (case-insensitive) hit — otherwise fontconfig substituted a default, i.e.
+    // the requested font isn't installed and we mustn't serve the wrong file.
+    families
+        .split(',')
+        .any(|a| a.trim().eq_ignore_ascii_case(name))
+        .then_some(path)
+}
+
+/// Raw `fc-match`: the `%{family}` alias list and file path fontconfig returns for
+/// `name` (always *some* font). Returns None only if fc-match is absent/fails.
+fn fc_query(name: &str) -> Option<(String, std::path::PathBuf)> {
     let out = std::process::Command::new("fc-match")
         .arg("-f")
         .arg("%{family}|%{file}")
@@ -119,11 +132,30 @@ fn locate_font(name: &str) -> Option<std::path::PathBuf> {
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     let (families, file) = stdout.split_once('|')?;
-    // %{family} is a comma-separated alias list; any exact (case-insensitive) hit.
-    if !families.split(',').any(|a| a.trim().eq_ignore_ascii_case(name)) {
-        return None;
+    Some((families.to_string(), std::path::PathBuf::from(file.trim())))
+}
+
+/// Expand CSS-generic entries in `default_font` (`monospace`, `serif`, …) to the
+/// host's concrete font family so viewers render the same face rather than their
+/// own browser default — for a mirror, the host's monospace *is* the content. The
+/// generic stays as the stack's last-resort fallback (appended by `font_stack`);
+/// downstream (`collect_fonts`, `font_stack`) then treats the concrete name like
+/// any other family. Left untouched if fontconfig can't resolve it.
+pub fn resolve_generics(config: &mut Config) {
+    for fam in &mut config.default_font {
+        if !GENERICS.contains(&fam.as_str()) {
+            continue;
+        }
+        // Take fontconfig's substitution as-is (that's what a generic means); use
+        // its primary alias as the concrete family name to reference and serve.
+        if let Some((families, _)) = fc_query(fam) {
+            if let Some(concrete) = families.split(',').next().map(str::trim) {
+                if !concrete.is_empty() {
+                    *fam = concrete.to_string();
+                }
+            }
+        }
     }
-    Some(std::path::PathBuf::from(file.trim()))
 }
 
 /// Parse `"U+E0A0-U+E0D4"` or a single `"U+F000"` into an inclusive range.
@@ -201,6 +233,21 @@ mod tests {
         ];
         // monospace dropped (generic); Menlo appears once despite two references.
         assert_eq!(referenced_families(&cfg), vec!["Menlo".to_string(), "NF".to_string()]);
+    }
+
+    #[test]
+    fn resolve_generics_pins_monospace_to_a_concrete_font() {
+        let mut cfg = Config::default(); // ["monospace", "Symbols Nerd Font Mono"]
+        resolve_generics(&mut cfg);
+        // With fontconfig present the generic becomes a concrete (non-generic)
+        // family; without it, it's left as-is. Either way it must not vanish, and
+        // the non-monospace entry is untouched.
+        let first = &cfg.default_font[0];
+        assert!(!first.is_empty());
+        if first != "monospace" {
+            assert!(!GENERICS.contains(&first.as_str()), "resolved to another generic: {first}");
+        }
+        assert_eq!(cfg.default_font[1], "Symbols Nerd Font Mono");
     }
 
     #[test]
