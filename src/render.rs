@@ -207,7 +207,13 @@ fn render_row(
 
 /// Emit a run of plain text as one fixed-width `inline-block` box that occupies
 /// exactly `cols` base-font columns.
-fn flush_text_run(out: &mut String, style: &Option<String>, col: u16, cols: u16, text: &mut String) {
+fn flush_text_run(
+    out: &mut String,
+    style: &Option<String>,
+    col: u16,
+    cols: u16,
+    text: &mut String,
+) {
     if text.is_empty() {
         return;
     }
