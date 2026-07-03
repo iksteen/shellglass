@@ -1,12 +1,19 @@
-//! Kitty-style `symbol_map`: resolve a character's codepoint to a font family,
-//! and build the embedded `@font-face` CSS for configured font sources.
+//! Kitty-style `symbol_map` codepoint→family resolution, plus locating the font
+//! files referenced by the config so they can be served to viewers.
+//!
+//! Font lookup uses [`fontdb`] — a pure-Rust, cross-platform system font database
+//! (no `fc-match`/Core Text subprocess). It hands back the file *and the face
+//! index*, so a single face can be extracted from a `.ttc` collection and served
+//! as a standalone web font (browsers can't select a face from a `.ttc`).
 
 use crate::config::Config;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
+use fontdb::{Database, Family, Query, Stretch, Style, Weight};
 use std::ops::RangeInclusive;
 use std::path::Path;
+use std::sync::OnceLock;
 
 /// Compiled font-override table: codepoint ranges paired with a family name.
 /// First matching range wins, mirroring Kitty's `symbol_map` semantics.
@@ -63,54 +70,92 @@ pub struct FontFile {
     pub bytes: Vec<u8>,
 }
 
+/// The process-wide system font database, built once (scanning font dirs is not
+/// cheap). Shared by generic resolution and per-family location.
+fn system_db() -> &'static Database {
+    static DB: OnceLock<Database> = OnceLock::new();
+    DB.get_or_init(|| {
+        let mut db = Database::new();
+        db.load_system_fonts();
+        db
+    })
+}
+
 /// Locate and read every referenced family's font file: an explicit `[fonts].path`
-/// wins, otherwise ask fontconfig (`fc-match`) for the installed file. Missing or
-/// unreadable fonts are soft failures (warn + skip) so the page still renders with
-/// browser fallback. Run once at startup by the process that owns the fonts
-/// (standalone or push client); the hub just serves what the client uploads.
+/// wins, otherwise `fontdb` finds the installed file. `.ttc` faces are extracted to
+/// standalone web fonts. Missing/unreadable fonts are soft failures (warn + skip)
+/// so the page still renders with browser fallback. Run once at startup by the
+/// process that owns the fonts (standalone or push client); the hub just serves
+/// what the client uploads.
 pub fn collect_fonts(config: &Config) -> Vec<FontFile> {
+    let db = system_db();
     let mut out = Vec::new();
     for family in referenced_families(config) {
         let entry = config.fonts.get(&family);
-        let path = entry.and_then(|s| s.path.clone()).or_else(|| {
+        let ff = if let Some(path) = entry.and_then(|s| s.path.as_deref()) {
+            match load_font_file(&family, path) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    eprintln!("tmuxsnitch: skipping font {family:?}: {e:#}");
+                    None
+                }
+            }
+        } else {
+            // `system` overrides the name to look up when it differs from the key.
             let name = entry.and_then(|s| s.system.as_deref()).unwrap_or(&family);
-            locate_font(name)
-        });
-        let Some(path) = path else {
+            let f = fontdb_locate(db, name).map(|(bytes, mime, format)| FontFile {
+                family: family.clone(), // reference it by the config key, not the lookup name
+                mime,
+                format,
+                bytes,
+            });
             // The built-in default symbol font is expected to be absent on some
             // hosts; don't nag about it. Anything the user configured, do warn.
-            if family != crate::config::DEFAULT_SYMBOL_FONT {
+            if f.is_none() && family != crate::config::DEFAULT_SYMBOL_FONT {
                 eprintln!(
                     "tmuxsnitch: font {family:?} not found on this host — viewers without it \
                      installed will see fallback glyphs"
                 );
             }
-            continue;
+            f
         };
-        match load_font(&family, &path) {
-            Ok(f) => out.push(f),
-            Err(e) => eprintln!("tmuxsnitch: skipping font {family:?}: {e:#}"),
-        }
+        out.extend(ff);
     }
     out
 }
 
-fn load_font(family: &str, path: &Path) -> Result<FontFile> {
-    let (mime, format) = font_format(path)?;
-    let bytes =
-        std::fs::read(path).with_context(|| format!("reading font file {}", path.display()))?;
+/// Read an explicit font file: WOFF/WOFF2 are already single-face web fonts and
+/// pass through; ttf/otf/ttc are normalized to a standalone sfnt (face 0).
+fn load_font_file(family: &str, path: &Path) -> Result<FontFile> {
+    let raw = std::fs::read(path).with_context(|| format!("reading font {}", path.display()))?;
+    let (bytes, mime, format) = match raw.get(0..4) {
+        Some(b"wOFF") => (raw, "font/woff", "woff"),
+        Some(b"wOF2") => (raw, "font/woff2", "woff2"),
+        _ => {
+            let (bytes, format) =
+                sfnt_face(&raw, 0).with_context(|| format!("parsing font {}", path.display()))?;
+            (bytes, mime_for(format), format)
+        }
+    };
     Ok(FontFile { family: family.to_string(), mime, format, bytes })
 }
 
-/// Ask fontconfig for the file backing `name`. fc-match always returns *some*
-/// font, so accept the result only if its family actually matches `name` — a
-/// mismatch means the font isn't installed and fontconfig substituted a default.
-/// File for an installed family exactly named `name`, or `None` if it isn't
-/// installed (a substituted default doesn't count) or the platform font DB is
-/// unavailable — the caller then falls back to browser rendering. Backed by
-/// fontconfig (`fc-match`) elsewhere, Core Text on macOS.
-fn locate_font(name: &str) -> Option<std::path::PathBuf> {
-    platform::locate_installed(name)
+/// Find the installed file for family `name` via fontdb and return servable bytes.
+/// fontdb matches by family and doesn't substitute, but double-check the match to
+/// be safe. Returns `(bytes, mime, format)`.
+fn fontdb_locate(db: &Database, name: &str) -> Option<(Vec<u8>, &'static str, &'static str)> {
+    let id = db.query(&Query {
+        families: &[Family::Name(name)],
+        weight: Weight::NORMAL,
+        stretch: Stretch::Normal,
+        style: Style::Normal,
+    })?;
+    let info = db.face(id)?;
+    if !info.families.iter().any(|(f, _)| f.eq_ignore_ascii_case(name)) {
+        return None;
+    }
+    let (bytes, format) = db.with_face_data(id, |data, idx| sfnt_face(data, idx))??;
+    Some((bytes, mime_for(format), format))
 }
 
 /// Expand CSS-generic entries in `default_font` (`monospace`, `serif`, …) to the
@@ -118,87 +163,154 @@ fn locate_font(name: &str) -> Option<std::path::PathBuf> {
 /// own browser default — for a mirror, the host's monospace *is* the content. The
 /// generic stays as the stack's last-resort fallback (appended by `font_stack`);
 /// downstream (`collect_fonts`, `font_stack`) then treats the concrete name like
-/// any other family. Left untouched if the platform can't resolve it.
+/// any other family. Left untouched if nothing suitable is installed.
 pub fn resolve_generics(config: &mut Config) {
+    let db = system_db();
     for fam in &mut config.default_font {
         if !GENERICS.contains(&fam.as_str()) {
             continue;
         }
-        if let Some(concrete) = platform::resolve_generic(fam) {
+        if let Some(concrete) = concrete_generic(db, fam) {
             *fam = concrete;
         }
     }
 }
 
-/// Platform font-database lookup: fontconfig on Linux/BSD, Core Text on macOS.
-#[cfg(not(target_os = "macos"))]
-mod platform {
-    use std::path::PathBuf;
-
-    /// ponytail: shells out to fc-match (the system font DB); absent/failed → None.
-    pub fn locate_installed(name: &str) -> Option<PathBuf> {
-        let (families, path) = fc_query(name)?;
-        // %{family} is a comma-separated alias list; accept only an exact
-        // (case-insensitive) hit — otherwise fontconfig substituted a default.
-        families
-            .split(',')
-            .any(|a| a.trim().eq_ignore_ascii_case(name))
-            .then_some(path)
-    }
-
-    /// fontconfig resolves a generic itself; take its primary matched family.
-    pub fn resolve_generic(name: &str) -> Option<String> {
-        let (families, _) = fc_query(name)?;
-        let fam = families.split(',').next()?.trim();
-        (!fam.is_empty()).then(|| fam.to_string())
-    }
-
-    /// Raw `fc-match`: the `%{family}` alias list and file path for `name`.
-    fn fc_query(name: &str) -> Option<(String, PathBuf)> {
-        let out = std::process::Command::new("fc-match")
-            .arg("-f")
-            .arg("%{family}|%{file}")
-            .arg(name)
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let (families, file) = stdout.split_once('|')?;
-        Some((families.to_string(), PathBuf::from(file.trim())))
-    }
+/// A concrete installed family backing a CSS generic. fontdb doesn't track the OS
+/// default, so try a small ordered candidate list per generic (cross-platform) and
+/// take the first installed. ponytail: heuristic, not the exact OS default — fine
+/// for a mirror, and the generic stays as the ultimate CSS fallback regardless.
+fn concrete_generic(db: &Database, generic: &str) -> Option<String> {
+    let candidates: &[&str] = match generic {
+        "monospace" => &[
+            "Menlo", "DejaVu Sans Mono", "Noto Sans Mono", "Liberation Mono", "Consolas",
+            "Cascadia Mono", "Courier New",
+        ],
+        "serif" => &["Times New Roman", "Times", "DejaVu Serif", "Noto Serif", "Liberation Serif"],
+        "sans-serif" => &["Helvetica", "Arial", "DejaVu Sans", "Noto Sans", "Liberation Sans"],
+        "cursive" => &["Apple Chancery", "Comic Sans MS"],
+        "fantasy" => &["Papyrus", "Impact"],
+        _ => return None,
+    };
+    candidates
+        .iter()
+        .find(|c| {
+            db.faces()
+                .any(|f| f.families.iter().any(|(fam, _)| fam.eq_ignore_ascii_case(c)))
+        })
+        .map(|c| c.to_string())
 }
 
-#[cfg(target_os = "macos")]
-mod platform {
-    use core_text::font;
-    use std::path::PathBuf;
-
-    /// Installed file for family `name` via Core Text. Core Text substitutes a
-    /// default when the family is missing, so accept only when the resolved font's
-    /// family actually matches `name` (mirrors the fontconfig exact-match check).
-    pub fn locate_installed(name: &str) -> Option<PathBuf> {
-        let f = font::new_from_name(name, 12.0).ok()?;
-        if !f.family_name().eq_ignore_ascii_case(name) {
+/// Extract face `index` from `data` (a TTF/OTF, or one face of a TTC) as a
+/// standalone sfnt, so it can be served as a single web font. Rebuilds the offset
+/// table + table directory pointing at 4-aligned copies of the face's tables and
+/// recomputes `head.checkSumAdjustment`. Returns the bytes and CSS `format`
+/// keyword; `None` on malformed input (all indexing is bounds-checked).
+fn sfnt_face(data: &[u8], index: u32) -> Option<(Vec<u8>, &'static str)> {
+    // A TTC starts with 'ttcf' then per-face offsets to each face's offset table.
+    let dir = if data.get(0..4)? == b"ttcf" {
+        let num = read_u32(data, 8)? as usize;
+        if index as usize >= num {
             return None;
         }
-        f.url().and_then(|u| u.to_path())
+        read_u32(data, 12 + 4 * index as usize)? as usize
+    } else {
+        0
+    };
+
+    let sfnt_ver = data.get(dir..dir + 4)?.to_vec();
+    let num_tables = read_u16(data, dir + 4)? as usize;
+    if num_tables == 0 {
+        return None;
     }
 
-    /// Core Text has no CSS generics, so map them to the macOS families that back
-    /// them, keeping only ones actually present (via the exact-match locator).
-    pub fn resolve_generic(name: &str) -> Option<String> {
-        let concrete = match name {
-            "monospace" => "Menlo",
-            "serif" => "Times New Roman",
-            "sans-serif" => "Helvetica",
-            "cursive" => "Apple Chancery",
-            "fantasy" => "Papyrus",
-            _ => return None,
-        };
-        let f = font::new_from_name(concrete, 12.0).ok()?;
-        f.family_name().eq_ignore_ascii_case(concrete).then(|| concrete.to_string())
+    // Collect each table's (tag, checksum, body) from the face's directory.
+    let mut tables = Vec::with_capacity(num_tables);
+    for i in 0..num_tables {
+        let rec = dir + 12 + i * 16;
+        let tag = data.get(rec..rec + 4)?.to_vec();
+        let checksum = read_u32(data, rec + 4)?;
+        let off = read_u32(data, rec + 8)? as usize;
+        let len = read_u32(data, rec + 12)? as usize;
+        let body = data.get(off..off + len)?.to_vec();
+        tables.push((tag, checksum, body));
+    }
+
+    // Write a fresh single-face sfnt: offset table, records, 4-aligned bodies.
+    let mut out = Vec::new();
+    out.extend_from_slice(&sfnt_ver);
+    let (sr, es, rs) = sfnt_search_params(num_tables);
+    out.extend_from_slice(&(num_tables as u16).to_be_bytes());
+    out.extend_from_slice(&sr.to_be_bytes());
+    out.extend_from_slice(&es.to_be_bytes());
+    out.extend_from_slice(&rs.to_be_bytes());
+    let rec_start = out.len();
+    out.resize(rec_start + num_tables * 16, 0);
+    let mut head_off = None;
+    for (i, (tag, checksum, body)) in tables.iter().enumerate() {
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+        let off = out.len() as u32;
+        if tag.as_slice() == b"head" {
+            head_off = Some(off as usize);
+        }
+        out.extend_from_slice(body);
+        let rec = rec_start + i * 16;
+        out[rec..rec + 4].copy_from_slice(tag);
+        out[rec + 4..rec + 8].copy_from_slice(&checksum.to_be_bytes());
+        out[rec + 8..rec + 12].copy_from_slice(&off.to_be_bytes());
+        out[rec + 12..rec + 16].copy_from_slice(&(body.len() as u32).to_be_bytes());
+    }
+
+    // head.checkSumAdjustment = 0xB1B0AFBA − checksum(whole file, field zeroed).
+    if let Some(h) = head_off {
+        if out.len() >= h + 12 {
+            out[h + 8..h + 12].copy_from_slice(&[0; 4]);
+            let adj = 0xB1B0_AFBAu32.wrapping_sub(sfnt_checksum(&out));
+            out[h + 8..h + 12].copy_from_slice(&adj.to_be_bytes());
+        }
+    }
+
+    let format = if sfnt_ver == b"OTTO" { "opentype" } else { "truetype" };
+    Some((out, format))
+}
+
+fn read_u16(d: &[u8], at: usize) -> Option<u16> {
+    Some(u16::from_be_bytes(d.get(at..at + 2)?.try_into().ok()?))
+}
+fn read_u32(d: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_be_bytes(d.get(at..at + 4)?.try_into().ok()?))
+}
+
+/// Sum of the data as big-endian u32 words, zero-padding a trailing partial word.
+fn sfnt_checksum(d: &[u8]) -> u32 {
+    d.chunks(4).fold(0u32, |acc, c| {
+        let mut w = [0u8; 4];
+        w[..c.len()].copy_from_slice(c);
+        acc.wrapping_add(u32::from_be_bytes(w))
+    })
+}
+
+/// sfnt offset-table `searchRange`, `entrySelector`, `rangeShift` for `n` tables.
+fn sfnt_search_params(n: usize) -> (u16, u16, u16) {
+    let mut es = 0u16;
+    let mut p = 1usize;
+    while p * 2 <= n {
+        p *= 2;
+        es += 1;
+    }
+    let sr = (p * 16) as u16;
+    let rs = (n * 16) as u16 - sr;
+    (sr, es, rs)
+}
+
+fn mime_for(format: &str) -> &'static str {
+    match format {
+        "opentype" => "font/otf",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        _ => "font/ttf",
     }
 }
 
@@ -242,21 +354,6 @@ pub fn font_assets(fonts: &[FontFile]) -> Vec<crate::proto::FontAsset> {
         .collect()
 }
 
-fn font_format(path: &Path) -> Result<(&'static str, &'static str)> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    match ext.as_str() {
-        "woff2" => Ok(("font/woff2", "woff2")),
-        "woff" => Ok(("font/woff", "woff")),
-        "ttf" => Ok(("font/ttf", "truetype")),
-        "otf" => Ok(("font/otf", "opentype")),
-        other => bail!("unsupported font extension {other:?} for {}", path.display()),
-    }
-}
-
 /// Family names go inside a single-quoted CSS string; neutralize quotes/backslashes.
 pub(crate) fn css_escape_family(name: &str) -> String {
     name.replace('\\', "\\\\").replace('\'', "\\'")
@@ -280,12 +377,74 @@ mod tests {
     }
 
     #[test]
+    fn extracts_single_face_from_ttc() {
+        // Build a 1-face TTC with a 'head' (≥12 bytes) and a 'cmap', extract face 0,
+        // and confirm both tables survive and the head checksum is made valid.
+        let head = vec![0u8; 54];
+        let cmap = vec![1u8, 2, 3, 4, 5];
+        let tables: [(&[u8; 4], &[u8]); 2] = [(b"head", &head), (b"cmap", &cmap)];
+        let ttc = build_ttc(b"\x00\x01\x00\x00", &tables);
+
+        let (out, format) = sfnt_face(&ttc, 0).expect("extract face 0");
+        assert_eq!(format, "truetype");
+        assert!(sfnt_face(&ttc, 1).is_none(), "only one face exists");
+
+        let n = u16::from_be_bytes([out[4], out[5]]) as usize;
+        assert_eq!(n, 2);
+        let table = |tag: &[u8; 4]| -> Vec<u8> {
+            for i in 0..n {
+                let rec = 12 + i * 16;
+                if &out[rec..rec + 4] == tag {
+                    let off = read_u32(&out, rec + 8).unwrap() as usize;
+                    let len = read_u32(&out, rec + 12).unwrap() as usize;
+                    return out[off..off + len].to_vec();
+                }
+            }
+            panic!("table {tag:?} missing from extracted sfnt");
+        };
+        assert_eq!(table(b"cmap"), cmap);
+        assert_eq!(table(b"head").len(), 54);
+        // With checkSumAdjustment applied, the whole file sums to the magic constant.
+        assert_eq!(sfnt_checksum(&out), 0xB1B0_AFBA, "head checkSumAdjustment wrong");
+    }
+
+    /// Lay out a single-face TTC with table offsets absolute from file start.
+    fn build_ttc(version: &[u8; 4], tables: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let n = tables.len();
+        let dir_off = 16usize; // 'ttcf' + version + numFonts + one face offset
+        let mut sfnt = Vec::new();
+        sfnt.extend_from_slice(version);
+        sfnt.extend_from_slice(&(n as u16).to_be_bytes());
+        sfnt.extend_from_slice(&[0u8; 6]); // search params (ignored by reader)
+        let rec_start = sfnt.len();
+        sfnt.resize(rec_start + n * 16, 0);
+        for (i, (tag, body)) in tables.iter().enumerate() {
+            while (dir_off + sfnt.len()) % 4 != 0 {
+                sfnt.push(0);
+            }
+            let off = (dir_off + sfnt.len()) as u32;
+            sfnt.extend_from_slice(body);
+            let rec = rec_start + i * 16;
+            sfnt[rec..rec + 4].copy_from_slice(*tag);
+            sfnt[rec + 8..rec + 12].copy_from_slice(&off.to_be_bytes());
+            sfnt[rec + 12..rec + 16].copy_from_slice(&(body.len() as u32).to_be_bytes());
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(b"ttcf");
+        out.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        out.extend_from_slice(&1u32.to_be_bytes());
+        out.extend_from_slice(&(dir_off as u32).to_be_bytes());
+        out.extend_from_slice(&sfnt);
+        out
+    }
+
+    #[test]
     fn resolve_generics_pins_monospace_to_a_concrete_font() {
         let mut cfg = Config::default(); // ["monospace", "Symbols Nerd Font Mono"]
         resolve_generics(&mut cfg);
-        // With fontconfig present the generic becomes a concrete (non-generic)
-        // family; without it, it's left as-is. Either way it must not vanish, and
-        // the non-monospace entry is untouched.
+        // With a monospace font installed the generic becomes a concrete (non-
+        // generic) family; without one, it's left as-is. Either way it must not
+        // vanish, and the non-monospace entry is untouched.
         let first = &cfg.default_font[0];
         assert!(!first.is_empty());
         if first != "monospace" {
@@ -296,7 +455,7 @@ mod tests {
 
     #[test]
     fn collect_skips_unlocatable_and_missing_path() {
-        // Neither a family fontconfig can't match nor a bad explicit path yields a
+        // Neither a family fontdb can't match nor a bad explicit path yields a
         // FontFile — collection soft-fails instead of aborting. (No dependence on
         // any particular font being installed: we only assert these are absent.)
         let mut cfg = Config::default();

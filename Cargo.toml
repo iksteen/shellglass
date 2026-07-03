@@ -11,6 +11,7 @@ axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.22.1"
 bytes = "1"
 clap = { version = "4.6.1", features = ["derive", "env"] }
+fontdb = "0.23"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
 rustls-acme = { version = "0.15", features = ["axum", "tokio"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -19,8 +20,3 @@ tokio = { version = "1.52.3", features = ["full"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 toml = "1.1.2"
 vt100 = "0.16.2"
-
-# macOS: locate installed font files via Core Text (no fontconfig/fc-match there).
-[target.'cfg(target_os = "macos")'.dependencies]
-core-text = "20"
-core-foundation = "0.10"
