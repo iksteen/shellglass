@@ -187,8 +187,10 @@ powerline rendering by serving kitty's bundled `Symbols Nerd Font Mono` as a fal
   ACME defaults to Let's Encrypt **staging** (untrusted certs, generous rate limits)
   so you can test the plumbing; add `--acme-production` for real certs. Always set
   `--acme-cache` or the account + certificate are re-issued on every restart.
-  Otherwise, run behind a TLS-terminating reverse proxy. The client's `--push`
-  URL just needs to be `https://…`.
+  Otherwise, run behind a TLS-terminating reverse proxy (Traefik, nginx, …). The
+  client's `--push` URL just needs to be `https://…`, and the hub honors
+  `X-Forwarded-Proto`/`X-Forwarded-Host` so the view URL it prints on connect
+  matches the proxy's public address, not the hub's internal bind.
 - The hub trusts allowed clients: it caps the `/register` body at 64 MB (uploaded fonts
   are large) but does not otherwise rate-limit. Don't expose an open hub to the internet.
 

@@ -95,6 +95,28 @@ fn key_of(headers: &HeaderMap) -> Option<String> {
     headers.get(KEY_HEADER)?.to_str().ok().map(str::to_string)
 }
 
+/// Public base URL for logging a view link, honoring reverse-proxy headers so the
+/// URL matches the address a viewer actually reaches (e.g. behind Traefik). Takes
+/// scheme from `X-Forwarded-Proto`, host from `X-Forwarded-Host` then `Host`;
+/// falls back to the configured base for whichever part is absent. XFF headers are
+/// comma-lists (proxy chain) — the first token is the original client-facing value.
+fn view_base(headers: &HeaderMap, configured: &str) -> String {
+    let fwd = |name| header_str(headers, name).and_then(|v| v.split(',').next()).map(str::trim);
+    let (def_scheme, def_host) = configured
+        .split_once("://")
+        .map_or(("http", configured), |(s, h)| (s, h));
+    let scheme = fwd("x-forwarded-proto").filter(|s| !s.is_empty()).unwrap_or(def_scheme);
+    let host = fwd("x-forwarded-host")
+        .or_else(|| header_str(headers, "host"))
+        .filter(|s| !s.is_empty())
+        .unwrap_or(def_host);
+    format!("{scheme}://{host}")
+}
+
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name)?.to_str().ok()
+}
+
 /// Store (or refresh) a session's CSS and served fonts. Creates the session if new.
 async fn register(
     State(st): State<HubState>,
@@ -123,8 +145,9 @@ async fn register(
             map.insert(id.clone(), Session { css: reg.css, frame, fonts });
             // First registration for this id (a new client, or after a hub
             // restart) — announce where to watch it. Stream reconnects re-hit the
-            // Some branch, so this doesn't spam.
-            println!("tmuxsnitch: session connected — view at {}/s/{id}", st.base);
+            // Some branch, so this doesn't spam. Honor reverse-proxy headers so the
+            // URL matches the public address, not the hub's internal bind.
+            println!("tmuxsnitch: session connected — view at {}/s/{id}", view_base(&headers, &st.base));
         }
     }
     (StatusCode::OK, id).into_response()
@@ -223,5 +246,25 @@ mod tests {
         // An empty allowlist rejects everything (no implicit open hub).
         let empty = HubState::new(HashSet::new(), String::new());
         assert!(!empty.allowed.contains(&session_id("good-secret")));
+    }
+
+    #[test]
+    fn view_base_honors_forwarded_headers() {
+        let cfg = "http://127.0.0.1:8080";
+
+        // No proxy headers → configured base verbatim.
+        assert_eq!(view_base(&HeaderMap::new(), cfg), cfg);
+
+        // Host header only (no proxy) → configured scheme + that host.
+        let mut h = HeaderMap::new();
+        h.insert("host", "example.com".parse().unwrap());
+        assert_eq!(view_base(&h, cfg), "http://example.com");
+
+        // Full XFF chain → first token of each, overriding scheme + host.
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-proto", "https, http".parse().unwrap());
+        h.insert("x-forwarded-host", "hub.example.com, internal".parse().unwrap());
+        h.insert("host", "internal:8080".parse().unwrap());
+        assert_eq!(view_base(&h, cfg), "https://hub.example.com");
     }
 }
