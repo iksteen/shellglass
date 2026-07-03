@@ -6,11 +6,12 @@
 //! `/s/<id>/events`. The id is the read capability; the secret (never sent to
 //! viewers) is the write capability.
 
+use crate::fonts::CACHE_CONTROL_FONT;
 use crate::proto::{self, session_id, KEY_HEADER};
 use crate::render;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::header::CONTENT_TYPE;
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
@@ -24,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 use tokio_stream::wrappers::WatchStream;
 use tokio_stream::StreamExt;
+use tower_http::compression::CompressionLayer;
 
 struct Session {
     css: String,
@@ -65,10 +67,13 @@ fn authorize(st: &HubState, headers: &HeaderMap) -> Result<String, StatusCode> {
 }
 
 pub fn app(state: HubState) -> Router {
+    // Compress the page + fonts, but never the SSE stream (compression buffers and
+    // would defeat the realtime push). So layer per-route, not globally.
+    let compress = CompressionLayer::new();
     Router::new()
         .route("/", get(index))
-        // /register carries the page CSS with base64-embedded fonts, which blows
-        // past axum's 2 MB default. Allowed clients are trusted, so cap generously.
+        // /register carries the page CSS plus base64 fonts, which blows past axum's
+        // 2 MB default. Allowed clients are trusted, so cap generously.
         .route(
             "/register",
             post(register).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
@@ -76,9 +81,9 @@ pub fn app(state: HubState) -> Router {
         // /stream is an unbounded, never-ending push body — the default limit would
         // cut it off, so disable it here.
         .route("/stream", post(stream).layer(DefaultBodyLimit::disable()))
-        .route("/s/{id}", get(view))
+        .route("/s/{id}", get(view).layer(compress.clone()))
         .route("/s/{id}/events", get(events))
-        .route("/s/{id}/fonts/{key}", get(font))
+        .route("/s/{id}/fonts/{key}", get(font).layer(compress))
         .with_state(state)
 }
 
@@ -125,9 +130,17 @@ async fn font(State(st): State<HubState>, Path((id, key)): Path<(String, String)
         return (StatusCode::NOT_FOUND, "unknown session").into_response();
     };
     match s.fonts.get(&key) {
-        // ponytail: clone the bytes per request; browsers cache fonts, so this is
-        // a cache-miss cost only. Wrap in Arc<[u8]> if it ever shows up in a profile.
-        Some((mime, bytes)) => ([(CONTENT_TYPE, mime.clone())], bytes.clone()).into_response(),
+        // ponytail: clone the bytes per request; browsers cache fonts (see the
+        // Cache-Control), so this is a cache-miss cost only. Wrap in Arc<[u8]> if it
+        // ever shows up in a profile.
+        Some((mime, bytes)) => (
+            [
+                (CONTENT_TYPE, mime.clone()),
+                (CACHE_CONTROL, CACHE_CONTROL_FONT.to_string()),
+            ],
+            bytes.clone(),
+        )
+            .into_response(),
         None => (StatusCode::NOT_FOUND, "unknown font").into_response(),
     }
 }

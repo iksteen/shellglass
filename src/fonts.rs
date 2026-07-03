@@ -61,6 +61,13 @@ fn referenced_families(config: &Config) -> Vec<String> {
         .collect()
 }
 
+/// `Cache-Control` for served fonts. A font's bytes are stable for the life of a
+/// session, so cache them a day and skip refetching on every page load / reconnect.
+/// ponytail: plain max-age, not `immutable` — a client that re-registers a changed
+/// config can remap the same key to different bytes; content-hash keys if you ever
+/// want `immutable`.
+pub const CACHE_CONTROL_FONT: &str = "public, max-age=86400";
+
 /// A font file located on this host, to be served to viewers so they render the
 /// glyphs without a local install. `family` is the CSS name it's referenced by.
 pub struct FontFile {

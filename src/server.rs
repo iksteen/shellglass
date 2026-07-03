@@ -3,10 +3,10 @@
 //! channel; `GET /` serves the page and `GET /events` streams updates over SSE.
 
 use crate::config::Config;
-use crate::fonts::FontFile;
+use crate::fonts::{FontFile, CACHE_CONTROL_FONT};
 use crate::render;
 use axum::extract::{Path, State};
-use axum::http::header::CONTENT_TYPE;
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
@@ -17,6 +17,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use tokio_stream::wrappers::WatchStream;
 use tokio_stream::StreamExt;
+use tower_http::compression::CompressionLayer;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -30,16 +31,23 @@ pub struct AppState {
 }
 
 pub fn app(state: AppState) -> Router {
+    // Compress the page + fonts, but never the SSE stream (compression buffers and
+    // would defeat the realtime push). So layer per-route, not globally.
+    let compress = CompressionLayer::new();
     Router::new()
-        .route("/", get(index))
+        .route("/", get(index).layer(compress.clone()))
         .route("/events", get(events))
-        .route("/fonts/{key}", get(font))
+        .route("/fonts/{key}", get(font).layer(compress))
         .with_state(state)
 }
 
 async fn font(State(state): State<AppState>, Path(key): Path<String>) -> Response {
     match key.parse::<usize>().ok().and_then(|i| state.fonts.get(i)) {
-        Some(f) => ([(CONTENT_TYPE, f.mime)], f.bytes.clone()).into_response(),
+        Some(f) => (
+            [(CONTENT_TYPE, f.mime), (CACHE_CONTROL, CACHE_CONTROL_FONT)],
+            f.bytes.clone(),
+        )
+            .into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
