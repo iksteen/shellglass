@@ -18,9 +18,15 @@
 //! - `{"t":"b", html}` — an error banner.
 //!
 //! Rectangles are each row's minimal changed cell-index span, with consecutive rows
-//! sharing an identical span merged vertically into one rectangle.
-//! ponytail: identical-span merge only; a bounding-rect merge over *overlapping*
-//! spans would send fewer rects but more (unchanged) cells — add if a workload wants it.
+//! sharing an identical span merged vertically into one rectangle. Measured (see
+//! `zz_analyze_rect_merging`): looser merging is a dead end — always-merging
+//! adjacent rows costs +9% bytes on an 80×24 corpus and +33% at 276×65 (padding
+//! scales with width), while an exact-cost greedy merge recovers only 0.3–1.1% and
+//! sometimes wins by *splitting* equal-span runs (the sparse style map keys are
+//! rect-relative, so tall rects inflate every key on style-dense content). The
+//! real remaining fat is the style map itself — runs of identically-styled cells
+//! each pay a full `{"n":{...}}` entry; a run-length style encoding is the
+//! worthwhile follow-up, not better rectangles.
 //!
 //! Connecting is **lock-free** (`/s/<id>/events` is public — the id is the read
 //! capability — so a connect flood must not be able to stall the publisher): deltas
@@ -641,6 +647,207 @@ mod tests {
                 Text::Blank => "",
             })
             .collect()
+    }
+
+    /// Wire-cost analysis harness, inert without SG_CORPUS. Replays real terminal
+    /// recordings through vt100 with the production 33ms frame coalescing and
+    /// compares rect strategies by exact encoded bytes — the measurement tool for
+    /// any future wire-format change (e.g. run-length style encoding).
+    ///
+    /// Record a corpus session (name.tm + name.raw pairs in a directory):
+    ///   script -q --log-timing name.tm --log-out name.raw \
+    ///     -c 'stty cols 80 rows 24; <the workload>'
+    /// Run: SG_CORPUS=<dir> [SG_SIZE=80x24] cargo test zz_analyze -- --nocapture
+    ///
+    /// Findings (2026-07, 80×24 + 276×65 corpora: htop, vim, logs, cargo, typing,
+    /// progress bars, watch): always-merging adjacent rows costs +9%/+33% bytes;
+    /// exact-cost greedy merging (incl. bridging unchanged rows) recovers only
+    /// 0.3–1.1% and often prefers SPLITTING tall rects because rect-relative style
+    /// keys inflate on style-dense content. Current conservative merging is within
+    /// ~1% of greedy-optimal; the style map, not rect geometry, is where the
+    /// remaining bytes are.
+    #[test]
+    fn zz_analyze_rect_merging() {
+        let dir = std::env::var("SG_CORPUS").unwrap_or_default();
+        if dir.is_empty() {
+            return;
+        }
+
+        // Encoded size of one rect (its share of the diff message).
+        fn rect_bytes(r: &WireRect) -> usize {
+            serde_json::to_string(r).unwrap().len() + 1 // +1 for the list comma
+        }
+        // Build a bounding rect for rows top..=bot spanning cell cols lo..=hi.
+        fn bounding<'a>(g: &'a Grid, top: usize, bot: usize, lo: usize, hi: usize) -> WireRect<'a> {
+            let mut cells = Vec::new();
+            for row in &g.rows[top..=bot] {
+                for i in lo..=hi {
+                    cells.push(row.get(i).unwrap_or(blank()));
+                }
+            }
+            WireRect {
+                top,
+                left: lo,
+                w: hi - lo + 1,
+                h: bot - top + 1,
+                block: cell_block(cells.into_iter()),
+            }
+        }
+
+        // Greedy: accumulate a rect; merge the next changed row (bridging up to
+        // `gap` unchanged rows as padding) when the merged encoding is no larger
+        // than the pieces. `gap` 0 = adjacent only.
+        fn greedy<'a>(old: &Grid, new: &'a Grid, gap: usize) -> Vec<WireRect<'a>> {
+            let spans: Vec<Option<(usize, usize)>> = old
+                .rows
+                .iter()
+                .zip(&new.rows)
+                .map(|(o, n)| row_span(o, n))
+                .collect();
+            let mut out: Vec<WireRect> = Vec::new();
+            // (top, bot, lo, hi) of the rect being accumulated.
+            let mut acc: Option<(usize, usize, usize, usize)> = None;
+            for (r, span) in spans.iter().enumerate() {
+                let Some((lo2, hi2)) = span else { continue };
+                acc = Some(match acc.take() {
+                    None => (r, r, *lo2, *hi2),
+                    Some((top, bot, lo, hi)) => {
+                        if r - bot <= gap + 1 {
+                            let m = bounding(new, top, r, lo.min(*lo2), hi.max(*hi2));
+                            let a = bounding(new, top, bot, lo, hi);
+                            let b = bounding(new, r, r, *lo2, *hi2);
+                            if rect_bytes(&m) <= rect_bytes(&a) + rect_bytes(&b) {
+                                (top, r, lo.min(*lo2), hi.max(*hi2))
+                            } else {
+                                out.push(a);
+                                (r, r, *lo2, *hi2)
+                            }
+                        } else {
+                            out.push(bounding(new, top, bot, lo, hi));
+                            (r, r, *lo2, *hi2)
+                        }
+                    }
+                });
+            }
+            if let Some((top, bot, lo, hi)) = acc {
+                out.push(bounding(new, top, bot, lo, hi));
+            }
+            out
+        }
+
+        // Always-merge adjacent changed rows (no cost check), for comparison.
+        fn always<'a>(old: &Grid, new: &'a Grid) -> Vec<WireRect<'a>> {
+            let spans: Vec<Option<(usize, usize)>> = old
+                .rows
+                .iter()
+                .zip(&new.rows)
+                .map(|(o, n)| row_span(o, n))
+                .collect();
+            let mut out = Vec::new();
+            let mut acc: Option<(usize, usize, usize, usize)> = None;
+            for (r, span) in spans.iter().enumerate() {
+                let Some((lo2, hi2)) = span else {
+                    if let Some((top, bot, lo, hi)) = acc.take() {
+                        out.push(bounding(new, top, bot, lo, hi));
+                    }
+                    continue;
+                };
+                acc = Some(match acc.take() {
+                    None => (r, r, *lo2, *hi2),
+                    Some((top, _, lo, hi)) => (top, r, lo.min(*lo2), hi.max(*hi2)),
+                });
+            }
+            if let Some((top, bot, lo, hi)) = acc {
+                out.push(bounding(new, top, bot, lo, hi));
+            }
+            out
+        }
+
+        fn total(rects: &[WireRect]) -> (usize, usize) {
+            (rects.iter().map(rect_bytes).sum(), rects.len())
+        }
+
+        println!(
+            "{:<10} {:>7} | {:>9} {:>6} | {:>9} {:>6} | {:>9} {:>6} | {:>9} {:>6}",
+            "session",
+            "frames",
+            "S0 bytes",
+            "rects",
+            "S1 bytes",
+            "rects",
+            "S2 bytes",
+            "rects",
+            "S3 bytes",
+            "rects"
+        );
+        let (mut t0, mut t1, mut t2, mut t3) = ((0, 0), (0, 0), (0, 0), (0, 0));
+        let add = |t: &mut (usize, usize), v: (usize, usize)| {
+            t.0 += v.0;
+            t.1 += v.1;
+        };
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("raw") {
+                continue;
+            }
+            let name = path.file_stem().unwrap().to_string_lossy().to_string();
+            let raw = std::fs::read(&path).unwrap();
+            let timing = std::fs::read_to_string(path.with_extension("tm")).unwrap();
+
+            // Replay: cut frames at ≥33ms of accumulated delay, like MIN_FRAME.
+            let (rows, cols) = std::env::var("SG_SIZE")
+                .ok()
+                .and_then(|s| {
+                    let (c, r) = s.split_once('x')?;
+                    Some((r.parse().ok()?, c.parse().ok()?))
+                })
+                .unwrap_or((24, 80));
+            let mut parser = vt100::Parser::new(rows, cols, 0);
+            let mut frames: Vec<Grid> = vec![crate::parse::grid_from_screen(parser.screen())];
+            let mut pos = 0usize;
+            let mut since = 0.0f64;
+            for line in timing.lines() {
+                let mut it = line.split_whitespace();
+                let (Some(d), Some(n)) = (it.next(), it.next()) else {
+                    continue;
+                };
+                let (d, n): (f64, usize) = (d.parse().unwrap(), n.parse().unwrap());
+                since += d;
+                if since >= 0.033 {
+                    frames.push(crate::parse::grid_from_screen(parser.screen()));
+                    since = 0.0;
+                }
+                parser.process(&raw[pos..(pos + n).min(raw.len())]);
+                pos += n;
+            }
+            frames.push(crate::parse::grid_from_screen(parser.screen()));
+
+            let (mut s0, mut s1, mut s2, mut s3) = ((0, 0), (0, 0), (0, 0), (0, 0));
+            let mut nframes = 0;
+            for pair in frames.windows(2) {
+                let (a, b) = (&pair[0], &pair[1]);
+                if !same_layout(a, b) {
+                    continue; // resize → full frame for every strategy
+                }
+                nframes += 1;
+                add(&mut s0, total(&grid_rects(a, b)));
+                add(&mut s1, total(&always(a, b)));
+                add(&mut s2, total(&greedy(a, b, 0)));
+                add(&mut s3, total(&greedy(a, b, 3)));
+            }
+            println!(
+                "{:<10} {:>7} | {:>9} {:>6} | {:>9} {:>6} | {:>9} {:>6} | {:>9} {:>6}",
+                name, nframes, s0.0, s0.1, s1.0, s1.1, s2.0, s2.1, s3.0, s3.1
+            );
+            add(&mut t0, s0);
+            add(&mut t1, s1);
+            add(&mut t2, s2);
+            add(&mut t3, s3);
+        }
+        println!(
+            "{:<10} {:>7} | {:>9} {:>6} | {:>9} {:>6} | {:>9} {:>6} | {:>9} {:>6}",
+            "TOTAL", "", t0.0, t0.1, t1.0, t1.1, t2.0, t2.1, t3.0, t3.1
+        );
     }
 
     #[test]
