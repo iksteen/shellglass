@@ -119,6 +119,19 @@ test("patchCells pads a growing row with blanks, never holes", () => {
   assert.doesNotThrow(() => renderRow(state.cells[0], -1));
 });
 
+test("patchCells tri-state cursor: undefined leaves it untouched", () => {
+  const state = { cells: [[{ t: "a" }], [{ t: "b" }]], cur: [0, 0] as [number, number] | null };
+  // Cursor unchanged (undefined): kept, and its row is NOT dirtied.
+  const dirty = patchCells(state, { cur: undefined, rows: [{ r: 1, l: 0, cells: [{ t: "X" }] }] });
+  assert.deepEqual(state.cur, [0, 0], "cursor untouched");
+  assert.ok(!dirty.has(0), "cursor row not dirtied when unchanged");
+  assert.ok(dirty.has(1), "patched row dirty");
+  // Explicit null hides it (and dirties the old cursor row).
+  const dirty2 = patchCells(state, { cur: null, rows: [] });
+  assert.equal(state.cur, null);
+  assert.ok(dirty2.has(0), "old cursor row re-rendered on hide");
+});
+
 test("patchCells marks both old and new cursor rows dirty", () => {
   const state = { cells: [[{ t: "a" }], [{ t: "b" }]], cur: [0, 0] as [number, number] | null };
   const dirty = patchCells(state, { cur: [1, 0], rows: [] });
@@ -151,24 +164,21 @@ test("decodeBlock expands runs, blanks, clusters, and style runs", () => {
   assert.deepEqual(decodeBlock([[]]), []);
 });
 
-test("single-cell diff rows decode via apply dispatch shape", () => {
-  // The applyDiff dispatch: a string third element is one cell (whole string =
-  // the grapheme), with an optional style OBJECT. Mirror that logic here.
-  const decodeRow = (row: [number, number, unknown, unknown?]) => {
-    const [r, l, text, style] = row;
-    return {
-      r,
-      l,
-      cells:
-        typeof text === "string"
-          ? [style ? { t: text, ...(style as object) } : { t: text }]
-          : [],
-    };
+test("uniform spans decode one cell per codepoint with a shared style", () => {
+  // Mirror of the applyCell/decodeRow bare-string rule.
+  const expand = (text: string, style?: object) => {
+    const cells: object[] = [];
+    for (const ch of text) cells.push(style ? { t: ch, ...style } : { t: ch });
+    return cells;
   };
-  assert.deepEqual(decodeRow([25, 0, "✶", { f: 174 }]).cells, [{ t: "✶", f: 174 }]);
-  assert.deepEqual(decodeRow([5, 3, "x"]).cells, [{ t: "x" }]);
-  // A bare cluster string is one cell in this form — no wrapper needed.
-  assert.deepEqual(decodeRow([1, 2, "é"]).cells, [{ t: "é" }]);
+  assert.deepEqual(expand("✶", { f: 174 }), [{ t: "✶", f: 174 }]);
+  assert.deepEqual(expand("ok!", { f: 2 }), [
+    { t: "o", f: 2 },
+    { t: "k", f: 2 },
+    { t: "!", f: 2 },
+  ]);
+  // Codepoint split: astral glyphs stay whole.
+  assert.deepEqual(expand("a🚀"), [{ t: "a" }, { t: "🚀" }]);
 });
 
 test("flags as 1 style like true (weight, reverse, dim, wide)", () => {

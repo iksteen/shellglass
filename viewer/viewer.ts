@@ -63,10 +63,25 @@ interface FullMsg {
   c?: Cur; // cursor [row, col]; absent = hidden
   r: Block[];
 }
+// On diff-family messages the cursor is TRI-STATE: absent = unchanged,
+// null = became hidden, [row, col] = moved. Empty r is omitted (cursor-only).
 interface DiffMsg {
   t: "d";
-  c?: Cur; // absent = hidden
-  r: WireRow[];
+  c?: Cur;
+  r?: WireRow[];
+}
+// A uniform span: r is the bare [row, left, "…"] tuple — ONE CELL PER CODEPOINT
+// — and the style flattened into the message applies to every cell.
+interface CellMsg extends Style {
+  t: "c";
+  c?: Cur;
+  r: [number, number, string];
+}
+// A single changed line: r is the bare [row, left, entries, runs?] tuple.
+interface LineMsg {
+  t: "l";
+  c?: Cur;
+  r: WireRow;
 }
 
 // Materialize text entries + style runs into per-cell objects (the form renderRow
@@ -94,7 +109,7 @@ interface BannerMsg {
   t: "b";
   html: string;
 }
-type Msg = FullMsg | DiffMsg | BannerMsg;
+type Msg = FullMsg | DiffMsg | CellMsg | LineMsg | BannerMsg;
 
 export interface Cfg {
   defFg: string; // default fg as #rrggbb (for reverse/dim materialization)
@@ -276,16 +291,19 @@ let screen: ScreenState = { cells: [], cur: null, rowEls: [] };
 let screenEl: HTMLElement;
 
 // Update the screen's cell buffer + cursor from decoded line patches, returning
-// the rows to re-render (changed lines plus the old and new cursor rows).
-// DOM-free, so it's unit-tested.
+// the rows to re-render (changed lines plus the old and new cursor rows). The
+// cursor is tri-state: undefined = unchanged (leave it, dirty nothing extra),
+// null = hidden, [row, col] = moved. DOM-free, so it's unit-tested.
 export function patchCells(
   state: { cells: Cell[][]; cur: Cur },
-  dp: { cur: Cur; rows: { r: number; l: number; cells: Cell[] }[] },
+  dp: { cur: Cur | undefined; rows: { r: number; l: number; cells: Cell[] }[] },
 ): Set<number> {
   const dirty = new Set<number>();
-  if (state.cur) dirty.add(state.cur[0]);
-  if (dp.cur) dirty.add(dp.cur[0]);
-  state.cur = dp.cur;
+  if (dp.cur !== undefined) {
+    if (state.cur) dirty.add(state.cur[0]);
+    if (dp.cur) dirty.add(dp.cur[0]);
+    state.cur = dp.cur;
+  }
   for (const patch of dp.rows) {
     let row = state.cells[patch.r];
     if (!row) {
@@ -322,21 +340,41 @@ function applyFull(m: FullMsg): void {
   };
 }
 
-function applyDiff(m: DiffMsg): void {
-  const rows = m.r.map(([r, l, text, style]) => ({
-    r,
-    l,
-    cells:
-      typeof text === "string"
-        ? [style ? { t: text, ...(style as Style) } : { t: text }]
-        : decodeCells(text, style as StyleRun[] | undefined),
-  }));
-  const dirty = patchCells(screen, { cur: m.c ?? null, rows });
+function decodeRow([r, l, text, style]: WireRow): { r: number; l: number; cells: Cell[] } {
+  if (typeof text === "string") {
+    // Bare string = one cell per codepoint; the single style covers all.
+    const st = style as Style | undefined;
+    const cells: Cell[] = [];
+    for (const ch of text) cells.push(st ? { t: ch, ...st } : { t: ch });
+    return { r, l, cells };
+  }
+  return { r, l, cells: decodeCells(text, style as StyleRun[] | undefined) };
+}
+
+// `m.c` passes through as-is: undefined = cursor unchanged, null = hidden.
+function applyPatches(cur: Cur | undefined, rows: { r: number; l: number; cells: Cell[] }[]): void {
+  const dirty = patchCells(screen, { cur, rows });
   for (const r of dirty) {
     const el = screen.rowEls[r];
     if (!el) continue;
     el.innerHTML = renderRow(screen.cells[r] ?? [], cursorCol(screen.cur, r));
   }
+}
+
+function applyDiff(m: DiffMsg): void {
+  applyPatches(m.c, (m.r ?? []).map(decodeRow));
+}
+
+function applyCell(m: CellMsg): void {
+  const { t: _t, c: _c, r, ...style } = m;
+  const styled = Object.keys(style).length > 0;
+  const cells: Cell[] = [];
+  for (const ch of r[2]) cells.push(styled ? { t: ch, ...style } : { t: ch });
+  applyPatches(m.c, [{ r: r[0], l: r[1], cells }]);
+}
+
+function applyLine(m: LineMsg): void {
+  applyPatches(m.c, [decodeRow(m.r)]);
 }
 
 function applyBanner(m: BannerMsg): void {
@@ -347,6 +385,8 @@ function applyBanner(m: BannerMsg): void {
 export function apply(m: Msg): void {
   if (m.t === "f") applyFull(m);
   else if (m.t === "d") applyDiff(m);
+  else if (m.t === "c") applyCell(m);
+  else if (m.t === "l") applyLine(m);
   else applyBanner(m);
 }
 

@@ -164,11 +164,13 @@ let screen = { cells: [], cur: null, rowEls: [] };
 let screenEl;
 export function patchCells(state, dp) {
     const dirty = new Set();
-    if (state.cur)
-        dirty.add(state.cur[0]);
-    if (dp.cur)
-        dirty.add(dp.cur[0]);
-    state.cur = dp.cur;
+    if (dp.cur !== undefined) {
+        if (state.cur)
+            dirty.add(state.cur[0]);
+        if (dp.cur)
+            dirty.add(dp.cur[0]);
+        state.cur = dp.cur;
+    }
     for (const patch of dp.rows) {
         let row = state.cells[patch.r];
         if (!row) {
@@ -201,21 +203,38 @@ function applyFull(m) {
         rowEls: Array.from(screenDiv.children),
     };
 }
-function applyDiff(m) {
-    const rows = m.r.map(([r, l, text, style]) => ({
-        r,
-        l,
-        cells: typeof text === "string"
-            ? [style ? { t: text, ...style } : { t: text }]
-            : decodeCells(text, style),
-    }));
-    const dirty = patchCells(screen, { cur: m.c ?? null, rows });
+function decodeRow([r, l, text, style]) {
+    if (typeof text === "string") {
+        const st = style;
+        const cells = [];
+        for (const ch of text)
+            cells.push(st ? { t: ch, ...st } : { t: ch });
+        return { r, l, cells };
+    }
+    return { r, l, cells: decodeCells(text, style) };
+}
+function applyPatches(cur, rows) {
+    const dirty = patchCells(screen, { cur, rows });
     for (const r of dirty) {
         const el = screen.rowEls[r];
         if (!el)
             continue;
         el.innerHTML = renderRow(screen.cells[r] ?? [], cursorCol(screen.cur, r));
     }
+}
+function applyDiff(m) {
+    applyPatches(m.c, (m.r ?? []).map(decodeRow));
+}
+function applyCell(m) {
+    const { t: _t, c: _c, r, ...style } = m;
+    const styled = Object.keys(style).length > 0;
+    const cells = [];
+    for (const ch of r[2])
+        cells.push(styled ? { t: ch, ...style } : { t: ch });
+    applyPatches(m.c, [{ r: r[0], l: r[1], cells }]);
+}
+function applyLine(m) {
+    applyPatches(m.c, [decodeRow(m.r)]);
 }
 function applyBanner(m) {
     screenEl.innerHTML = m.html;
@@ -226,6 +245,10 @@ export function apply(m) {
         applyFull(m);
     else if (m.t === "d")
         applyDiff(m);
+    else if (m.t === "c")
+        applyCell(m);
+    else if (m.t === "l")
+        applyLine(m);
     else
         applyBanner(m);
 }

@@ -9,11 +9,17 @@
 //! encoder/decoder pair covers both hops.
 //!
 //! - `{"t":"f", w, h, c?, r:[block,…]}` — a full snapshot (sent to each viewer
-//!   on connect, and whenever the screen size changes).
-//! - `{"t":"d", c?, r:[[row, left, text, style?],…]}` — changed lines only: row
-//!   index, the cell index the span starts at, then the block. The viewer patches
-//!   its cell buffer and re-renders the affected rows. `c` is the cursor [row,
-//!   col]; absent = hidden.
+//!   on connect, and whenever the screen size changes). `c` = cursor; absent =
+//!   hidden.
+//! - `{"t":"d", c?, r?:[[row, left, text, style?],…]}` — changed lines: row
+//!   index, the cell index the span starts at, then the block. On diff-family
+//!   messages `c` is TRI-STATE (absent = unchanged, null = hidden, [row, col] =
+//!   moved) and an empty `r` is omitted (cursor-only moves).
+//! - `{"t":"c", c?, r:[row, left, "…"], …style}` — a uniform span: one cell per
+//!   codepoint, the flattened style applying to every cell. The hottest diffs
+//!   (spinner ticks, typing echo, appended log lines) take this form.
+//! - `{"t":"l", c?, r:[row, left, text, style?]}` — a single changed line that
+//!   isn't uniform (mixed styles, blanks-as-0, or cluster cells).
 //! - `{"t":"b", html}` — an error banner.
 //!
 //! A block (see [`CellBlock`]) is positional `[text]` / `[text, style]`: `text` is
@@ -241,10 +247,32 @@ enum WireMsg<'a> {
     },
     #[serde(rename = "d")]
     Diff {
+        /// Tri-state: absent = cursor unchanged, `null` = became hidden,
+        /// `[row, col]` = moved. (Fulls are absolute: absent there = hidden.)
         #[serde(rename = "c", skip_serializing_if = "Option::is_none")]
-        cur: Option<(u16, u16)>,
-        #[serde(rename = "r")]
+        cur: Option<Option<(u16, u16)>>,
+        #[serde(rename = "r", skip_serializing_if = "Vec::is_empty")]
         rows: Vec<WireRow<'a>>,
+    },
+    /// A uniform span — the hottest diffs (spinner ticks, typing echo, appended
+    /// log lines) change one line where every cell shares one style: `r` is the
+    /// bare `[row, left, "…"]` tuple, the string is ONE CELL PER CODEPOINT, and
+    /// the style flattens into the message itself, applying to every cell
+    /// (`f,g,b,d,i,u,n,w` don't collide with `t,c,r`).
+    #[serde(rename = "c")]
+    Cell {
+        #[serde(rename = "c", skip_serializing_if = "Option::is_none")]
+        cur: Option<Option<(u16, u16)>>,
+        r: (usize, usize, String),
+        #[serde(flatten)]
+        style: Option<CellStyle>,
+    },
+    /// A single changed line: `r` is the bare `[row, left, entries, runs?]` tuple.
+    #[serde(rename = "l")]
+    Line {
+        #[serde(rename = "c", skip_serializing_if = "Option::is_none")]
+        cur: Option<Option<(u16, u16)>>,
+        r: WireRow<'a>,
     },
     #[serde(rename = "b")]
     Banner { html: &'a str },
@@ -253,9 +281,9 @@ enum WireMsg<'a> {
 /// One changed line, positional — `left` is the cell index the span starts at.
 /// Two forms, distinguished by the third element's type:
 /// - `[row, left, text-entries, style-runs?]` — the general line span.
-/// - `[row, left, "…", {style}?]` — a single changed cell (spinners, typing echo:
-///   the most common diff by far), the whole string being that cell's grapheme —
-///   no entry array, no run framing, and clusters need no `["…"]` wrapper here.
+/// - `[row, left, "x", {style}?]` — a single changed cell holding one codepoint
+///   (a bare wire string is always one cell per codepoint; multi-codepoint
+///   grapheme cells use the `["…"]` entry form in a line span).
 ///
 /// Line-only and tuple-framed on purpose — measured (see `zz_measure_wire_cost`),
 /// merging lines into rectangles never paid (padding scales with width), and the
@@ -501,6 +529,20 @@ fn cell_block<'a>(cells: impl Iterator<Item = &'a StyledCell>) -> CellBlock<'a> 
     block
 }
 
+/// A block that is exactly one merged run (no blanks-as-0, no clusters) whose
+/// style is empty or one run covering every cell — squashable to the uniform
+/// `"t":"c"` form.
+fn uniform(block: &CellBlock) -> bool {
+    let [Text::Run(run)] = block.text.as_slice() else {
+        return false;
+    };
+    match block.style.as_slice() {
+        [] => true,
+        [(0, n, _)] => *n == run.chars().count(),
+        _ => false,
+    }
+}
+
 fn full_message_grid(g: &Grid) -> String {
     let msg = WireMsg::Full {
         w: g.cols,
@@ -516,19 +558,43 @@ fn banner_message(html: &str) -> String {
 }
 
 /// Per-line diff between two same-size grids. `None` if nothing (cells or cursor)
-/// changed.
+/// changed. Single-row diffs get their own compact tags (`c` / `l`).
 fn diff_message(a: &Grid, b: &Grid) -> Option<String> {
-    let rows = grid_rows(a, b);
+    let mut rows = grid_rows(a, b);
     if rows.is_empty() && a.cursor == b.cursor {
         return None; // nothing this viewer would see changed
     }
-    Some(
-        serde_json::to_string(&WireMsg::Diff {
-            cur: b.cursor,
-            rows,
-        })
-        .expect("diff wire message serializes"),
-    )
+    // Absent = unchanged; Some(None) = became hidden; Some(pos) = moved.
+    let cur = (a.cursor != b.cursor).then_some(b.cursor);
+    let msg = if rows.len() == 1 {
+        match rows.pop().expect("len checked") {
+            WireRow::Cell { r, l, cell } => WireMsg::Cell {
+                cur,
+                r: (r, l, cell.text.clone()),
+                style: (!is_plain(cell)).then(|| cell_style(cell)),
+            },
+            // A whole span sharing one style (or all plain) squashes to the
+            // uniform form too: one run string, style flattened once.
+            WireRow::Line { r, l, block } if uniform(&block) => {
+                let CellBlock {
+                    mut text,
+                    mut style,
+                } = block;
+                let Some(Text::Run(run)) = text.pop() else {
+                    unreachable!("uniform() guarantees a single run")
+                };
+                WireMsg::Cell {
+                    cur,
+                    r: (r, l, run),
+                    style: style.pop().map(|(_, _, st)| st),
+                }
+            }
+            row => WireMsg::Line { cur, r: row },
+        }
+    } else {
+        WireMsg::Diff { cur, rows }
+    };
+    Some(serde_json::to_string(&msg).expect("diff wire message serializes"))
 }
 
 /// A shared blank cell (canonical form: a plain space — see `grid_from_screen`),
@@ -566,12 +632,13 @@ fn grid_rows<'a>(old: &Grid, new: &'a Grid) -> Vec<WireRow<'a>> {
         .enumerate()
         .filter_map(|(r, (o, n))| {
             let (lo, hi) = row_span(o, n)?;
-            Some(if lo == hi {
-                WireRow::Cell {
-                    r,
-                    l: lo,
-                    cell: n.get(lo).unwrap_or(blank()),
-                }
+            let single = (lo == hi)
+                .then(|| n.get(lo).unwrap_or(blank()))
+                // A bare wire string is one cell per codepoint, so the compact
+                // form only fits single-codepoint cells.
+                .filter(|c| c.text.chars().nth(1).is_none());
+            Some(if let Some(cell) = single {
+                WireRow::Cell { r, l: lo, cell }
             } else {
                 let cells = (lo..=hi).map(|i| n.get(i).unwrap_or(blank()));
                 WireRow::Line {
@@ -604,13 +671,36 @@ enum WireMsgIn {
     },
     #[serde(rename = "d")]
     Diff {
-        #[serde(rename = "c", default)]
-        cur: Option<(u16, u16)>,
-        #[serde(rename = "r")]
+        #[serde(rename = "c", default, deserialize_with = "double_option")]
+        cur: Option<Option<(u16, u16)>>,
+        #[serde(rename = "r", default)]
         rows: Vec<WireRowIn>,
+    },
+    #[serde(rename = "c")]
+    Cell {
+        #[serde(rename = "c", default, deserialize_with = "double_option")]
+        cur: Option<Option<(u16, u16)>>,
+        // One cell per codepoint; the flattened style applies to all of them.
+        r: (usize, usize, String),
+        #[serde(flatten)]
+        style: CellStyleIn,
+    },
+    #[serde(rename = "l")]
+    Line {
+        #[serde(rename = "c", default, deserialize_with = "double_option")]
+        cur: Option<Option<(u16, u16)>>,
+        r: WireRowIn,
     },
     #[serde(rename = "b")]
     Banner { html: String },
+}
+
+/// Distinguish an absent field from an explicit `null`: with `default`, absent
+/// stays `None` while any present value (including null) becomes `Some(inner)`.
+fn double_option<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Option<T>>, D::Error> {
+    Deserialize::deserialize(d).map(Some)
 }
 
 /// Mirror of [`WireRow`], both forms: `[r, l, entries, runs?]` (line span) and
@@ -706,14 +796,19 @@ impl<'de> Deserialize<'de> for WireRowIn {
                     .ok_or_else(|| de::Error::missing_field("text"))?;
                 let style = seq.next_element::<RowStyleIn>()?;
                 let block = match (text, style) {
-                    (RowTextIn::Single(s), st) => CellBlockIn {
-                        text: vec![TextIn::Cluster(s)],
-                        style: match st {
-                            Some(RowStyleIn::Style(cs)) => vec![(0, 1, cs)],
-                            Some(RowStyleIn::Runs(runs)) => runs,
-                            None => Vec::new(),
-                        },
-                    },
+                    // A bare string is one cell per codepoint; the single style
+                    // (if any) covers all of them.
+                    (RowTextIn::Single(s), st) => {
+                        let n = s.chars().count();
+                        CellBlockIn {
+                            text: vec![TextIn::Run(s)],
+                            style: match st {
+                                Some(RowStyleIn::Style(cs)) => vec![(0, n, cs)],
+                                Some(RowStyleIn::Runs(runs)) => runs,
+                                None => Vec::new(),
+                            },
+                        }
+                    }
                     (RowTextIn::Entries(text), st) => CellBlockIn {
                         text,
                         style: match st {
@@ -868,40 +963,60 @@ fn decode_block(block: CellBlockIn) -> Vec<StyledCell> {
 /// lockstep with every browser. `None` = drop the message (a diff arriving while
 /// the state is a banner is a desync; forwarding it would corrupt viewers too).
 fn apply_wire(prev: &Frame, msg: WireMsgIn) -> Option<Frame> {
-    match msg {
-        WireMsgIn::Full { w, cur, rows } => Some(Frame::Screen(Grid {
-            cols: w,
-            rows: rows.into_iter().map(decode_block).collect(),
-            cursor: cur,
-        })),
-        WireMsgIn::Banner { html } => Some(Frame::Banner(html)),
-        WireMsgIn::Diff { cur, rows } => {
-            let Frame::Screen(grid) = prev else {
-                return None;
-            };
-            let mut grid = grid.clone();
-            for patch in rows {
-                let Some(row) = grid.rows.get_mut(patch.r) else {
-                    continue; // out-of-range row: same_layout should prevent this
-                };
-                for (dx, cell) in decode_block(patch.block).into_iter().enumerate() {
-                    let i = patch.l + dx;
-                    if i < row.len() {
-                        row[i] = cell;
-                    } else {
-                        // Mirror viewer.ts: a jagged row can grow — pad with
-                        // canonical blanks (spaces), then push.
-                        while row.len() < i {
-                            row.push(blank().clone());
-                        }
-                        row.push(cell);
-                    }
+    // Normalize the three diff shapes into (cursor, row patches).
+    let (cur, rows) = match msg {
+        WireMsgIn::Full { w, cur, rows } => {
+            return Some(Frame::Screen(Grid {
+                cols: w,
+                rows: rows.into_iter().map(decode_block).collect(),
+                cursor: cur,
+            }));
+        }
+        WireMsgIn::Banner { html } => return Some(Frame::Banner(html)),
+        WireMsgIn::Diff { cur, rows } => (cur, rows),
+        WireMsgIn::Cell { cur, r, style } => {
+            let (row, l, text) = r;
+            let n = text.chars().count();
+            (
+                cur,
+                vec![WireRowIn {
+                    r: row,
+                    l,
+                    block: CellBlockIn {
+                        text: vec![TextIn::Run(text)],
+                        style: vec![(0, n, style)],
+                    },
+                }],
+            )
+        }
+        WireMsgIn::Line { cur, r } => (cur, vec![r]),
+    };
+    let Frame::Screen(grid) = prev else {
+        return None; // a diff can't apply to a banner — drop it
+    };
+    let mut grid = grid.clone();
+    for patch in rows {
+        let Some(row) = grid.rows.get_mut(patch.r) else {
+            continue; // out-of-range row: same_layout should prevent this
+        };
+        for (dx, cell) in decode_block(patch.block).into_iter().enumerate() {
+            let i = patch.l + dx;
+            if i < row.len() {
+                row[i] = cell;
+            } else {
+                // Mirror viewer.ts: a jagged row can grow — pad with canonical
+                // blanks (spaces), then push.
+                while row.len() < i {
+                    row.push(blank().clone());
                 }
+                row.push(cell);
             }
-            grid.cursor = cur;
-            Some(Frame::Screen(grid))
         }
     }
+    if let Some(c) = cur {
+        grid.cursor = c; // absent = unchanged; null = hidden; pos = moved
+    }
+    Some(Frame::Screen(grid))
 }
 
 #[cfg(test)]
@@ -1068,9 +1183,34 @@ mod tests {
         b.rows[0][6].bold = true;
         let msg = diff_message(&a, &b).unwrap();
         assert!(
-            msg.contains(r#""r":[[0,4,["O WO"],[[0,3,{"b":1}]]]]"#),
-            "positional line, merged text run, style run with 1-flag: {msg}"
+            msg.contains(r#""t":"l""#) && msg.contains(r#""r":[0,4,["O WO"],[[0,3,{"b":1}]]]"#),
+            "single-line tag, merged text run, style run with 1-flag: {msg}"
         );
+    }
+
+    #[test]
+    fn cursor_is_tristate_on_diffs() {
+        // Unchanged cursor is omitted entirely; the hub keeps its own.
+        let mut a = grid(&["ab", "cd"]);
+        let mut b = grid(&["xb", "cd"]);
+        a.cursor = Some((1, 1));
+        b.cursor = Some((1, 1));
+        let msg = diff_message(&a, &b).unwrap();
+        assert!(!msg.contains("\"c\":"), "unchanged cursor omitted: {msg}");
+        let Frame::Screen(g) = apply(&Frame::Screen(a), &msg).unwrap() else {
+            panic!("screen")
+        };
+        assert_eq!(g.cursor, Some((1, 1)), "hub keeps the cursor when absent");
+        // Becoming hidden is an explicit null, applied as None.
+        let mut h = b.clone();
+        h.cursor = None;
+        h.rows[0][0].text = "q".into();
+        let msg2 = diff_message(&b, &h).unwrap();
+        assert!(msg2.contains("\"c\":null"), "hide is explicit null: {msg2}");
+        let Frame::Screen(g2) = apply(&Frame::Screen(b), &msg2).unwrap() else {
+            panic!("screen")
+        };
+        assert_eq!(g2.cursor, None);
     }
 
     #[test]
@@ -1083,16 +1223,16 @@ mod tests {
         b.cols = 9;
         b.rows[0][0].fg = Color::Idx(174);
         let msg = diff_message(&a, &b).unwrap();
-        assert!(
-            msg.contains(r#""r":[[0,0,"y",{"f":174}]]"#),
-            "compact styled single cell: {msg}"
+        assert_eq!(
+            msg, r#"{"t":"c","r":[0,0,"y"],"f":174}"#,
+            "single-cell tag with flattened style"
         );
         // Plain single cell drops the style element entirely.
         let c = grid(&["z spinner"]);
         let msg2 = diff_message(&b, &c).unwrap();
-        assert!(
-            msg2.contains(r#""r":[[0,0,"z"]]"#),
-            "compact plain single cell: {msg2}"
+        assert_eq!(
+            msg2, r#"{"t":"c","r":[0,0,"z"]}"#,
+            "plain single cell drops the style entirely"
         );
         // Both round-trip through the hub-side decoder.
         let applied = apply(&Frame::Screen(a), &msg).unwrap();
@@ -1102,19 +1242,52 @@ mod tests {
     }
 
     #[test]
-    fn single_cell_cluster_needs_no_wrapper() {
-        // In the single-cell form the whole string IS the cell, so a combining
-        // grapheme rides bare.
+    fn single_cluster_cell_uses_the_entry_form() {
+        // A bare wire string is one cell per codepoint everywhere, so a single
+        // multi-codepoint grapheme cell must take the ["…"] entry form (t:"l").
         let a = grid(&["ab"]);
         let mut b = grid(&["xb"]);
         b.rows[0][0].text = "e\u{0301}".to_string();
         let msg = diff_message(&a, &b).unwrap();
-        assert!(
-            msg.contains(r#"[0,0,"é"]"#) || msg.contains("[0,0,\"e\u{301}\"]"),
-            "bare cluster string: {msg}"
+        assert_eq!(
+            msg,
+            format!(r#"{{"t":"l","r":[0,0,[["{}"]]]}}"#, "e\u{0301}"),
+            "cluster via entries"
         );
         let applied = apply(&Frame::Screen(a), &msg).unwrap();
         assert_eq!(applied, Frame::Screen(b));
+    }
+
+    #[test]
+    fn uniform_line_squashes_to_the_c_form() {
+        // Every changed cell shares one style → multi-char "c" message with the
+        // style flattened once.
+        let mut a = grid(&["............", "keep"]);
+        let mut b = grid(&["INFO started", "keep"]);
+        a.cols = 12;
+        b.cols = 12;
+        for c in &mut b.rows[0] {
+            c.fg = Color::Idx(2);
+        }
+        let msg = diff_message(&a, &b).unwrap();
+        assert_eq!(
+            msg, r#"{"t":"c","r":[0,0,"INFO started"],"f":2}"#,
+            "uniform styled span squashes"
+        );
+        let applied = apply(&Frame::Screen(a.clone()), &msg).unwrap();
+        assert_eq!(applied, Frame::Screen(b.clone()));
+        // All-plain spans squash too (no flattened style at all).
+        let c = grid(&["hello world.", "keep"]);
+        let msg2 = diff_message(&b, &c).unwrap();
+        assert_eq!(msg2, r#"{"t":"c","r":[0,0,"hello world."]}"#);
+        // Mixed styles stay in the line form.
+        let mut d = grid(&["hello WORLD.", "keep"]);
+        d.rows[0][6].bold = true;
+        let msg3 = diff_message(&c, &d).unwrap();
+        assert!(
+            msg3.starts_with(r#"{"t":"l""#),
+            "mixed span stays a line: {msg3}"
+        );
     }
 
     #[test]
@@ -1152,8 +1325,7 @@ mod tests {
         a.cursor = Some((0, 0));
         b.cursor = Some((0, 2));
         let msg = diff_message(&a, &b).expect("cursor move is a change");
-        assert!(msg.contains("\"c\":[0,2]"), "carries new cursor: {msg}");
-        assert!(msg.contains("\"r\":[]"), "no line patches: {msg}");
+        assert_eq!(msg, r#"{"t":"d","c":[0,2]}"#, "cursor-only move is minimal");
     }
 
     #[test]
