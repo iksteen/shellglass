@@ -69,6 +69,7 @@ footer { max-width:1140px; width:100%; margin:0 auto; padding:24px clamp(16px,5v
 .panel {
   position:relative; max-width:100%; max-height:100%; overflow:auto;
   scrollbar-width:thin; scrollbar-color:var(--border) transparent;
+  touch-action:none; /* we own touch: one finger pans, two-finger pinch zooms */
   padding:26px 30px; border:none; border-radius:26px / 34px;
   background:#040705;
   box-shadow:
@@ -215,40 +216,93 @@ body:has(#crt:not(:checked)) #screen { filter:none; text-shadow:none; }
   ro.observe(stage);
   ro.observe(scr);
 
-  // Zoom: pinch / ctrl+wheel, keeping the point under the cursor fixed. Plain
+  // Multiply the user zoom by `f`, keeping the viewport point (x, y) fixed.
+  const zoomAt = (f, x, y) => {
+    const prev = userZ;
+    userZ = Math.min(8, Math.max(1, userZ * f));
+    if (userZ === prev) return;
+    const r = userZ / prev;
+    const rect = panel.getBoundingClientRect();
+    const cx = x - rect.left, cy = y - rect.top;
+    apply();
+    panel.scrollLeft = (panel.scrollLeft + cx) * r - cx;
+    panel.scrollTop = (panel.scrollTop + cy) * r - cy;
+  };
+
+  // Desktop zoom: ctrl+wheel (and trackpad pinch, which arrives as it). Plain
   // wheel falls through to native scrolling (that's the pan). Firefox mouse
   // wheels report line deltas (deltaMode 1) — normalize to ~pixels.
   panel.addEventListener('wheel', (e) => {
     if (!e.ctrlKey) return;
     e.preventDefault(); // keep the browser's own page zoom out of it
     const dy = e.deltaY * (e.deltaMode === 1 ? 33 : 1);
-    const prev = userZ;
-    userZ = Math.min(8, Math.max(1, userZ * Math.pow(2, -dy / 400)));
-    if (userZ === prev) return;
-    const r = userZ / prev;
-    const rect = panel.getBoundingClientRect();
-    const cx = e.clientX - rect.left, cy = e.clientY - rect.top;
-    apply();
-    panel.scrollLeft = (panel.scrollLeft + cx) * r - cx;
-    panel.scrollTop = (panel.scrollTop + cy) * r - cy;
+    zoomAt(Math.pow(2, -dy / 400), e.clientX, e.clientY);
   }, { passive: false });
 
-  // Pan: middle-button drag (left button selects text as usual).
-  let drag = null;
+  // Touch (touch-action:none claims these from the browser, so a pinch on the
+  // terminal zooms IT, not the page): one finger pans, two fingers pinch-zoom
+  // at their midpoint (which also pans as the midpoint moves). Mouse pan stays
+  // on middle-drag so left-drag keeps selecting text.
+  // ponytail: touch pan has no fling/momentum — native scrolling is gone with
+  // touch-action:none; add velocity-decay on pointerup if it feels dead.
+  const touches = new Map(); // active touch points, pointerId → position
+  let drag = null; // one-finger / middle-button pan state
+  let pinch = null; // previous two-finger distance + midpoint
+  const startDrag = (x, y) => {
+    drag = { x, y, l: panel.scrollLeft, t: panel.scrollTop };
+  };
   panel.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'touch') {
+      touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      try { panel.setPointerCapture(e.pointerId); } catch (err) {}
+      pinch = null;
+      if (touches.size === 1) startDrag(e.clientX, e.clientY);
+      else drag = null; // second finger: switch from pan to pinch
+      return;
+    }
     if (e.button !== 1) return;
     e.preventDefault(); // suppress middle-click autoscroll/paste-position
-    drag = { x: e.clientX, y: e.clientY, l: panel.scrollLeft, t: panel.scrollTop };
+    startDrag(e.clientX, e.clientY);
     try { panel.setPointerCapture(e.pointerId); } catch (err) {}
   });
   panel.addEventListener('pointermove', (e) => {
+    if (e.pointerType === 'touch' && touches.has(e.pointerId)) {
+      touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (touches.size >= 2) {
+        const [a, b] = [...touches.values()];
+        const dist = Math.hypot(a.x - b.x, a.y - b.y);
+        const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+        if (pinch && pinch.dist > 0) {
+          zoomAt(dist / pinch.dist, mx, my);
+          panel.scrollLeft -= mx - pinch.mx; // midpoint movement pans too
+          panel.scrollTop -= my - pinch.my;
+        }
+        pinch = { dist, mx, my };
+        return;
+      }
+    }
     if (!drag) return;
     panel.scrollLeft = drag.l - (e.clientX - drag.x);
     panel.scrollTop = drag.t - (e.clientY - drag.y);
   });
-  const endDrag = () => { drag = null; };
-  panel.addEventListener('pointerup', endDrag);
-  panel.addEventListener('pointercancel', endDrag);
+  const endPointer = (e) => {
+    touches.delete(e.pointerId);
+    pinch = null;
+    drag = null;
+    if (touches.size === 1) {
+      // Pinch ended with one finger still down — continue as a pan from there.
+      const [p] = touches.values();
+      startDrag(p.x, p.y);
+    }
+  };
+  panel.addEventListener('pointerup', endPointer);
+  panel.addEventListener('pointercancel', endPointer);
+
+  // iOS Safari's proprietary pinch pipeline can still fire page zoom from a
+  // gesture starting on the panel — cut it off explicitly.
+  for (const t of ['gesturestart', 'gesturechange']) {
+    panel.addEventListener(t, (e) => e.preventDefault());
+  }
 })();
 </script>
 {{script}}
