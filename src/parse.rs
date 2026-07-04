@@ -39,8 +39,15 @@ pub fn grid_from_screen(screen: &vt100::Screen) -> Grid {
                 continue;
             }
             let wide = cell.is_wide();
+            // Canonicalize blank cells to a space: the renderers draw them
+            // identically (style rides separately), so keeping the distinction
+            // only costs wire bytes and spurious erase-vs-space diffs.
+            let mut text = cell.contents().to_string();
+            if text.is_empty() {
+                text.push(' ');
+            }
             row.push(StyledCell {
-                text: cell.contents().to_string(),
+                text,
                 fg: conv_color(cell.fgcolor()),
                 bg: conv_color(cell.bgcolor()),
                 bold: cell.bold(),

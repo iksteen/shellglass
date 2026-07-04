@@ -110,6 +110,15 @@ test("patchCells writes line patches and reports dirty rows", () => {
   assert.ok(dirty.has(0), "changed + cursor row is dirty");
 });
 
+test("patchCells pads a growing row with blanks, never holes", () => {
+  // A span starting past the current row end (canonical spaces upstream made
+  // the in-between cells "unchanged") must not leave undefined holes.
+  const state = { cells: [[{ t: "s" }, { t: "h" }]], cur: null as [number, number] | null };
+  patchCells(state, { cur: null, rows: [{ r: 0, l: 4, cells: [{ t: "$" }] }] });
+  assert.deepEqual(state.cells[0], [{ t: "s" }, { t: "h" }, { t: " " }, { t: " " }, { t: "$" }]);
+  assert.doesNotThrow(() => renderRow(state.cells[0], -1));
+});
+
 test("patchCells marks both old and new cursor rows dirty", () => {
   const state = { cells: [[{ t: "a" }], [{ t: "b" }]], cur: [0, 0] as [number, number] | null };
   const dirty = patchCells(state, { cur: [1, 0], rows: [] });

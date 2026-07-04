@@ -287,7 +287,11 @@ export function patchCells(
       state.cells[patch.r] = row;
     }
     for (let dx = 0; dx < patch.cells.length; dx++) {
-      row[patch.l + dx] = patch.cells[dx];
+      const i = patch.l + dx;
+      // Pad a growing row with canonical blanks — bare assignment past the end
+      // would leave holes (undefined cells) that renderRow can't iterate.
+      while (row.length < i) row.push({ t: " " });
+      row[i] = patch.cells[dx];
     }
     dirty.add(patch.r);
   }

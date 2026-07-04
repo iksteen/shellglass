@@ -176,7 +176,10 @@ export function patchCells(state, dp) {
             state.cells[patch.r] = row;
         }
         for (let dx = 0; dx < patch.cells.length; dx++) {
-            row[patch.l + dx] = patch.cells[dx];
+            const i = patch.l + dx;
+            while (row.length < i)
+                row.push({ t: " " });
+            row[i] = patch.cells[dx];
         }
         dirty.add(patch.r);
     }

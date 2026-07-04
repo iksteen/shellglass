@@ -16,9 +16,10 @@
 //! - `{"t":"b", html}` — an error banner.
 //!
 //! A block (see [`CellBlock`]) is positional `[text]` / `[text, style]`: `text` is
-//! one cell per codepoint in merged strings (`0` = blank, `["…"]` = one
-//! multi-codepoint-grapheme cell), `style` is `[start, len, {attrs}]` runs with
-//! `1`-flags. Diffs are per-line minimal spans — measured (see
+//! one cell per codepoint in merged strings (`["…"]` = one multi-codepoint-grapheme
+//! cell; `0` = an empty-text cell, vestigial now that blanks are canonicalized to
+//! spaces at the parse boundary, but still decoded), `style` is
+//! `[start, len, {attrs}]` runs with `1`-flags. Diffs are per-line minimal spans — measured (see
 //! `zz_measure_wire_cost` history), merging lines into rectangles never paid.
 //!
 //! Connecting is **lock-free** (`/s/<id>/events` is public — the id is the read
@@ -475,11 +476,15 @@ fn diff_message(a: &Grid, b: &Grid) -> Option<String> {
     )
 }
 
-/// A shared blank cell, so out-of-range indices (a row that grew/shrank between
-/// frames) compare and serialize as an empty cell.
+/// A shared blank cell (canonical form: a plain space — see `grid_from_screen`),
+/// so out-of-range indices (a row that grew/shrank between frames) compare and
+/// serialize as an empty cell.
 fn blank() -> &'static StyledCell {
     static BLANK: OnceLock<StyledCell> = OnceLock::new();
-    BLANK.get_or_init(StyledCell::default)
+    BLANK.get_or_init(|| StyledCell {
+        text: " ".to_string(),
+        ..Default::default()
+    })
 }
 
 /// The minimal `[lo, hi]` cell-index span that changed between two rows (compared
@@ -736,9 +741,10 @@ fn apply_wire(prev: &Frame, msg: WireMsgIn) -> Option<Frame> {
                     if i < row.len() {
                         row[i] = cell;
                     } else {
-                        // Mirror viewer.ts: a jagged row can grow — pad then push.
+                        // Mirror viewer.ts: a jagged row can grow — pad with
+                        // canonical blanks (spaces), then push.
                         while row.len() < i {
-                            row.push(StyledCell::default());
+                            row.push(blank().clone());
                         }
                         row.push(cell);
                     }
@@ -1032,13 +1038,13 @@ mod tests {
     }
 
     /// Grid equality up to trailing blank cells per row (a diff that shrinks a row
-    /// leaves explicit blanks where the origin simply has a shorter row — same
-    /// rendering, different cell count).
+    /// leaves explicit blanks — canonical spaces — where the origin simply has a
+    /// shorter row: same rendering, different cell count).
     fn assert_grid_equiv(a: &Grid, b: &Grid) {
         let trim = |g: &Grid| {
             let mut g = g.clone();
             for row in &mut g.rows {
-                while row.last() == Some(&StyledCell::default()) {
+                while row.last().is_some_and(|c| c == blank()) {
                     row.pop();
                 }
             }
