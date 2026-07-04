@@ -48,7 +48,14 @@ pub const KEY_HEADER: &str = "x-shellglass-key";
 /// and hub derive it independently and must agree), so the salt can't be random
 /// or per-hash — it's a constant. Memory-hardness, not the salt, is what slows a
 /// brute force here.
-const SALT: &[u8] = b"shellglass/session-id/v1";
+///
+/// The version suffix does double duty: it versions the derivation scheme AND
+/// guards against protocol skew. Bump it on every breaking wire change — a
+/// version-skewed client/hub pair then disagrees on `key → id`, so the stale side
+/// fails loudly at `/register` (403, "register its session id") instead of
+/// streaming frames the other side silently drops. The cost of a bump is that
+/// operators re-run `print-id` and update `--allow` + view URLs; keys stay valid.
+const SALT: &[u8] = b"shellglass/session-id/v2";
 
 /// Underivable session id for a secret key: Argon2id (memory- and compute-hard)
 /// rendered as lowercase hex. Memory-hardness makes brute-forcing a weak secret

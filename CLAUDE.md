@@ -53,7 +53,7 @@ PTY output bytes → vt100::Parser → model::Grid (StyledCell cells)
 
 ## Capability model (proto.rs)
 
-The **secret key** is the write capability. The **session id** = `hex(argon2id(key))` with a fixed salt (`SALT`) is the read capability that goes in the view URL — one-way, so viewers can't recover the key. The hub screens pushes against a pre-registered `--allow` set of ids (`authorize` in `hub.rs`); it never sees secrets. `session_id` is intentionally memory-hard — call it once per connection, never per frame.
+The **secret key** is the write capability. The **session id** = `hex(argon2id(key))` with a fixed salt (`SALT`) is the read capability that goes in the view URL — one-way, so viewers can't recover the key. The hub screens pushes against a pre-registered `--allow` set of ids (`authorize` in `hub.rs`); it never sees secrets. `session_id` is intentionally memory-hard — call it once per connection, never per frame. The salt's version suffix is **also the protocol-skew guard**: bump it on every breaking wire change so a mismatched client/hub pair fails loudly at `/register` (they derive different ids from the same key) instead of silently dropping frames.
 
 Wire framing for the streaming push: `frame_encode`/`frame_drain` (`[u32 BE length][payload]`), capped at `MAX_FRAME`.
 
