@@ -1,7 +1,7 @@
 //! PTY backend: run an interactive command in a pseudo-terminal that you drive
 //! from your own terminal, while mirroring its screen to the browser — the
-//! `script(1)` model. One PTY feeds a single [`vt100::Parser`], rendered as one
-//! full-window fragment by the renderer at a 30fps cap. Unix only (raw mode +
+//! `script(1)` model. One PTY feeds a single [`vt100::Parser`], snapshotted as
+//! [`Frame`]s at a 30fps cap for the diff/stream pipeline. Unix only (raw mode +
 //! `TIOCGWINSZ`).
 //!
 //! One `screen` thread owns everything that touches the real terminal — the raw

@@ -657,6 +657,17 @@ mod tests {
     }
 
     #[test]
+    fn dim_matches_the_shared_floor_formula() {
+        // Pinned in both suites (see viewer.test.ts) so the Rust and JS renderers
+        // can't drift on the integer math: f/10*6 floors. 0xd0=208 → 120 = 0x78.
+        let mut c = StyledCell::default();
+        c.dim = true;
+        assert_eq!(cell_box_style(&c, false), "color:#787878;");
+        c.fg = Color::Idx(9); // bright red 255 → 25*6 = 150 = 0x96
+        assert_eq!(cell_box_style(&c, false), "color:#960000;");
+    }
+
+    #[test]
     fn fragment_sizes_the_screen_box() {
         let cfg = Config::default();
         let res = Resolver::build(&cfg).unwrap();

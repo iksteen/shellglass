@@ -221,7 +221,7 @@ fn gen_key() -> Result<()> {
     Ok(())
 }
 
-/// The shared render setup for `view` and `push`: load config, resolve fonts, and
+/// The shared render setup for `serve` and `push`: load config, resolve fonts, and
 /// build the input backend. Returns everything the two modes need to run.
 struct Rendered {
     config: Arc<Config>,

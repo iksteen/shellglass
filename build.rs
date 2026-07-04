@@ -21,19 +21,26 @@ fn main() {
     println!("cargo:rerun-if-changed=viewer/dist/viewer.js");
 
     // tsc is a shell wrapper on Windows; extension-less path works on Unix, which is
-    // all we build from here.
+    // all we build from here. No `current_dir`: a relative program path resolves in
+    // the *child's* cwd on Unix, so pairing it with current_dir("viewer") would look
+    // for viewer/viewer/… and never find tsc. `-p viewer` points at the tsconfig.
     let tsc = Path::new("viewer/node_modules/.bin/tsc");
-    let compiled = tsc.exists()
-        && Command::new(tsc)
-            .current_dir("viewer")
-            .arg("--outDir")
+    if tsc.exists() {
+        let ok = Command::new(tsc)
+            .args(["-p", "viewer", "--outDir"])
             .arg(&out_dir)
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-
-    if compiled && dest.exists() {
-        return;
+        if ok && dest.exists() {
+            return;
+        }
+        // A present-but-failing toolchain (type error in viewer.ts, broken install)
+        // must not silently bake the stale committed dist — the edit would vanish.
+        println!(
+            "cargo:warning=viewer tsc failed — baking the committed viewer/dist/viewer.js, \
+             which does NOT include local viewer.ts changes"
+        );
     }
 
     // Fallback: the committed prebuilt renderer.

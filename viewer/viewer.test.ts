@@ -47,6 +47,17 @@ test("cellStyle emits colors, weight, and reverse video", () => {
   assert.equal(cellStyle({}, true), "color:#000000;background:#d0d0d0;");
 });
 
+test("cellStyle dim matches the Rust floor formula, italic/underline emit", () => {
+  // Rust: f/10*6 (integer division) — default fg 0xd0=208 → 20*6 = 120 = 0x78.
+  assert.equal(cellStyle({ d: true }, false), "color:#787878;");
+  // On a palette color: bright red 255 → 25*6 = 150 = 0x96.
+  assert.equal(cellStyle({ f: 9, d: true }, false), "color:#960000;");
+  assert.equal(
+    cellStyle({ i: true, u: true }, false),
+    "font-style:italic;text-decoration:underline;",
+  );
+});
+
 test("renderRow coalesces same-style cells into one positioned run", () => {
   const html = renderRow([{ t: "a" }, { t: "b" }, { t: "c" }], -1);
   assert.equal(html, '<span class="run" style="left:0ch;width:3ch;">abc</span>');

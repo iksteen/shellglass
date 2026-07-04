@@ -122,21 +122,23 @@ public id. It's computed once per client connection, not per frame. Use
 
 ```
 command in a PTY  ── output bytes ─►  long-lived vt100 parser
-  → parser-agnostic StyledCell grid   → symbol_map font resolution
-  → HTML (absolute-positioned, coalesced <span> runs)
-  → SSE fragment on a watch channel   → browser swaps #screen
+  → parser-agnostic StyledCell grid   → rectangle diffs (changed cells only)
+  → SSE deltas, encoded once per frame for all viewers
+  → viewer.js renders cells → HTML in the browser
 ```
 
 The command runs in a pseudo-terminal you drive from your own terminal (the `script(1)`
 model): its output is teed to your screen immediately and, in parallel, fed to a
-long-lived vt100 parser that the renderer turns into HTML at up to 30fps. Terminal
-resizes (`SIGWINCH`) reflow both the PTY and the browser. In hub mode the client renders
-everything and pushes frames over a **single persistent streaming connection** (not a
-request per frame), so throughput isn't gated by round-trip latency; the hub just stores
-and re-serves the latest CSS + fragment, plus the fonts the client uploaded. If the
-connection drops (hub restart, network blip) the client re-registers and reconnects
-automatically — and the local session pauses cleanly, showing the outage in your terminal
-until it's back.
+long-lived vt100 parser snapshotted at up to 30fps. Each viewer gets a full frame on
+connect, then only the **changed rectangles** — a keystroke costs bytes, not a full
+screen — and a small baked-in renderer (`/viewer.js`) turns cells into HTML
+client-side. Terminal resizes (`SIGWINCH`) reflow both the PTY and the browser. In hub
+mode the client pushes frames over a **single persistent streaming connection** (not a
+request per frame), so throughput isn't gated by round-trip latency; the hub diffs them
+per session and re-serves the client's CSS, fonts, and render config. If the connection
+drops (hub restart, network blip) the client re-registers and reconnects automatically —
+and the local session pauses cleanly, showing the outage in your terminal until it's
+back.
 
 ## Fonts
 
@@ -188,7 +190,7 @@ For a fully custom page, point `template` at a full HTML document (this override
 |-------|-------------|
 | `{{style}}` | the generated `<style>` — terminal cell CSS + served-font `@font-face` |
 | `{{screen}}` | the live `<div id="screen">…</div>` the SSE updater swaps (keep the id) |
-| `{{script}}` | the `<script>` that subscribes to the event stream |
+| `{{script}}` | the `<script>` blocks that boot the live renderer (config + `/viewer.js` loader) |
 
 ```toml
 # config.toml

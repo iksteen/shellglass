@@ -1,10 +1,10 @@
 //! Multi-session hub server: receives pushes from clients and serves viewers.
 //!
-//! It renders nothing — a client pushes its already-rendered CSS (`/register`) then
-//! streams fragments over a single persistent `/stream` POST, keyed by
-//! `session_id(secret)`. Viewers open `/s/<id>` and stream updates from
-//! `/s/<id>/events`. The id is the read capability; the secret (never sent to
-//! viewers) is the write capability.
+//! It renders nothing — a client pushes its page CSS + render config (`/register`)
+//! then streams JSON frames over a single persistent `/stream` POST, keyed by
+//! `session_id(secret)`; the hub diffs them per session ([`diff::Live`]). Viewers
+//! open `/s/<id>` and stream cell deltas from `/s/<id>/events`. The id is the read
+//! capability; the secret (never sent to viewers) is the write capability.
 
 use crate::diff;
 use crate::fonts::CACHE_CONTROL_FONT;

@@ -12,30 +12,41 @@ cargo test                       # unit tests (CI runs with --locked)
 cargo test id_is_deterministic   # a single test by name
 cargo fmt --check                # CI gate
 cargo clippy --all-targets -- -D warnings   # CI gate (pedantic-clean; keep it that way)
+
+cd viewer && npm ci              # once: browser-renderer toolchain (TypeScript)
+npx tsc --noEmit                 # type-check viewer.ts (CI gate)
+node --test                      # viewer unit tests (CI gate)
+npm run build                    # regenerate viewer/dist/viewer.js — COMMIT IT after
+                                 # editing viewer.ts (CI fails if dist drifts)
 ```
 
-CI (`.github/workflows/ci.yml`) runs fmt + clippy + tests on push/PR. Tagging `v*` triggers Docker Hub multi-arch and GitHub Release binary builds.
+`cargo build` works without Node: `build.rs` compiles `viewer/viewer.ts` with the local `tsc` when `viewer/node_modules` exists, else it bakes the committed `viewer/dist/viewer.js`.
+
+CI (`.github/workflows/ci.yml`) runs fmt + clippy + tests plus the viewer job (type-check, tests, dist-freshness) on push/PR. Tagging `v*` triggers Docker Hub multi-arch and GitHub Release binary builds (both consume the committed `dist/`, no Node).
 
 ## Architecture
 
-The core is one rendering pipeline shared by every mode:
+The core is one streaming pipeline shared by every mode:
 
 ```
-PTY output bytes → vt100::Parser → model::Window (StyledCell grid)
-  → render::render_fragment (HTML) → watch::Receiver<String> → SSE to browser
+PTY output bytes → vt100::Parser → model::Grid (StyledCell cells)
+  → watch::Receiver<Arc<Frame>> → diff::Live (rectangle deltas, encoded once)
+  → SSE → viewer.js renders cells → HTML in the browser
 ```
 
-**Input backend** — `pty.rs` (`render_setup` in `main.rs`) produces a `watch::Receiver<String>` of the latest `#screen` HTML fragment. It runs one command in a PTY (`script(1)` model); one parser, one pane. A single `screen` thread owns raw mode + stdout + parser so hub-connection notices can pause/repaint cleanly, and renders at a 30fps cap (`MIN_FRAME`). The command defaults to `$SHELL`; `SIGWINCH` reflows both the PTY and the parser. Unix only.
+**Input backend** — `pty.rs` (`render_setup` in `main.rs`) produces a `watch::Receiver<Arc<Frame>>` of structured screen snapshots (`Frame::Screen(Grid)`). It runs one command in a PTY (`script(1)` model); one parser, one screen. A single `screen` thread owns raw mode + stdout + parser so hub-connection notices can pause/repaint cleanly, and snapshots at a 30fps cap (`MIN_FRAME`). The command defaults to `$SHELL`; `SIGWINCH` reflows both the PTY and the parser. Unix only.
 
 **Three serving modes** (all in `main.rs`):
-- Standalone (`server.rs`) — local axum server, `GET /` page + `GET /events` SSE.
-- Client (`client.rs`) — renders locally, streams frames to a remote hub over one persistent `/stream` POST (avoids per-frame HTTP round-trips); re-registers + reconnects on drop.
-- Hub (`hub.rs`, `hub` subcommand) — renders nothing; stores each client's pushed CSS/fonts/frames and re-serves them at `/s/<id>`.
+- Standalone (`server.rs`) — local axum server: `GET /` page, `GET /events` SSE deltas, `GET /viewer.js` the baked renderer.
+- Client (`client.rs`) — streams full JSON `Frame`s to a remote hub over one persistent `/stream` POST (avoids per-frame HTTP round-trips); re-registers + reconnects on drop. (Diffing this link is a marked follow-up; the fan-out win is on the viewer SSE.)
+- Hub (`hub.rs`, `hub` subcommand) — renders nothing; stores each client's pushed CSS/fonts/render-config, decodes its pushed frames into a per-session `diff::Live`, and serves viewers at `/s/<id>`.
 
 **Key layers:**
-- `model.rs` — parser-agnostic IR (`StyledCell`, `Grid`, `Pane`, `Window`). Nothing here depends on `vt100`, so the parse layer is swappable.
+- `model.rs` — parser-agnostic IR (`StyledCell`, `Grid`, `Frame`) doubling as the wire format: compact serde (single-letter keys, defaults omitted — a blank cell is `{}`). Nothing here depends on `vt100`.
 - `parse.rs` — `grid_from_screen` extracts a `Grid` from a live `vt100::Screen`.
-- `render.rs` — `Grid` → HTML. Panes absolutely positioned in cell units; adjacent same-style cells coalesced into one `<span>`. Also builds `@font-face` CSS and fills the page template.
+- `diff.rs` — `Live`: diff-once, broadcast-to-all. Computes each frame's delta from the previous **once** and broadcasts one pre-encoded message to every viewer; a connect atomically snapshots a full frame + subscribes; a lagged viewer resyncs with a fresh full. Deltas are per-row minimal changed cell-index spans, vertically merged into rectangles; cells ride columnar (dense text array, blank = `0`, sparse index→style map). Layout (cols/row-count) change ⇒ full frame.
+- `viewer/viewer.ts` — the live browser renderer (TypeScript): applies full/diff/banner messages to an in-memory cell grid and re-renders dirty rows. **It must mirror `render.rs` byte-for-byte** (run coalescing, absolute `left:{col}ch` positioning, SVG symbol cells, palette/dim/reverse math) — nothing enforces this at build time, so change them together. `build.rs` compiles it (local `tsc`, else the committed `viewer/dist/viewer.js`), bakes it in via `include_str!`, and both servers serve it at `/viewer.js`.
+- `render.rs` — the Rust reference renderer (`render_fragment`, kept in lockstep with `viewer.ts`), used for the standalone `GET /` initial paint; also builds `@font-face` CSS, the render-config JSON handed to the browser, and fills the page template.
 - `fonts.rs` — `symbol_map` codepoint→family resolution + locating font files via `fontdb` (extracts a single face from `.ttc`) so viewers render glyphs with no local install. `fc-match` is consulted only to resolve a CSS generic like `monospace`.
 - `config.rs` — TOML config (`default_font` stack, `symbol_map`, `theme`/`template`).
 - `proto.rs` — client/hub wire contract.
