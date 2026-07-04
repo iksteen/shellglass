@@ -1,0 +1,353 @@
+// shellglass browser renderer.
+//
+// Receives the compact cell-diff stream over SSE and renders it to HTML, mirroring
+// the Rust reference (`src/render.rs`) cell-for-cell: run coalescing with absolute
+// per-run positioning, SVG-scaled symbol glyphs, the xterm-256 palette, and
+// reverse/dim/bold/italic/underline styling. It keeps the full cell grid in memory
+// so a rectangle diff only needs to re-render the affected rows.
+//
+// Compiled to viewer.js (see build.rs) and served at /viewer.js; the page injects
+// `window.SHELLGLASS = { events, cfg }` before loading this module.
+
+// ── wire types ────────────────────────────────────────────────────────────────
+
+// A color is null (default), a 0-255 palette index, or an [r,g,b] triple.
+export type Color = null | number | [number, number, number];
+
+export interface Cell {
+  t?: string; // text (grapheme); absent = blank
+  f?: Color; // fg
+  g?: Color; // bg
+  b?: boolean; // bold
+  d?: boolean; // dim
+  i?: boolean; // italic
+  u?: boolean; // underline
+  n?: boolean; // inverse
+  w?: boolean; // wide (two columns)
+}
+
+export type Cur = [number, number] | null;
+
+// A cell's style attributes (everything but the text), keyed like Cell.
+export type Style = Omit<Cell, "t">;
+
+// Columnar cell block: dense text array + sparse style map (only non-plain cells).
+// A text entry is a glyph string, or the number 0 for a blank cell (cheaper than
+// "" and common). Empty arrays/maps are omitted, so a blank row is `{}`.
+export interface Block {
+  t?: (string | number)[];
+  s?: Record<number, Style>;
+}
+
+// A diff rectangle is a Block plus its position/size (serde flattens the block in).
+interface WireRect extends Block {
+  top: number;
+  left: number;
+  w: number;
+  h: number;
+}
+
+// A decoded rectangle: cells materialized from the columnar block.
+interface Rect {
+  top: number;
+  left: number;
+  w: number;
+  h: number;
+  cells: Cell[];
+}
+
+interface FullMsg {
+  t: "f";
+  w: number;
+  h: number;
+  cur: Cur;
+  rows: Block[];
+}
+interface DiffMsg {
+  t: "d";
+  cur: Cur;
+  rects: WireRect[];
+}
+
+// Materialize a columnar block into per-cell objects (the form renderRow consumes).
+export function decodeBlock(block: Block): Cell[] {
+  const t = block.t ?? [];
+  const s = block.s;
+  const cells: Cell[] = new Array(t.length);
+  for (let i = 0; i < t.length; i++) {
+    const v = t[i];
+    const text = typeof v === "string" ? v : ""; // 0 → blank
+    const st = s && s[i];
+    cells[i] = st ? { t: text, ...st } : { t: text };
+  }
+  return cells;
+}
+interface BannerMsg {
+  t: "b";
+  html: string;
+}
+type Msg = FullMsg | DiffMsg | BannerMsg;
+
+export interface Cfg {
+  defFg: string; // default fg as #rrggbb (for reverse/dim materialization)
+  defBg: string;
+  fillFont: string; // base font stack for stretch-fill glyphs
+  sym: [number, number, string][]; // [lo, hi, family-stack] symbol_map overrides
+}
+
+type RGB = [number, number, number];
+
+// ── config ──────────────────────────────────────────────────────────────────
+
+let cfg: Cfg;
+export function setConfig(c: Cfg): void {
+  cfg = c;
+}
+
+// ── color ─────────────────────────────────────────────────────────────────────
+
+const BASE16: RGB[] = [
+  [0x00, 0x00, 0x00], [0xcd, 0x00, 0x00], [0x00, 0xcd, 0x00], [0xcd, 0xcd, 0x00],
+  [0x00, 0x00, 0xee], [0xcd, 0x00, 0xcd], [0x00, 0xcd, 0xcd], [0xe5, 0xe5, 0xe5],
+  [0x7f, 0x7f, 0x7f], [0xff, 0x00, 0x00], [0x00, 0xff, 0x00], [0xff, 0xff, 0x00],
+  [0x5c, 0x5c, 0xff], [0xff, 0x00, 0xff], [0x00, 0xff, 0xff], [0xff, 0xff, 0xff],
+];
+
+// xterm 256-color palette (port of render.rs:palette).
+export function palette(i: number): RGB {
+  if (i < 16) return BASE16[i];
+  if (i < 232) {
+    const n = i - 16;
+    const L = [0, 95, 135, 175, 215, 255];
+    return [L[Math.floor(n / 36)], L[Math.floor(n / 6) % 6], L[n % 6]];
+  }
+  const v = 8 + 10 * (i - 232);
+  return [v, v, v];
+}
+
+function hex(c: RGB): string {
+  return "#" + c.map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+function parseHex(s: string): RGB {
+  return [
+    parseInt(s.slice(1, 3), 16),
+    parseInt(s.slice(3, 5), 16),
+    parseInt(s.slice(5, 7), 16),
+  ];
+}
+
+export function resolveRgb(c: Color | undefined): RGB | null {
+  if (c == null) return null;
+  if (typeof c === "number") return palette(c);
+  return c;
+}
+
+// ── cell → CSS (port of render.rs:cell_box_style) ─────────────────────────────
+
+export function cellStyle(cell: Cell, isCursor: boolean): string {
+  let fg = resolveRgb(cell.f);
+  let bg = resolveRgb(cell.g);
+  // Reverse video (inverse XOR cursor) swaps fg/bg, materializing defaults.
+  if (!!cell.n !== isCursor) {
+    const f = fg ?? parseHex(cfg.defFg);
+    const b = bg ?? parseHex(cfg.defBg);
+    fg = b;
+    bg = f;
+  }
+  if (cell.d) {
+    const f = fg ?? parseHex(cfg.defFg);
+    fg = [Math.floor(f[0] / 10) * 6, Math.floor(f[1] / 10) * 6, Math.floor(f[2] / 10) * 6];
+  }
+  let s = "";
+  if (fg) s += `color:${hex(fg)};`;
+  if (bg) s += `background:${hex(bg)};`;
+  if (cell.b) s += "font-weight:bold;";
+  if (cell.i) s += "font-style:italic;";
+  if (cell.u) s += "text-decoration:underline;";
+  return s;
+}
+
+// ── symbol / fill glyphs (port of render.rs:is_fill_glyph + svg_font) ──────────
+
+export function isFillGlyph(cp: number): boolean {
+  return (
+    (cp >= 0xe0b0 && cp <= 0xe0d4) || // powerline separators
+    (cp >= 0x2500 && cp <= 0x259f) || // box drawing + block elements
+    (cp >= 0x1fb00 && cp <= 0x1fbaf) // legacy computing
+  );
+}
+
+function symbolFamily(cp: number): string | null {
+  for (const [lo, hi, fam] of cfg.sym) {
+    if (cp >= lo && cp <= hi) return fam;
+  }
+  return null;
+}
+
+// The font stack to render `cell` as a scaled SVG glyph, or null for plain text.
+function svgFont(cell: Cell): string | null {
+  const t = cell.t ?? "";
+  if (!t) return null;
+  const cp = t.codePointAt(0)!;
+  const fam = symbolFamily(cp);
+  if (fam) return fam;
+  return isFillGlyph(cp) ? cfg.fillFont : null;
+}
+
+function esc(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function symbolCell(cell: Cell, isCursor: boolean, col: number, w: number, font: string): string {
+  const boxStyle = cellStyle(cell, isCursor);
+  const t = cell.t ?? " ";
+  const first = t.codePointAt(0) ?? 0x20;
+  const par = isFillGlyph(first) ? "none" : "xMidYMid meet";
+  return (
+    `<span class="run" style="left:${col}ch;width:${w}ch;${boxStyle}">` +
+    `<svg viewBox="0 0 14 14" preserveAspectRatio="${par}" style="display:block;width:100%;height:100%">` +
+    `<text x="0" y="12" font-family="${font}" font-size="14" fill="currentColor">${esc(t)}</text></svg></span>`
+  );
+}
+
+// ── row rendering (port of render.rs:render_row) ──────────────────────────────
+
+// Render one row's cells to inner HTML. `cursorCol` is the cursor column, or -1.
+export function renderRow(cells: Cell[], cursorCol: number): string {
+  let out = "";
+  let col = 0;
+  let runStyle: string | null = null;
+  let runCol = 0;
+  let cols = 0;
+  let text = "";
+  const flush = () => {
+    if (text.length === 0) return;
+    out += `<span class="run" style="left:${runCol}ch;width:${cols}ch;${runStyle ?? ""}">${text}</span>`;
+    text = "";
+  };
+  for (const cell of cells) {
+    const isCursor = col === cursorCol;
+    const w = cell.w ? 2 : 1;
+    const font = svgFont(cell);
+    if (font) {
+      flush();
+      runStyle = null;
+      cols = 0;
+      out += symbolCell(cell, isCursor, col, w, font);
+    } else {
+      const style = cellStyle(cell, isCursor);
+      if (runStyle !== style) {
+        flush();
+        runStyle = style;
+        cols = 0;
+      }
+      if (cols === 0) runCol = col;
+      text += esc(cell.t && cell.t.length ? cell.t : " ");
+      cols += w;
+    }
+    col += w;
+  }
+  flush();
+  return out;
+}
+
+function cursorCol(cur: Cur, row: number): number {
+  return cur && cur[0] === row ? cur[1] : -1;
+}
+
+// ── screen state + message application ────────────────────────────────────────
+
+interface ScreenState {
+  cells: Cell[][];
+  cur: Cur;
+  rowEls: HTMLElement[];
+}
+
+let screen: ScreenState = { cells: [], cur: null, rowEls: [] };
+let screenEl: HTMLElement;
+
+// Update the screen's cell buffer + cursor from a diff (with decoded rects),
+// returning the rows to re-render (changed rects plus the old and new cursor rows).
+// DOM-free, so it's unit-tested.
+export function patchCells(
+  state: { cells: Cell[][]; cur: Cur },
+  dp: { cur: Cur; rects: Rect[] },
+): Set<number> {
+  const dirty = new Set<number>();
+  if (state.cur) dirty.add(state.cur[0]);
+  if (dp.cur) dirty.add(dp.cur[0]);
+  state.cur = dp.cur;
+  for (const rect of dp.rects) {
+    for (let dy = 0; dy < rect.h; dy++) {
+      const r = rect.top + dy;
+      let row = state.cells[r];
+      if (!row) {
+        row = [];
+        state.cells[r] = row;
+      }
+      for (let dx = 0; dx < rect.w; dx++) {
+        row[rect.left + dx] = rect.cells[dy * rect.w + dx];
+      }
+      dirty.add(r);
+    }
+  }
+  return dirty;
+}
+
+function applyFull(m: FullMsg): void {
+  const rows = m.rows.map(decodeBlock);
+  let html = `<div class="screen" style="width:${m.w}ch;height:calc(${m.h} * var(--lh));">`;
+  for (let r = 0; r < rows.length; r++) {
+    html += `<div class="row">${renderRow(rows[r], cursorCol(m.cur, r))}</div>`;
+  }
+  html += "</div>";
+  screenEl.innerHTML = html;
+
+  const screenDiv = screenEl.firstElementChild!;
+  screen = {
+    cells: rows,
+    cur: m.cur,
+    rowEls: Array.from(screenDiv.children) as HTMLElement[],
+  };
+}
+
+function applyDiff(m: DiffMsg): void {
+  const rects: Rect[] = m.rects.map((r) => ({
+    top: r.top,
+    left: r.left,
+    w: r.w,
+    h: r.h,
+    cells: decodeBlock(r),
+  }));
+  const dirty = patchCells(screen, { cur: m.cur, rects });
+  for (const r of dirty) {
+    const el = screen.rowEls[r];
+    if (!el) continue;
+    el.innerHTML = renderRow(screen.cells[r] ?? [], cursorCol(screen.cur, r));
+  }
+}
+
+function applyBanner(m: BannerMsg): void {
+  screenEl.innerHTML = m.html;
+  screen = { cells: [], cur: null, rowEls: [] };
+}
+
+export function apply(m: Msg): void {
+  if (m.t === "f") applyFull(m);
+  else if (m.t === "d") applyDiff(m);
+  else applyBanner(m);
+}
+
+function main(): void {
+  const boot = (window as unknown as { SHELLGLASS: { events: string; cfg: Cfg } }).SHELLGLASS;
+  setConfig(boot.cfg);
+  screenEl = document.getElementById("screen")!;
+  const es = new EventSource(boot.events);
+  es.onmessage = (e) => apply(JSON.parse(e.data) as Msg);
+}
+
+// Only bootstrap in the browser; importing this module in Node (tests) is inert.
+if (typeof document !== "undefined" && (window as unknown as { SHELLGLASS?: unknown }).SHELLGLASS) {
+  main();
+}

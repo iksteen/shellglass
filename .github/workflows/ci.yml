@@ -30,3 +30,32 @@ jobs:
 
       - name: Tests
         run: cargo test --locked
+
+  # The browser renderer is TypeScript, compiled to the committed viewer/dist/viewer.js
+  # that build.rs bakes in. Type-check it, run its unit tests, and confirm the committed
+  # build is regenerated from source (so it can never drift).
+  viewer:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: viewer
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install
+        run: npm ci
+
+      - name: Type-check
+        run: npx tsc --noEmit
+
+      - name: Tests
+        run: node --test
+
+      - name: Committed build is fresh
+        run: |
+          npm run build
+          git diff --exit-code dist/viewer.js

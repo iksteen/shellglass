@@ -36,6 +36,13 @@ impl Resolver {
         Ok(Resolver { entries })
     }
 
+    /// The compiled `(range, family)` overrides, so the browser renderer can be
+    /// handed the symbol table and resolve fonts client-side (see
+    /// [`crate::render::render_config_json`]).
+    pub fn entries(&self) -> &[(RangeInclusive<u32>, String)] {
+        &self.entries
+    }
+
     /// Family name overriding the default for `ch`, if any matches.
     pub fn font_for(&self, ch: char) -> Option<&str> {
         let cp = ch as u32;

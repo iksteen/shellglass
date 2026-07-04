@@ -6,33 +6,33 @@
 //! `/s/<id>/events`. The id is the read capability; the secret (never sent to
 //! viewers) is the write capability.
 
+use crate::diff;
 use crate::fonts::CACHE_CONTROL_FONT;
+use crate::model::Frame;
 use crate::proto::{self, KEY_HEADER, session_id};
 use crate::render;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use std::collections::{HashMap, HashSet};
-use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
-use tokio::sync::watch;
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::WatchStream;
 use tower_http::compression::CompressionLayer;
 
 struct Session {
     css: String,
     /// Viewer template the client pushed (empty → the hub's built-in default).
     template: String,
-    /// Latest fragment; `watch` hands the current value to each new viewer.
-    frame: watch::Sender<String>,
+    /// Render config the client pushed (colors + symbol_map) for its `viewer.js`.
+    render_cfg: String,
+    /// Live publisher: decoded pushed frames in, per-viewer cell deltas out.
+    live: Arc<diff::Live>,
     /// Fonts the client uploaded, keyed as the CSS references them (`key` → (mime,
     /// bytes)). Scoped to this session so different clients' fonts never clash.
     fonts: HashMap<String, (String, Vec<u8>)>,
@@ -87,6 +87,7 @@ pub fn app(state: HubState) -> Router {
         // /stream is an unbounded, never-ending push body — the default limit would
         // cut it off, so disable it here.
         .route("/stream", post(stream).layer(DefaultBodyLimit::disable()))
+        .route("/viewer.js", get(viewer_js).layer(compress.clone()))
         .route("/s/{id}", get(view).layer(compress.clone()))
         .route("/s/{id}/events", get(events))
         .route("/s/{id}/fonts/{key}", get(font).layer(compress))
@@ -146,15 +147,19 @@ async fn register(
     if let Some(s) = map.get_mut(&id) {
         s.css = reg.css;
         s.template = reg.template;
+        s.render_cfg = reg.render_cfg;
         s.fonts = fonts;
     } else {
-        let (frame, _) = watch::channel(render::banner("waiting for client…"));
+        let live = diff::Live::new(Arc::new(Frame::Banner(render::banner(
+            "waiting for client…",
+        ))));
         map.insert(
             id.clone(),
             Session {
                 css: reg.css,
                 template: reg.template,
-                frame,
+                render_cfg: reg.render_cfg,
+                live,
                 fonts,
             },
         );
@@ -202,10 +207,10 @@ async fn stream(State(st): State<HubState>, headers: HeaderMap, body: Body) -> R
         Ok(id) => id,
         Err(code) => return code.into_response(),
     };
-    // Clone the watch sender out (don't hold the lock while streaming). send_replace
-    // retains the latest frame even with no browser subscribed.
-    let tx = match st.sessions.lock().unwrap().get(&id) {
-        Some(s) => s.frame.clone(),
+    // Clone the publisher out (don't hold the lock while streaming). It keeps the
+    // latest frame even with no browser subscribed.
+    let live = match st.sessions.lock().unwrap().get(&id) {
+        Some(s) => Arc::clone(&s.live),
         None => return StatusCode::CONFLICT.into_response(),
     };
 
@@ -216,7 +221,12 @@ async fn stream(State(st): State<HubState>, headers: HeaderMap, body: Body) -> R
         match proto::frame_drain(&mut buf) {
             Ok(frames) => {
                 for f in frames {
-                    tx.send_replace(f);
+                    // Each frame is a JSON-encoded Frame; publishing computes the
+                    // per-viewer deltas. Skip a malformed frame rather than dropping
+                    // the whole session (e.g. a version-skewed client).
+                    if let Ok(frame) = serde_json::from_str::<Frame>(&f) {
+                        live.publish(Arc::new(frame));
+                    }
                 }
             }
             Err(()) => break, // corrupt length prefix — drop the connection
@@ -230,27 +240,38 @@ async fn view(State(st): State<HubState>, Path(id): Path<String>) -> Response {
     let Some(s) = map.get(&id) else {
         return (StatusCode::NOT_FOUND, "unknown session").into_response();
     };
-    let script = render::sse_script(&format!("/s/{id}/events"));
+    let script = render::sse_script(&format!("/s/{id}/events"), &s.render_cfg);
     // Empty template = an older client that didn't push one; use the built-in.
     let template = if s.template.is_empty() {
         render::DEFAULT_TEMPLATE
     } else {
         &s.template
     };
-    Html(render::page(template, &s.css, &s.frame.borrow(), &script)).into_response()
+    // Empty #screen: the renderer fills it from the first SSE frame (the hub renders
+    // nothing itself).
+    Html(render::page(template, &s.css, "", &script)).into_response()
 }
 
 async fn events(State(st): State<HubState>, Path(id): Path<String>) -> Response {
-    let rx = {
+    let live = {
         let map = st.sessions.lock().unwrap();
         match map.get(&id) {
-            Some(s) => s.frame.subscribe(),
+            Some(s) => Arc::clone(&s.live),
             None => return (StatusCode::NOT_FOUND, "unknown session").into_response(),
         }
     };
-    let stream = WatchStream::new(rx).map(|html| Ok::<_, Infallible>(Event::default().data(html)));
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
+    live.connect()
+}
+
+/// Serve the baked renderer (see [`crate::server`] for the caching rationale).
+async fn viewer_js() -> Response {
+    (
+        [
+            (CONTENT_TYPE, "application/javascript"),
+            (CACHE_CONTROL, "no-cache"),
+        ],
+        render::VIEWER_JS,
+    )
         .into_response()
 }
 

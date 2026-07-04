@@ -11,10 +11,7 @@
 //! parser (`contents_formatted`), rather than the client's `eprintln!`s corrupting
 //! the live session.
 
-use crate::config::Config;
-use crate::fonts::Resolver;
-use crate::model::{Pane, PaneGeom, Window};
-use crate::render;
+use crate::model::Frame;
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{Read, Write};
@@ -55,14 +52,9 @@ impl Notifier {
 }
 
 /// Start an interactive PTY session running `command`. Returns a receiver of the
-/// latest rendered `#screen` fragment plus a [`Notifier`] for hub status. Puts the
-/// terminal in raw mode, bridges stdin/stdout, and exits the process when the
-/// command exits.
-pub fn start(
-    command: &[String],
-    config: Arc<Config>,
-    resolver: Arc<Resolver>,
-) -> Result<(watch::Receiver<String>, Notifier)> {
+/// latest screen [`Frame`] plus a [`Notifier`] for hub status. Puts the terminal in
+/// raw mode, bridges stdin/stdout, and exits the process when the command exits.
+pub fn start(command: &[String]) -> Result<(watch::Receiver<Arc<Frame>>, Notifier)> {
     let (cols, rows) = term_size().unwrap_or((80, 24));
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -91,8 +83,7 @@ pub fn start(
     // Raw mode now, before the child draws anything.
     let raw = RawMode::acquire();
     let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
-    let (frame_tx, frame_rx) =
-        watch::channel(render_screen(&new_parser(rows, cols), &config, &resolver));
+    let (frame_tx, frame_rx) = watch::channel(frame_from(&new_parser(rows, cols)));
 
     // PTY reader → screen thread.
     {
@@ -163,14 +154,7 @@ pub fn start(
     // parser. Tees shell output immediately, renders to the browser at ≤30fps, and
     // handles hub notices with a clean pause/restore.
     std::thread::spawn(move || {
-        screen_thread(
-            msg_rx,
-            frame_tx,
-            raw,
-            new_parser(rows, cols),
-            config,
-            resolver,
-        );
+        screen_thread(msg_rx, frame_tx, raw, new_parser(rows, cols));
     });
 
     // When the command exits, tell the screen thread to restore the terminal + quit.
@@ -187,11 +171,9 @@ pub fn start(
 
 fn screen_thread(
     msg_rx: mpsc::Receiver<Msg>,
-    frame_tx: watch::Sender<String>,
+    frame_tx: watch::Sender<Arc<Frame>>,
     raw: RawMode,
     mut parser: vt100::Parser,
-    config: Arc<Config>,
-    resolver: Arc<Resolver>,
 ) {
     let mut out = std::io::stdout();
     let mut connected = true; // teeing shell output to the terminal
@@ -251,7 +233,7 @@ fn screen_thread(
             None => {}    // frame due
         }
         if dirty && last_frame.elapsed() >= MIN_FRAME {
-            let _ = frame_tx.send(render_screen(&parser, &config, &resolver));
+            let _ = frame_tx.send(frame_from(&parser));
             dirty = false;
             last_frame = Instant::now();
         }
@@ -262,25 +244,11 @@ fn new_parser(rows: u16, cols: u16) -> vt100::Parser {
     vt100::Parser::new(rows, cols, 0)
 }
 
-/// Render the single PTY screen as a one-pane window fragment.
-fn render_screen(parser: &vt100::Parser, config: &Config, resolver: &Resolver) -> String {
-    let screen = parser.screen();
-    let (rows, cols) = screen.size();
-    let window = Window {
-        width: cols,
-        height: rows,
-        panes: vec![Pane {
-            geom: PaneGeom {
-                left: 0,
-                top: 0,
-                width: cols,
-                height: rows,
-                active: true,
-            },
-            grid: crate::parse::grid_from_screen(screen),
-        }],
-    };
-    render::render_fragment(&window, config, resolver)
+/// Snapshot the PTY screen as a [`Frame`] for the diff/stream pipeline.
+fn frame_from(parser: &vt100::Parser) -> Arc<Frame> {
+    Arc::new(Frame::Screen(crate::parse::grid_from_screen(
+        parser.screen(),
+    )))
 }
 
 /// Write end of the SIGWINCH self-pipe, read by the async-signal-safe handler.

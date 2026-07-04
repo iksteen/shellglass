@@ -1,5 +1,5 @@
-//! Push client: run the live control-mode pipeline locally, but stream the
-//! rendered fragments to a remote hub instead of serving them.
+//! Push client: run the live PTY pipeline locally, but stream its frames to a
+//! remote hub instead of serving them.
 //!
 //! It registers the page CSS once (`/register`), then opens a single long-lived
 //! `/stream` POST and writes length-prefixed frames into its body as the live
@@ -9,7 +9,8 @@
 //! blip) it re-registers and reopens.
 
 use crate::config::Config;
-use crate::fonts::{self, FontFile};
+use crate::fonts::{self, FontFile, Resolver};
+use crate::model::Frame;
 use crate::proto::{KEY_HEADER, RegisterBody, frame_encode};
 use crate::render;
 use anyhow::{Context, Result, bail};
@@ -28,9 +29,10 @@ pub async fn run(
     key: String,
     id: String,
     config: Arc<Config>,
+    resolver: Arc<Resolver>,
     fonts: Arc<Vec<FontFile>>,
     template: Arc<String>,
-    mut rx: watch::Receiver<String>,
+    mut rx: watch::Receiver<Arc<Frame>>,
     notifier: Option<crate::pty::Notifier>,
 ) -> Result<()> {
     let base = base_url.trim_end_matches('/').to_string();
@@ -43,6 +45,7 @@ pub async fn run(
     let reg = RegisterBody {
         css,
         template: (*template).clone(),
+        render_cfg: render::render_config_json(&config, &resolver),
         fonts: fonts::font_assets(&fonts),
     };
     let reg_body = Bytes::from(serde_json::to_vec(&reg).context("encoding register payload")?);
@@ -129,13 +132,21 @@ enum End {
     Disconnected,
 }
 
+/// Length-prefix a frame for the push body: the wire payload is the JSON-encoded
+/// [`Frame`] (the hub diffs successive frames into per-viewer deltas).
+fn encode_frame(frame: &Frame) -> Bytes {
+    Bytes::from(frame_encode(
+        &serde_json::to_string(frame).unwrap_or_default(),
+    ))
+}
+
 /// Open one streaming POST and pump frames until either the live task ends or the
 /// connection breaks.
 async fn stream_push(
     http: &reqwest::Client,
     base: &str,
     key: &str,
-    rx: &mut watch::Receiver<String>,
+    rx: &mut watch::Receiver<Arc<Frame>>,
 ) -> End {
     let (tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
     let body = reqwest::Body::wrap_stream(ReceiverStream::new(body_rx));
@@ -148,9 +159,12 @@ async fn stream_push(
     // Feeder: send the current frame immediately, then every subsequent change.
     // A bounded channel + the watch's latest-only semantics give backpressure: if
     // the network stalls, we hold and coalesce, always sending the freshest frame.
+    // ponytail: each frame is the full screen JSON — larger than the old HTML.
+    // Diff this link next (the hub already diffs per viewer; the client could send
+    // deltas and the hub apply them), but the fan-out win is on the viewer SSE.
     let feeder = async {
         let cur = rx.borrow_and_update().clone();
-        if tx.send(Ok(Bytes::from(frame_encode(&cur)))).await.is_err() {
+        if tx.send(Ok(encode_frame(&cur))).await.is_err() {
             return false; // body consumer gone (connection dropped)
         }
         loop {
@@ -158,7 +172,7 @@ async fn stream_push(
                 return true; // live task ended
             }
             let f = rx.borrow_and_update().clone();
-            if tx.send(Ok(Bytes::from(frame_encode(&f)))).await.is_err() {
+            if tx.send(Ok(encode_frame(&f))).await.is_err() {
                 return false;
             }
         }

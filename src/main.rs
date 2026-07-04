@@ -2,6 +2,7 @@
 
 mod client;
 mod config;
+mod diff;
 mod fonts;
 mod hub;
 mod model;
@@ -224,9 +225,10 @@ fn gen_key() -> Result<()> {
 /// build the input backend. Returns everything the two modes need to run.
 struct Rendered {
     config: Arc<Config>,
+    resolver: Arc<Resolver>,
     fonts: Arc<Vec<FontFile>>,
     template: Arc<String>,
-    rx: tokio::sync::watch::Receiver<String>,
+    rx: tokio::sync::watch::Receiver<Arc<model::Frame>>,
     notifier: Option<pty::Notifier>,
 }
 
@@ -247,9 +249,13 @@ fn render_setup(source: SourceArgs) -> Result<Rendered> {
     let template = Arc::new(config.template_html().context("loading viewer template")?);
     let config = Arc::new(config);
 
-    let (rx, notifier) = pty::start(&source.command(), config.clone(), resolver)?;
+    // The backend emits structured frames; color/glyph rendering happens in the
+    // browser (and the initial paint via the resolver held here), so it no longer
+    // needs the config or resolver.
+    let (rx, notifier) = pty::start(&source.command())?;
     Ok(Rendered {
         config,
+        resolver,
         fonts,
         template,
         rx,
@@ -270,9 +276,10 @@ async fn run_serve(source: SourceArgs, bind_addr: &str) -> Result<()> {
     let state = AppState {
         font_css: Arc::new(render::font_face_css(&r.fonts, "/fonts/")),
         config: r.config,
+        resolver: r.resolver,
         fonts: r.fonts,
         template: r.template,
-        live_rx: r.rx,
+        live: diff::Live::spawn(r.rx),
     };
     axum::serve(listener, server::app(state)).await?;
     Ok(())
@@ -286,7 +293,7 @@ async fn run_push(url: String, key: String, source: SourceArgs) -> Result<()> {
     println!("shellglass: pushing live to {base}; view at {base}/s/{id}");
     let r = render_setup(source)?;
     client::run(
-        url, key, id, r.config, r.fonts, r.template, r.rx, r.notifier,
+        url, key, id, r.config, r.resolver, r.fonts, r.template, r.rx, r.notifier,
     )
     .await
 }

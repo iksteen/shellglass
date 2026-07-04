@@ -32,6 +32,11 @@ pub struct RegisterBody {
     /// `default` (empty) so the hub falls back to its built-in for older clients.
     #[serde(default)]
     pub template: String,
+    /// Render config JSON (colors + `symbol_map`) the hub injects into the page so
+    /// the client's `viewer.js` resolves glyphs as the client would. `default`
+    /// (empty) so the renderer falls back to its built-in defaults for older clients.
+    #[serde(default)]
+    pub render_cfg: String,
     #[serde(default)]
     pub fonts: Vec<FontAsset>,
 }
@@ -67,7 +72,9 @@ pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 
 /// Frame a payload for the streaming push body: `[u32 BE length][payload bytes]`.
 /// A persistent POST carries a sequence of these, so the client never waits for a
-/// per-frame HTTP response (that round-trip is what made the hub feel laggy).
+/// per-frame HTTP response (that round-trip is what made the hub feel laggy). The
+/// payload is a JSON-encoded [`crate::model::Frame`]; the hub diffs successive
+/// frames into the compact deltas it streams to viewers.
 pub fn frame_encode(payload: &str) -> Vec<u8> {
     let mut v = Vec::with_capacity(4 + payload.len());
     v.extend_from_slice(&(payload.len() as u32).to_be_bytes());

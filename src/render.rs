@@ -1,11 +1,18 @@
-//! Grid → HTML. Panes are absolutely positioned in cell units; within a pane,
-//! adjacent cells with identical styling (including resolved font) are coalesced
-//! into a single `<span>`.
+//! Grid → HTML. Rows are stacked in the `#screen` box; within a row, adjacent cells
+//! with identical styling (including resolved font) are coalesced into a single
+//! `<span>`, each absolutely positioned at its column.
 
 use crate::config::Config;
 use crate::fonts::{FontFile, Resolver};
-use crate::model::{Color, StyledCell, Window};
+use crate::model::{Color, Grid, StyledCell};
+use serde::Serialize;
 use std::fmt::Write as _;
+
+/// The compiled browser renderer (`viewer/viewer.ts` → JS), baked into the binary
+/// and served verbatim at `/viewer.js` by both the standalone server and the hub.
+/// `build.rs` produces it (via `tsc` when present, else the committed
+/// `viewer/dist/viewer.js`).
+pub const VIEWER_JS: &str = include_str!(concat!(env!("OUT_DIR"), "/viewer.js"));
 
 /// `@font-face` blocks for served fonts. Each references `{url_prefix}{index}`,
 /// where the index is the font's position (matching [`crate::fonts::font_assets`])
@@ -52,10 +59,7 @@ pub fn head_css(font_css: &str, config: &Config) -> String {
         "html,body {{ margin:0; }}\n\
          #screen {{ font-family:{stack}; font-size:{fs}px; --lh:{lh}px; \
          line-height:var(--lh); color:{fg}; background:#000; }}\n\
-         .screen {{ position:relative; }}\n\
-         .pane {{ position:absolute; white-space:pre; overflow:hidden; \
-         box-sizing:border-box; }}\n\
-         .pane.active {{ box-shadow: inset 0 0 0 1px #3b3b3b; }}\n\
+         .screen {{ position:relative; white-space:pre; overflow:hidden; }}\n\
          .row {{ position:relative; height:var(--lh); }}\n\
          .run {{ position:absolute; top:0; height:var(--lh); overflow:hidden; }}\n",
         stack = font_stack(config),
@@ -71,31 +75,87 @@ pub fn head_css(font_css: &str, config: &Config) -> String {
 /// `{{screen}}` is filled last and its replacement is never re-scanned, so a
 /// literal `{{script}}` the user typed into the terminal can't corrupt the page.
 pub fn page(template: &str, head_css: &str, fragment: &str, script: &str) -> String {
+    // `script` already carries its own `<script>` tags (it loads the external
+    // renderer), so inject it raw rather than wrapping it.
     template
         .replace("{{style}}", &format!("<style>\n{head_css}</style>"))
-        .replace("{{script}}", &format!("<script>\n{script}\n</script>"))
+        .replace("{{script}}", script)
         .replace(
             "{{screen}}",
             &format!("<div id=\"screen\">{fragment}</div>"),
         )
 }
 
-/// SSE updater: subscribe to `events_path` and swap `#screen` on each push.
-/// `EventSource` auto-reconnects if the stream drops, so no retry logic here.
-pub fn sse_script(events_path: &str) -> String {
+/// The page's updater block: a tiny inline config the renderer reads (the SSE path
+/// plus the render config), then a `<script src>` for the baked `/viewer.js`. The
+/// renderer itself is served as a cacheable file, not inlined. `cfg_json` is a JSON
+/// object (from [`render_config_json`], or the client's, relayed by the hub); an
+/// empty string falls back to `null` so the renderer uses its built-in defaults.
+pub fn sse_script(events_path: &str, cfg_json: &str) -> String {
+    let cfg = if cfg_json.is_empty() {
+        "null"
+    } else {
+        cfg_json
+    };
+    let events = serde_json::to_string(events_path).unwrap_or_else(|_| "\"/events\"".into());
+    // The inline classic script runs at parse time (setting the config); the module
+    // script is deferred by default and runs after, so the config is ready. viewer.js
+    // is an ES module, hence type="module".
     format!(
-        "const es = new EventSource('{events_path}');\n\
-         es.onmessage = e => {{ document.getElementById('screen').innerHTML = e.data; }};"
+        "<script>window.SHELLGLASS={{events:{events},cfg:{cfg}}};</script>\n\
+         <script type=\"module\" src=\"/viewer.js\"></script>"
     )
 }
 
-/// Standalone page (local tmux → local viewer): streams live from `/events`.
-pub fn render_page(template: &str, fragment: &str, font_css: &str, config: &Config) -> String {
+/// Render config handed to the browser renderer so it resolves colors and symbol
+/// fonts exactly as the Rust reference would: default fg/bg, the base stack for
+/// stretch-fill glyphs, and the `symbol_map` overrides as `[lo, hi, familyStack]`
+/// (each stack pre-joined like [`cell_font`] builds it). Injected once per page.
+pub fn render_config_json(config: &Config, resolver: &Resolver) -> String {
+    #[derive(Serialize)]
+    struct RenderConfig {
+        #[serde(rename = "defFg")]
+        def_fg: String,
+        #[serde(rename = "defBg")]
+        def_bg: String,
+        #[serde(rename = "fillFont")]
+        fill_font: String,
+        sym: Vec<(u32, u32, String)>,
+    }
+    let stack = font_stack(config);
+    let sym = resolver
+        .entries()
+        .iter()
+        .map(|(r, fam)| {
+            (
+                *r.start(),
+                *r.end(),
+                format!("{},{}", quote_family(fam), stack),
+            )
+        })
+        .collect();
+    let cfg = RenderConfig {
+        def_fg: hex(DEFAULT_FG),
+        def_bg: hex(DEFAULT_BG),
+        fill_font: stack,
+        sym,
+    };
+    serde_json::to_string(&cfg).expect("RenderConfig serializes")
+}
+
+/// Standalone page (local command → local viewer): streams live from `/events`.
+pub fn render_page(
+    template: &str,
+    fragment: &str,
+    font_css: &str,
+    config: &Config,
+    cfg_json: &str,
+) -> String {
     page(
         template,
         &head_css(font_css, config),
         fragment,
-        &sse_script("/events"),
+        &sse_script("/events", cfg_json),
     )
 }
 
@@ -111,46 +171,29 @@ pub fn banner(msg: &str) -> String {
     )
 }
 
-/// Render just the panes (the swappable inner fragment each SSE update replaces).
-pub fn render_fragment(window: &Window, config: &Config, resolver: &Resolver) -> String {
+/// Render the screen (the swappable inner fragment each SSE update replaces): a
+/// `.screen` box of absolutely-sized rows. The browser renderer (`viewer.ts`)
+/// reproduces this exact structure, so the two must stay in lockstep.
+pub fn render_fragment(grid: &Grid, config: &Config, resolver: &Resolver) -> String {
     let mut out = String::new();
     let _ = write!(
         out,
         "<div class=\"screen\" style=\"width:{}ch;height:calc({} * var(--lh));\">",
-        window.width, window.height
+        grid.cols,
+        grid.rows.len()
     );
-    for pane in &window.panes {
-        let g = &pane.geom;
-        let active = if g.active { " active" } else { "" };
-        let _ = write!(
-            out,
-            "<div class=\"pane{active}\" style=\"left:{}ch;top:calc({} * var(--lh));\
-             width:{}ch;height:calc({} * var(--lh));\">",
-            g.left, g.top, g.width, g.height
-        );
-        render_pane_body(&mut out, pane, config, resolver);
-        out.push_str("</div>");
-    }
-    out.push_str("</div>");
-    out
-}
-
-fn render_pane_body(
-    out: &mut String,
-    pane: &crate::model::Pane,
-    config: &Config,
-    resolver: &Resolver,
-) {
-    let cursor = pane.grid.cursor;
-    for (r, row) in pane.grid.rows.iter().enumerate() {
+    let cursor = grid.cursor;
+    for (r, row) in grid.rows.iter().enumerate() {
         let cursor_col = match cursor {
             Some((cr, cc)) if cr as usize == r => Some(cc),
             _ => None,
         };
         out.push_str("<div class=\"row\">");
-        render_row(out, row, cursor_col, config, resolver);
+        render_row(&mut out, row, cursor_col, config, resolver);
         out.push_str("</div>");
     }
+    out.push_str("</div>");
+    out
 }
 
 fn render_row(
@@ -424,33 +467,19 @@ fn palette(i: u8) -> (u8, u8, u8) {
 mod tests {
     use super::*;
     use crate::config::{Config, SymbolMap};
-    use crate::model::{Grid, Pane, PaneGeom};
     use crate::parse::grid_from_capture;
 
-    fn window_from(cap: &str, w: u16, h: u16) -> Window {
+    fn grid_from(cap: &str, w: u16, h: u16) -> Grid {
         let mut grid = grid_from_capture(cap, w, h);
         grid.cursor = None; // these tests check cell styling, not cursor rendering
-        Window {
-            width: w,
-            height: h,
-            panes: vec![Pane {
-                geom: PaneGeom {
-                    left: 0,
-                    top: 0,
-                    width: w,
-                    height: h,
-                    active: true,
-                },
-                grid,
-            }],
-        }
+        grid
     }
 
     #[test]
     fn colors_and_bold_render() {
         let cfg = Config::default();
         let res = Resolver::build(&cfg).unwrap();
-        let html = render_fragment(&window_from("\x1b[1;31mA\x1b[0mB", 4, 1), &cfg, &res);
+        let html = render_fragment(&grid_from("\x1b[1;31mA\x1b[0mB", 4, 1), &cfg, &res);
         assert!(html.contains("font-weight:bold;"), "bold missing: {html}");
         assert!(html.contains("color:#cd0000;"), "red missing: {html}");
         assert!(html.contains(">A</span>"));
@@ -466,7 +495,7 @@ mod tests {
         }];
         let res = Resolver::build(&cfg).unwrap();
         // U+E0A0 (Powerline branch) is an icon-like glyph -> SVG, proportional fit.
-        let html = render_fragment(&window_from("\u{E0A0}", 2, 1), &cfg, &res);
+        let html = render_fragment(&grid_from("\u{E0A0}", 2, 1), &cfg, &res);
         assert!(
             html.contains("font-family=\"'Symbols Nerd Font','Menlo',monospace\""),
             "override font missing: {html}"
@@ -488,7 +517,7 @@ mod tests {
         }];
         let res = Resolver::build(&cfg).unwrap();
         // glyph + "ab", padded to 10 columns.
-        let html = render_fragment(&window_from("\u{E0B0}ab", 10, 1), &cfg, &res);
+        let html = render_fragment(&grid_from("\u{E0B0}ab", 10, 1), &cfg, &res);
         // The glyph is a 1ch box holding a stretch-to-fill SVG (E0B0 is a separator)...
         assert!(
             html.contains("<span class=\"run\" style=\"left:0ch;width:1ch;\"><svg viewBox=\"0 0 14 14\" preserveAspectRatio=\"none\""),
@@ -512,13 +541,13 @@ mod tests {
         // stretch-to-fill SVG path as powerline separators so it reads solid.
         let cfg = Config::default();
         let res = Resolver::build(&cfg).unwrap();
-        let html = render_fragment(&window_from("\u{2502}", 2, 1), &cfg, &res);
+        let html = render_fragment(&grid_from("\u{2502}", 2, 1), &cfg, &res);
         assert!(
             html.contains("preserveAspectRatio=\"none\""),
             "box-drawing divider not stretch-filled: {html}"
         );
         // A legacy-computing sextant (U+1FB00) tiles like a block element too.
-        let sextant = render_fragment(&window_from("\u{1FB00}", 2, 1), &cfg, &res);
+        let sextant = render_fragment(&grid_from("\u{1FB00}", 2, 1), &cfg, &res);
         assert!(
             sextant.contains("preserveAspectRatio=\"none\""),
             "legacy sextant not stretch-filled: {sextant}"
@@ -532,7 +561,7 @@ mod tests {
         // what precedes it. Here `ab│` puts the divider at column 2.
         let cfg = Config::default();
         let res = Resolver::build(&cfg).unwrap();
-        let html = render_fragment(&window_from("ab\u{2502}", 5, 1), &cfg, &res);
+        let html = render_fragment(&grid_from("ab\u{2502}", 5, 1), &cfg, &res);
         assert!(
             html.contains("style=\"left:0ch;width:2ch;"),
             "leading text run not at column 0: {html}"
@@ -563,7 +592,7 @@ mod tests {
         // clipped to a block. It renders in a 1ch box with a base fallback stack.
         let cfg = Config::default();
         let res = Resolver::build(&cfg).unwrap();
-        let html = render_fragment(&window_from("\u{E0B0}", 2, 1), &cfg, &res);
+        let html = render_fragment(&grid_from("\u{E0B0}", 2, 1), &cfg, &res);
         assert!(
             html.contains("preserveAspectRatio=\"none\""),
             "separator not SVG stretch-filled: {html}"
@@ -573,7 +602,7 @@ mod tests {
             "no SVG glyph box: {html}"
         );
         // A plain letter next to it stays plain text (not SVG).
-        let plain = render_fragment(&window_from("a", 2, 1), &cfg, &res);
+        let plain = render_fragment(&grid_from("a", 2, 1), &cfg, &res);
         assert!(
             !plain.contains("<svg"),
             "plain text should not be SVG: {plain}"
@@ -585,14 +614,15 @@ mod tests {
         let tmpl = "<head>{{style}}</head><body>{{screen}}{{script}}</body>";
         // Fragment contains a literal token the user "typed" — it must survive
         // verbatim (screen is filled last and never re-scanned).
-        let html = page(tmpl, "CSS", "hi {{script}} there", "JS");
+        let html = page(tmpl, "CSS", "hi {{script}} there", "<script>JS</script>");
         assert!(html.contains("<style>\nCSS</style>"), "{html}");
         assert!(
             html.contains("<div id=\"screen\">hi {{script}} there</div>"),
             "{html}"
         );
-        assert!(html.contains("<script>\nJS\n</script>"), "{html}");
-        // Exactly one real script block (the typed token wasn't expanded).
+        // The script block is injected raw (it carries its own <script> tags).
+        assert!(html.contains("<script>JS</script>"), "{html}");
+        // The typed {{script}} token in the fragment was NOT expanded into a script.
         assert_eq!(
             html.matches("<script>").count(),
             1,
@@ -627,29 +657,16 @@ mod tests {
     }
 
     #[test]
-    fn absolute_pane_geometry() {
+    fn fragment_sizes_the_screen_box() {
         let cfg = Config::default();
         let res = Resolver::build(&cfg).unwrap();
-        let w = Window {
-            width: 80,
-            height: 24,
-            panes: vec![Pane {
-                geom: PaneGeom {
-                    left: 41,
-                    top: 0,
-                    width: 39,
-                    height: 24,
-                    active: false,
-                },
-                grid: Grid {
-                    cols: 39,
-                    rows: vec![vec![]],
-                    cursor: None,
-                },
-            }],
-        };
-        let html = render_fragment(&w, &cfg, &res);
-        assert!(html.contains("left:41ch;"), "pane offset missing: {html}");
-        assert!(html.contains("width:39ch;"));
+        let html = render_fragment(&grid_from("ab", 5, 1), &cfg, &res);
+        assert!(
+            html.starts_with(
+                "<div class=\"screen\" style=\"width:5ch;height:calc(1 * var(--lh));\">"
+            ),
+            "screen box not sized: {html}"
+        );
+        assert!(html.contains("<div class=\"row\">"), "no row: {html}");
     }
 }
