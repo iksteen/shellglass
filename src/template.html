@@ -68,6 +68,7 @@ footer { max-width:1140px; width:100%; margin:0 auto; padding:24px clamp(16px,5v
 .stage { perspective:1600px; }
 .panel {
   position:relative; max-width:100%; max-height:100%; overflow:auto;
+  scrollbar-width:thin; scrollbar-color:var(--border) transparent;
   padding:26px 30px; border:none; border-radius:26px / 34px;
   background:#040705;
   box-shadow:
@@ -171,34 +172,83 @@ body:has(#crt:not(:checked)) #screen { filter:none; text-shadow:none; }
 </main>
 <footer>Live over SSE — <a href="https://github.com/iksteen/shellglass">shellglass</a>.</footer>
 <script>
-// Shrink-to-fit: scale the terminal down (never up) so it fits the stage between
-// nav and footer. `zoom` affects layout — unlike transform — so the panel tightens
-// around the scaled result. Re-fits when the grid resizes (#screen is fit-content,
-// so a new frame size changes its box) or the viewport does (the stage resizes).
-// Stable: the stage is viewport-driven (flex-basis 0), so zooming #screen can't
-// change the available space we measure against. Runs after <footer> so the first
-// measurement already sees the final page layout.
+// Fit + zoom + pan. The terminal is scaled with CSS `zoom` (it affects layout —
+// unlike transform — so the panel tightens around the result): the base factor
+// shrinks it to fit the stage between nav and footer (never enlarges), and the
+// user factor (pinch / ctrl+wheel, 1..8, anchored at the cursor) magnifies on
+// top. Zoomed-in content overflows *inside* the panel (overflow:auto, capped at
+// the stage via max-width/height:100%), so the tube never grows past nav or
+// footer; panning is native scroll (wheel/trackpad/scrollbars) plus middle-drag —
+// left-drag stays free for text selection. Re-fits when the grid resizes
+// (#screen is fit-content, so a new frame size moves its box) or the viewport
+// does (the stage resizes). Stable: the stage is viewport-driven (flex-basis 0),
+// so zooming #screen can't change the space we measure against. Runs after
+// <footer> so the first measurement already sees the final page layout.
 (() => {
   const scr = document.getElementById('screen');
   const stage = document.querySelector('.stage');
   const panel = document.querySelector('.panel');
+  let fitZ = 1; // shrink-to-fit factor (≤ 1), from the layout
+  let userZ = 1; // user magnification (≥ 1), from pinch / ctrl+wheel
   const pads = (el, a, b) => {
     const cs = getComputedStyle(el);
     return parseFloat(cs[a]) + parseFloat(cs[b]);
   };
+  const apply = () => { scr.style.zoom = fitZ * userZ; };
   const fit = () => {
     const box = scr.firstElementChild;
     if (!box) return;
-    scr.style.zoom = 1; // measure at natural size
+    // Measuring at zoom 1 momentarily shrinks the content, which clamps the
+    // panel's scroll position — capture and restore it around the measurement.
+    const sl = panel.scrollLeft, st = panel.scrollTop;
+    scr.style.zoom = 1;
     const availW = stage.clientWidth - pads(stage, 'paddingLeft', 'paddingRight')
       - pads(panel, 'paddingLeft', 'paddingRight');
     const availH = stage.clientHeight - pads(stage, 'paddingTop', 'paddingBottom')
       - pads(panel, 'paddingTop', 'paddingBottom');
-    scr.style.zoom = Math.min(1, availW / box.offsetWidth, availH / box.offsetHeight);
+    fitZ = Math.min(1, availW / box.offsetWidth, availH / box.offsetHeight);
+    apply();
+    panel.scrollLeft = sl;
+    panel.scrollTop = st;
   };
   const ro = new ResizeObserver(fit);
   ro.observe(stage);
   ro.observe(scr);
+
+  // Zoom: pinch / ctrl+wheel, keeping the point under the cursor fixed. Plain
+  // wheel falls through to native scrolling (that's the pan). Firefox mouse
+  // wheels report line deltas (deltaMode 1) — normalize to ~pixels.
+  panel.addEventListener('wheel', (e) => {
+    if (!e.ctrlKey) return;
+    e.preventDefault(); // keep the browser's own page zoom out of it
+    const dy = e.deltaY * (e.deltaMode === 1 ? 33 : 1);
+    const prev = userZ;
+    userZ = Math.min(8, Math.max(1, userZ * Math.pow(2, -dy / 400)));
+    if (userZ === prev) return;
+    const r = userZ / prev;
+    const rect = panel.getBoundingClientRect();
+    const cx = e.clientX - rect.left, cy = e.clientY - rect.top;
+    apply();
+    panel.scrollLeft = (panel.scrollLeft + cx) * r - cx;
+    panel.scrollTop = (panel.scrollTop + cy) * r - cy;
+  }, { passive: false });
+
+  // Pan: middle-button drag (left button selects text as usual).
+  let drag = null;
+  panel.addEventListener('pointerdown', (e) => {
+    if (e.button !== 1) return;
+    e.preventDefault(); // suppress middle-click autoscroll/paste-position
+    drag = { x: e.clientX, y: e.clientY, l: panel.scrollLeft, t: panel.scrollTop };
+    try { panel.setPointerCapture(e.pointerId); } catch (err) {}
+  });
+  panel.addEventListener('pointermove', (e) => {
+    if (!drag) return;
+    panel.scrollLeft = drag.l - (e.clientX - drag.x);
+    panel.scrollTop = drag.t - (e.clientY - drag.y);
+  });
+  const endDrag = () => { drag = null; };
+  panel.addEventListener('pointerup', endDrag);
+  panel.addEventListener('pointercancel', endDrag);
 })();
 </script>
 {{script}}
