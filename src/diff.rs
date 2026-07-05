@@ -138,11 +138,6 @@ impl Live {
         live
     }
 
-    /// The current full frame, for an initial server-side paint. Lock-free.
-    pub fn current(&self) -> Arc<Frame> {
-        self.state.load().frame.clone()
-    }
-
     /// Publish the next frame (standalone path): encode its delta from the current
     /// frame once, then commit it. No-op if nothing viewers see changed.
     pub fn publish(&self, next: Arc<Frame>) {
@@ -1629,7 +1624,11 @@ mod tests {
         let g = grid(&["hi"]);
         let full = full_message_grid(&g);
         live.publish_wire(&full);
-        assert_eq!(*live.current(), Frame::Screen(g.clone()), "matrix updated");
+        assert_eq!(
+            *live.state.load().frame,
+            Frame::Screen(g.clone()),
+            "matrix updated"
+        );
         let (seq, fwd) = rx.try_recv().expect("full forwarded");
         assert_eq!((seq, &*fwd), (1, full.as_str()), "verbatim bytes, seq 1");
 
@@ -1637,7 +1636,11 @@ mod tests {
         let g2 = grid(&["hX"]);
         let dmsg = diff_message(&g, &g2).unwrap();
         live.publish_wire(&dmsg);
-        assert_eq!(*live.current(), Frame::Screen(g2), "diff applied to matrix");
+        assert_eq!(
+            *live.state.load().frame,
+            Frame::Screen(g2),
+            "diff applied to matrix"
+        );
         let (seq, fwd) = rx.try_recv().expect("diff forwarded");
         assert_eq!((seq, &*fwd), (2, dmsg.as_str()));
 

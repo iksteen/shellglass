@@ -256,7 +256,7 @@ async fn view(State(st): State<HubState>, Path(id): Path<String>) -> Response {
     // fetching fresh HTML (fingerprinted /viewer.js?v=… URL + the version pair).
     (
         [(CACHE_CONTROL, "no-cache")],
-        Html(render::page(template, &s.css, "", &script)),
+        Html(render::page(template, &s.css, &script)),
     )
         .into_response()
 }

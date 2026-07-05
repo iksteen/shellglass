@@ -1,10 +1,10 @@
-//! Grid → HTML. Rows are stacked in the `#screen` box; within a row, adjacent cells
-//! with identical styling (including resolved font) are coalesced into a single
-//! `<span>`, each absolutely positioned at its column.
+//! Page assembly: the viewer template, its `<style>`/`<script>` blocks, the render
+//! config handed to the browser, and the baked renderer/favicon assets. All cell
+//! rendering lives in `viewer/viewer.ts` — the page ships with an empty `#screen`
+//! and the renderer paints it from the full frame that heads every SSE stream.
 
 use crate::config::Config;
 use crate::fonts::{FontFile, Resolver};
-use crate::model::{Color, Grid, StyledCell};
 use serde::Serialize;
 use std::fmt::Write as _;
 
@@ -83,20 +83,17 @@ pub fn head_css(font_css: &str, config: &Config) -> String {
     format!("{font_css}{base_css}")
 }
 
-/// Fill a viewer `template` with the terminal `<style>`, the `#screen` fragment,
-/// and the updater `<script>`. Tokens: `{{style}}`, `{{screen}}`, `{{script}}`.
-/// `{{screen}}` is filled last and its replacement is never re-scanned, so a
-/// literal `{{script}}` the user typed into the terminal can't corrupt the page.
-pub fn page(template: &str, head_css: &str, fragment: &str, script: &str) -> String {
+/// Fill a viewer `template` with the terminal `<style>`, the (empty) `#screen`
+/// div, and the updater `<script>`. Tokens: `{{style}}`, `{{screen}}`,
+/// `{{script}}`. The screen starts empty — the renderer paints it from the full
+/// frame that heads every SSE stream, one round-trip after load.
+pub fn page(template: &str, head_css: &str, script: &str) -> String {
     // `script` already carries its own `<script>` tags (it loads the external
     // renderer), so inject it raw rather than wrapping it.
     template
         .replace("{{style}}", &format!("<style>\n{head_css}</style>"))
         .replace("{{script}}", script)
-        .replace(
-            "{{screen}}",
-            &format!("<div id=\"screen\">{fragment}</div>"),
-        )
+        .replace("{{screen}}", "<div id=\"screen\"></div>")
 }
 
 /// The page's updater block: a tiny inline config the renderer reads (the SSE path
@@ -125,10 +122,9 @@ pub fn sse_script(events_path: &str, cfg_json: &str) -> String {
     )
 }
 
-/// Render config handed to the browser renderer so it resolves colors and symbol
-/// fonts exactly as the Rust reference would: default fg/bg, the base stack for
+/// Render config handed to the browser renderer: default fg/bg, the base stack for
 /// stretch-fill glyphs, and the `symbol_map` overrides as `[lo, hi, familyStack]`
-/// (each stack pre-joined like [`cell_font`] builds it). Injected once per page.
+/// (each stack pre-joined, override family first). Injected once per page.
 pub fn render_config_json(config: &Config, resolver: &Resolver) -> String {
     #[derive(Serialize)]
     struct RenderConfig {
@@ -162,17 +158,10 @@ pub fn render_config_json(config: &Config, resolver: &Resolver) -> String {
 }
 
 /// Standalone page (local command → local viewer): streams live from `/events`.
-pub fn render_page(
-    template: &str,
-    fragment: &str,
-    font_css: &str,
-    config: &Config,
-    cfg_json: &str,
-) -> String {
+pub fn render_page(template: &str, font_css: &str, config: &Config, cfg_json: &str) -> String {
     page(
         template,
         &head_css(font_css, config),
-        fragment,
         &sse_script("/events", cfg_json),
     )
 }
@@ -187,295 +176,6 @@ pub fn banner(msg: &str) -> String {
         "<div style=\"color:#ff6b6b;font-family:monospace;padding:8px;\">\
          shellglass: {esc}</div>"
     )
-}
-
-/// Render the screen (the swappable inner fragment each SSE update replaces): a
-/// `.screen` box of absolutely-sized rows. The browser renderer (`viewer.ts`)
-/// reproduces this exact structure, so the two must stay in lockstep.
-pub fn render_fragment(grid: &Grid, config: &Config, resolver: &Resolver) -> String {
-    let mut out = String::new();
-    let _ = write!(
-        out,
-        "<div class=\"screen\" style=\"width:{}ch;height:calc({} * var(--lh));\">",
-        grid.cols,
-        grid.rows.len()
-    );
-    let cursor = grid.cursor;
-    for (r, row) in grid.rows.iter().enumerate() {
-        let cursor_col = match cursor {
-            Some((cr, cc)) if cr as usize == r => Some(cc),
-            _ => None,
-        };
-        out.push_str("<div class=\"row\">");
-        render_row(&mut out, row, cursor_col, config, resolver);
-        out.push_str("</div>");
-    }
-    out.push_str("</div>");
-    out
-}
-
-fn render_row(
-    out: &mut String,
-    row: &[StyledCell],
-    cursor_col: Option<u16>,
-    config: &Config,
-    resolver: &Resolver,
-) {
-    let mut col: u16 = 0;
-    // Accumulator for a run of plain (base-font) text cells, with the column it
-    // starts at — every run is positioned absolutely at `left:{run_col}ch` so its
-    // x is `round(run_col × ch)`, identical on every row. (Stacking inline-blocks
-    // instead sums each run's independently-rounded `ch` width, so the sub-pixel
-    // error accumulates and a column — e.g. a tmux pane divider — drifts per row.)
-    let mut run_style: Option<String> = None;
-    let mut run_col: u16 = 0;
-    let mut cols: u16 = 0;
-    let mut text = String::new();
-    // A run of the same mergeable fill glyph (same glyph, style, font) emitted as one
-    // stretched span — see `is_mergeable_fill`. Extends across cells; flushed on any
-    // other cell or at row end.
-    let mut fill: Option<FillRun> = None;
-
-    for cell in row {
-        let is_cursor = cursor_col == Some(col);
-        let w = if cell.wide { 2 } else { 1 };
-
-        if let Some(font) = svg_font(cell, resolver, config) {
-            // Symbol cells render as a scaled SVG, never inside a text run.
-            flush_text_run(out, &run_style, run_col, cols, &mut text);
-            run_style = None;
-            cols = 0;
-            let first = cell.text.chars().next().unwrap_or(' ');
-            if is_mergeable_fill(first) {
-                let style = cell_box_style(cell, is_cursor);
-                let same = fill
-                    .as_ref()
-                    .is_some_and(|f| f.text == cell.text && f.style == style && f.font == font);
-                if same {
-                    let f = fill.as_mut().expect("same ⇒ present");
-                    f.width += w;
-                } else {
-                    flush_fill_run(out, fill.take());
-                    let mut glyph = String::new();
-                    escape_into(&mut glyph, &cell.text);
-                    fill = Some(FillRun {
-                        col,
-                        width: w,
-                        text: &cell.text,
-                        glyph,
-                        style,
-                        font,
-                        first,
-                    });
-                }
-            } else {
-                flush_fill_run(out, fill.take());
-                emit_symbol_cell(out, cell, is_cursor, col, w, &font);
-            }
-        } else {
-            flush_fill_run(out, fill.take());
-            let style = cell_box_style(cell, is_cursor);
-            if run_style.as_ref() != Some(&style) {
-                flush_text_run(out, &run_style, run_col, cols, &mut text);
-                run_style = Some(style);
-                cols = 0;
-            }
-            if cols == 0 {
-                run_col = col; // first cell of this run fixes its left edge
-            }
-            let ch = if cell.text.is_empty() {
-                " "
-            } else {
-                &cell.text
-            };
-            escape_into(&mut text, ch);
-            cols += w;
-        }
-        col += w;
-    }
-    flush_text_run(out, &run_style, run_col, cols, &mut text);
-    flush_fill_run(out, fill);
-}
-
-/// A pending run of one mergeable fill glyph (see [`is_mergeable_fill`]).
-struct FillRun<'a> {
-    col: u16,
-    width: u16,
-    text: &'a str, // raw glyph, for run-continuation comparison
-    glyph: String, // escaped, for emission
-    style: String, // precomputed box style
-    font: String,
-    first: char,
-}
-
-fn flush_fill_run(out: &mut String, run: Option<FillRun>) {
-    if let Some(f) = run {
-        emit_symbol_span(out, f.col, f.width, &f.style, &f.font, &f.glyph, f.first);
-    }
-}
-
-/// Emit a run of plain text as one fixed-width `inline-block` box that occupies
-/// exactly `cols` base-font columns.
-fn flush_text_run(
-    out: &mut String,
-    style: &Option<String>,
-    col: u16,
-    cols: u16,
-    text: &mut String,
-) {
-    if text.is_empty() {
-        return;
-    }
-    let s = style.as_deref().unwrap_or("");
-    let _ = write!(
-        out,
-        "<span class=\"run\" style=\"left:{col}ch;width:{cols}ch;{s}\">{text}</span>"
-    );
-    text.clear();
-}
-
-/// Emit a symbol cell: an SVG-scaled glyph inside a fixed-width box. Nerd-Font
-/// glyphs are designed for a ~1em-square cell, far wider than our base font's
-/// `ch`; rendering them natively clips/misaligns them. Scaling via SVG matches
-/// what kitty does: powerline/box separators **stretch** to fill the cell (so
-/// they tile seamlessly), other icons **fit** proportionally and centered.
-fn emit_symbol_cell(
-    out: &mut String,
-    cell: &StyledCell,
-    is_cursor: bool,
-    col: u16,
-    w: u16,
-    font: &str,
-) {
-    let box_style = cell_box_style(cell, is_cursor);
-    let first = cell.text.chars().next().unwrap_or(' ');
-    let mut glyph = String::new();
-    escape_into(&mut glyph, &cell.text);
-    emit_symbol_span(out, col, w, &box_style, font, &glyph, first);
-}
-
-/// Emit one SVG symbol span (already-escaped `glyph`, precomputed `box_style`)
-/// covering `w` columns at `col`. Shared by single symbol cells and merged fill
-/// runs — for a merged run, `w` is the run's total width and the one glyph stretches
-/// seamlessly across it (no per-cell box boundaries to gap at fractional zoom).
-fn emit_symbol_span(
-    out: &mut String,
-    col: u16,
-    w: u16,
-    box_style: &str,
-    font: &str,
-    glyph: &str,
-    first: char,
-) {
-    let fill = is_fill_glyph(first);
-    let par = if fill { "none" } else { "xMidYMid meet" };
-    // A fill glyph must span the whole box so lines tile, but a monospace glyph's
-    // advance is only ~0.6em, so a bare `none`-stretch of the 14-wide viewBox leaves
-    // ~40% blank — a horizontal divider renders as dashes. Force the glyph to fill
-    // the viewBox width with textLength, then `none` maps it onto the full box
-    // (width:{w}ch × --lh). Fit glyphs (icons) keep their aspect.
-    let stretch = if fill {
-        " textLength=\"14\" lengthAdjust=\"spacingAndGlyphs\""
-    } else {
-        ""
-    };
-    let _ = write!(
-        out,
-        "<span class=\"run\" style=\"left:{col}ch;width:{w}ch;{box_style}\">\
-         <svg viewBox=\"0 0 14 14\" preserveAspectRatio=\"{par}\" \
-         style=\"display:block;width:100%;height:100%\">\
-         <text x=\"0\" y=\"12\" font-family=\"{font}\" font-size=\"14\" \
-         fill=\"currentColor\"{stretch}>{glyph}</text></svg></span>"
-    );
-}
-
-/// Powerline separators, box-drawing lines, and block elements must fill the whole
-/// cell so adjacent segments tile without gaps — the page's `line-height` > 1 gives
-/// a plain-text `│` vertical leading between rows, so a stack of them (e.g. a tmux
-/// pane divider) renders dashed. Everything else scales proportionally.
-fn is_fill_glyph(c: char) -> bool {
-    matches!(c,
-        '\u{E0B0}'..='\u{E0D4}'     // powerline separators
-        | '\u{2500}'..='\u{259F}'   // box drawing + block elements
-        | '\u{1FB00}'..='\u{1FBAF}' // legacy computing: sextants, eighth-blocks, wedges
-    )
-    // ponytail: braille (U+2800–28FF) is deliberately out — a dot matrix that must
-    // scale proportionally, not stretch. Octants (U+1CD00+) omitted until a font/tool
-    // in the wild needs them; base fonts rarely carry the glyphs, so SVG'ing them
-    // would just stretch tofu.
-}
-
-/// A fill glyph whose ink is uniform along x, so a run of it can render as ONE
-/// stretched span instead of N per-cell boxes — killing the sub-pixel seams that
-/// otherwise dash a long horizontal divider at fractional zoom. Restricted to solid
-/// horizontal strips: stretching a shade (`░▒▓`), a dashed line, or a left/right
-/// partial block across a run would smear its pattern, so those stay per-cell.
-fn is_mergeable_fill(c: char) -> bool {
-    matches!(
-        c,
-        '\u{2500}' | '\u{2501}' | '\u{2550}'  // ─ ━ ═ horizontal lines
-        | '\u{2588}'                          // █ full block
-        | '\u{2581}'
-            ..='\u{2587}'             // ▁▂▃▄▅▆▇ lower strips
-        | '\u{2594}' // ▔ upper strip
-    )
-}
-
-/// Font stack for rendering `cell` as a scaled SVG glyph, or `None` for plain text.
-/// A `symbol_map` override wins. Otherwise *fill* glyphs still need SVG cell-locking
-/// even with no `symbol_map` — powerline separators are wider than a cell and clip;
-/// box-drawing lines gap vertically under `line-height` > 1 — so route them through
-/// the base fallback stack (the browser picks whichever family has the glyph).
-fn svg_font(cell: &StyledCell, resolver: &Resolver, config: &Config) -> Option<String> {
-    if let Some(font) = cell_font(cell, resolver, config) {
-        return Some(font);
-    }
-    let first = cell.text.chars().next()?;
-    is_fill_glyph(first).then(|| font_stack(config))
-}
-
-/// Resolved override font stack for a cell, or `None` to use the base font.
-fn cell_font(cell: &StyledCell, resolver: &Resolver, config: &Config) -> Option<String> {
-    let first = cell.text.chars().next()?;
-    let fam = resolver.font_for(first)?;
-    Some(format!("{},{}", quote_family(fam), font_stack(config)))
-}
-
-/// Box CSS for a cell (colors, weight, style, decoration) — no font-family; the
-/// override font lives on the inner span so it never changes the box's `ch`.
-fn cell_box_style(cell: &StyledCell, is_cursor: bool) -> String {
-    let mut fg = resolve_rgb(cell.fg);
-    let mut bg = resolve_rgb(cell.bg);
-
-    // Reverse video swaps fg/bg, materializing defaults.
-    if cell.inverse ^ is_cursor {
-        let f = fg.unwrap_or(DEFAULT_FG);
-        let b = bg.unwrap_or(DEFAULT_BG);
-        fg = Some(b);
-        bg = Some(f);
-    }
-    if cell.dim {
-        let f = fg.unwrap_or(DEFAULT_FG);
-        fg = Some((f.0 / 10 * 6, f.1 / 10 * 6, f.2 / 10 * 6));
-    }
-
-    let mut s = String::new();
-    if let Some(c) = fg {
-        let _ = write!(s, "color:{};", hex(c));
-    }
-    if let Some(c) = bg {
-        let _ = write!(s, "background:{};", hex(c));
-    }
-    if cell.bold {
-        s.push_str("font-weight:bold;");
-    }
-    if cell.italic {
-        s.push_str("font-style:italic;");
-    }
-    if cell.underline {
-        s.push_str("text-decoration:underline;");
-    }
-    s
 }
 
 /// The base font stack: the configured families in order, with a `monospace`
@@ -493,14 +193,6 @@ fn font_stack(config: &Config) -> String {
     fams.join(",")
 }
 
-fn resolve_rgb(c: Color) -> Option<(u8, u8, u8)> {
-    match c {
-        Color::Default => None,
-        Color::Idx(i) => Some(palette(i)),
-        Color::Rgb(r, g, b) => Some((r, g, b)),
-    }
-}
-
 fn hex((r, g, b): (u8, u8, u8)) -> String {
     format!("#{r:02x}{g:02x}{b:02x}")
 }
@@ -515,216 +207,13 @@ fn quote_family(name: &str) -> String {
     }
 }
 
-fn escape_into(out: &mut String, s: &str) {
-    for ch in s.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            _ => out.push(ch),
-        }
-    }
-}
-
-/// xterm 256-color palette.
-fn palette(i: u8) -> (u8, u8, u8) {
-    const BASE16: [(u8, u8, u8); 16] = [
-        (0x00, 0x00, 0x00),
-        (0xcd, 0x00, 0x00),
-        (0x00, 0xcd, 0x00),
-        (0xcd, 0xcd, 0x00),
-        (0x00, 0x00, 0xee),
-        (0xcd, 0x00, 0xcd),
-        (0x00, 0xcd, 0xcd),
-        (0xe5, 0xe5, 0xe5),
-        (0x7f, 0x7f, 0x7f),
-        (0xff, 0x00, 0x00),
-        (0x00, 0xff, 0x00),
-        (0xff, 0xff, 0x00),
-        (0x5c, 0x5c, 0xff),
-        (0xff, 0x00, 0xff),
-        (0x00, 0xff, 0xff),
-        (0xff, 0xff, 0xff),
-    ];
-    match i {
-        0..=15 => BASE16[i as usize],
-        16..=231 => {
-            let n = i - 16;
-            let levels = [0u8, 95, 135, 175, 215, 255];
-            let r = levels[(n / 36) as usize];
-            let g = levels[((n / 6) % 6) as usize];
-            let b = levels[(n % 6) as usize];
-            (r, g, b)
-        }
-        232..=255 => {
-            let v = 8 + 10 * (i - 232);
-            (v, v, v)
-        }
-    }
-}
-
 #[cfg(test)]
 // Tests build a Config then tweak a field or two — the mutate-after-default form
 // reads better here than struct-update with ..Default::default().
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
-    use crate::config::{Config, SymbolMap};
-    use crate::parse::grid_from_capture;
-
-    fn grid_from(cap: &str, w: u16, h: u16) -> Grid {
-        let mut grid = grid_from_capture(cap, w, h);
-        grid.cursor = None; // these tests check cell styling, not cursor rendering
-        grid
-    }
-
-    #[test]
-    fn colors_and_bold_render() {
-        let cfg = Config::default();
-        let res = Resolver::build(&cfg).unwrap();
-        let html = render_fragment(&grid_from("\x1b[1;31mA\x1b[0mB", 4, 1), &cfg, &res);
-        assert!(html.contains("font-weight:bold;"), "bold missing: {html}");
-        assert!(html.contains("color:#cd0000;"), "red missing: {html}");
-        assert!(html.contains(">A</span>"));
-    }
-
-    #[test]
-    fn symbol_map_overrides_font() {
-        let mut cfg = Config::default();
-        cfg.default_font = vec!["Menlo".into()];
-        cfg.symbol_map = vec![SymbolMap {
-            ranges: vec!["U+E0A0-U+E0D4".into()],
-            font: "Symbols Nerd Font".into(),
-        }];
-        let res = Resolver::build(&cfg).unwrap();
-        // U+E0A0 (Powerline branch) is an icon-like glyph -> SVG, proportional fit.
-        let html = render_fragment(&grid_from("\u{E0A0}", 2, 1), &cfg, &res);
-        assert!(
-            html.contains("font-family=\"'Symbols Nerd Font','Menlo',monospace\""),
-            "override font missing: {html}"
-        );
-        assert!(
-            html.contains("preserveAspectRatio=\"xMidYMid meet\""),
-            "icon glyph should fit proportionally: {html}"
-        );
-        // A fit glyph keeps its aspect — it must NOT be stretched to the cell width.
-        assert!(
-            !html.contains("textLength"),
-            "icon glyph should not be width-stretched: {html}"
-        );
-    }
-
-    #[test]
-    fn glyph_locked_to_one_cell() {
-        // A powerline glyph must occupy exactly a 1ch box so the rest of the
-        // line keeps its columns (this is what fixes right-aligned segments).
-        let mut cfg = Config::default();
-        cfg.symbol_map = vec![SymbolMap {
-            ranges: vec!["U+E0B0".into()],
-            font: "Symbols Nerd Font Mono".into(),
-        }];
-        let res = Resolver::build(&cfg).unwrap();
-        // glyph + "ab", padded to 10 columns.
-        let html = render_fragment(&grid_from("\u{E0B0}ab", 10, 1), &cfg, &res);
-        // The glyph is a 1ch box holding a stretch-to-fill SVG (E0B0 is a separator)...
-        assert!(
-            html.contains("<span class=\"run\" style=\"left:0ch;width:1ch;\"><svg viewBox=\"0 0 14 14\" preserveAspectRatio=\"none\""),
-            "separator glyph not stretch-filled in a 1ch box: {html}"
-        );
-        // ...and the run widths across the row sum to exactly the 10 columns, so
-        // the glyph's real advance can't shift anything after it.
-        let row = html.split("<div class=\"row\">").nth(1).unwrap();
-        let sum: u16 = row
-            .split("width:")
-            .skip(1)
-            .filter_map(|s| s.split("ch").next()?.parse::<u16>().ok())
-            .sum();
-        assert_eq!(sum, 10, "run widths don't tile the row: {html}");
-    }
-
-    #[test]
-    fn box_drawing_divider_stretch_fills() {
-        // A tmux pane divider is a column of `│` (U+2502). Rendered as plain text
-        // it gaps vertically under line-height > 1; it must go through the same
-        // stretch-to-fill SVG path as powerline separators so it reads solid.
-        let cfg = Config::default();
-        let res = Resolver::build(&cfg).unwrap();
-        let html = render_fragment(&grid_from("\u{2502}", 2, 1), &cfg, &res);
-        assert!(
-            html.contains("preserveAspectRatio=\"none\""),
-            "box-drawing divider not stretch-filled: {html}"
-        );
-        // ...and the glyph is forced to the full viewBox width, else a monospace
-        // advance (~0.6em) under-fills and horizontal lines render as dashes.
-        assert!(
-            html.contains(
-                "fill=\"currentColor\" textLength=\"14\" lengthAdjust=\"spacingAndGlyphs\">"
-            ),
-            "fill glyph not stretched to the full cell width: {html}"
-        );
-        // A legacy-computing sextant (U+1FB00) tiles like a block element too.
-        let sextant = render_fragment(&grid_from("\u{1FB00}", 2, 1), &cfg, &res);
-        assert!(
-            sextant.contains("preserveAspectRatio=\"none\""),
-            "legacy sextant not stretch-filled: {sextant}"
-        );
-    }
-
-    #[test]
-    fn horizontal_divider_run_merges_into_one_span() {
-        // A run of the same solid horizontal line renders as ONE stretched span, not
-        // five — so there are no per-cell box seams to dash the line at fractional
-        // zoom. The single span spans the whole run width.
-        let cfg = Config::default();
-        let res = Resolver::build(&cfg).unwrap();
-        let html = render_fragment(
-            &grid_from("\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}", 5, 1),
-            &cfg,
-            &res,
-        );
-        assert_eq!(
-            html.matches("<svg ").count(),
-            1,
-            "divider run not merged: {html}"
-        );
-        assert!(
-            html.contains("style=\"left:0ch;width:5ch;"),
-            "merged divider doesn't span the whole run: {html}"
-        );
-        // Shades must NOT merge — stretching one across the run would smear the
-        // pattern — so a run of `░` stays one box per cell.
-        let shade = render_fragment(&grid_from("\u{2591}\u{2591}\u{2591}", 3, 1), &cfg, &res);
-        assert_eq!(
-            shade.matches("<svg ").count(),
-            3,
-            "shade wrongly merged: {shade}"
-        );
-        // Different adjacent glyphs don't merge: `┼` between two `─` breaks the run.
-        let mixed = render_fragment(&grid_from("\u{2500}\u{253C}\u{2500}", 3, 1), &cfg, &res);
-        assert_eq!(
-            mixed.matches("<svg ").count(),
-            3,
-            "distinct glyphs merged: {mixed}"
-        );
-    }
-
-    #[test]
-    fn runs_are_positioned_at_their_column() {
-        // Each run's `left` is its absolute column, not its flow position — so a
-        // column (e.g. a divider) lands at the same x on every row regardless of
-        // what precedes it. Here `ab│` puts the divider at column 2.
-        let cfg = Config::default();
-        let res = Resolver::build(&cfg).unwrap();
-        let html = render_fragment(&grid_from("ab\u{2502}", 5, 1), &cfg, &res);
-        assert!(
-            html.contains("style=\"left:0ch;width:2ch;"),
-            "leading text run not at column 0: {html}"
-        );
-        assert!(
-            html.contains("style=\"left:2ch;width:1ch;"),
-            "divider not positioned at its column: {html}"
-        );
-    }
+    use crate::config::Config;
 
     #[test]
     fn font_list_becomes_a_css_fallback_stack() {
@@ -740,48 +229,14 @@ mod tests {
     }
 
     #[test]
-    fn powerline_separator_svg_scaled_without_symbol_map() {
-        // With no symbol_map (the default fallback setup), a fill separator must
-        // still go through the stretch-to-fill SVG path — otherwise its glyph is
-        // clipped to a block. It renders in a 1ch box with a base fallback stack.
-        let cfg = Config::default();
-        let res = Resolver::build(&cfg).unwrap();
-        let html = render_fragment(&grid_from("\u{E0B0}", 2, 1), &cfg, &res);
-        assert!(
-            html.contains("preserveAspectRatio=\"none\""),
-            "separator not SVG stretch-filled: {html}"
-        );
-        assert!(
-            html.contains("<svg viewBox=\"0 0 14 14\""),
-            "no SVG glyph box: {html}"
-        );
-        // A plain letter next to it stays plain text (not SVG).
-        let plain = render_fragment(&grid_from("a", 2, 1), &cfg, &res);
-        assert!(
-            !plain.contains("<svg"),
-            "plain text should not be SVG: {plain}"
-        );
-    }
-
-    #[test]
     fn page_fills_template_tokens() {
         let tmpl = "<head>{{style}}</head><body>{{screen}}{{script}}</body>";
-        // Fragment contains a literal token the user "typed" — it must survive
-        // verbatim (screen is filled last and never re-scanned).
-        let html = page(tmpl, "CSS", "hi {{script}} there", "<script>JS</script>");
+        let html = page(tmpl, "CSS", "<script>JS</script>");
         assert!(html.contains("<style>\nCSS</style>"), "{html}");
-        assert!(
-            html.contains("<div id=\"screen\">hi {{script}} there</div>"),
-            "{html}"
-        );
+        // The screen ships empty — the renderer paints it from the first SSE full.
+        assert!(html.contains("<div id=\"screen\"></div>"), "{html}");
         // The script block is injected raw (it carries its own <script> tags).
         assert!(html.contains("<script>JS</script>"), "{html}");
-        // The typed {{script}} token in the fragment was NOT expanded into a script.
-        assert_eq!(
-            html.matches("<script>").count(),
-            1,
-            "typed token got expanded: {html}"
-        );
     }
 
     #[test]
@@ -820,30 +275,5 @@ mod tests {
             css.contains("src:url(\"/s/abc/fonts/0\") format('truetype')"),
             "{css}"
         );
-    }
-
-    #[test]
-    fn dim_matches_the_shared_floor_formula() {
-        // Pinned in both suites (see viewer.test.ts) so the Rust and JS renderers
-        // can't drift on the integer math: f/10*6 floors. 0xd0=208 → 120 = 0x78.
-        let mut c = StyledCell::default();
-        c.dim = true;
-        assert_eq!(cell_box_style(&c, false), "color:#787878;");
-        c.fg = Color::Idx(9); // bright red 255 → 25*6 = 150 = 0x96
-        assert_eq!(cell_box_style(&c, false), "color:#960000;");
-    }
-
-    #[test]
-    fn fragment_sizes_the_screen_box() {
-        let cfg = Config::default();
-        let res = Resolver::build(&cfg).unwrap();
-        let html = render_fragment(&grid_from("ab", 5, 1), &cfg, &res);
-        assert!(
-            html.starts_with(
-                "<div class=\"screen\" style=\"width:5ch;height:calc(1 * var(--lh));\">"
-            ),
-            "screen box not sized: {html}"
-        );
-        assert!(html.contains("<div class=\"row\">"), "no row: {html}");
     }
 }

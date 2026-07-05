@@ -5,7 +5,6 @@
 
 use crate::config::Config;
 use crate::fonts::{CACHE_CONTROL_FONT, FontFile};
-use crate::model::Frame;
 use crate::render;
 use crate::{diff, fonts};
 use axum::Router;
@@ -83,12 +82,8 @@ async fn favicon() -> Response {
 }
 
 async fn index(State(state): State<AppState>) -> Response {
-    // Initial paint from the current frame, so the page isn't blank before the first
-    // SSE message; the renderer takes over (and rebuilds) as soon as it connects.
-    let fragment = match &*state.live.current() {
-        Frame::Screen(g) => render::render_fragment(g, &state.config, &state.resolver),
-        Frame::Banner(html) => html.clone(),
-    };
+    // The screen starts empty; the renderer paints it from the full frame that
+    // heads the SSE stream, one round-trip after load (same as hub-served pages).
     let cfg = render::render_config_json(&state.config, &state.resolver);
     // no-cache: the auto-reload path depends on a reload fetching fresh HTML
     // (it carries the fingerprinted /viewer.js?v=… URL and the version pair).
@@ -96,7 +91,6 @@ async fn index(State(state): State<AppState>) -> Response {
         [(CACHE_CONTROL, "no-cache")],
         Html(render::render_page(
             &state.template,
-            &fragment,
             &state.font_css,
             &state.config,
             &cfg,

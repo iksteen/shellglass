@@ -42,15 +42,6 @@ impl Resolver {
     pub fn entries(&self) -> &[(RangeInclusive<u32>, String)] {
         &self.entries
     }
-
-    /// Family name overriding the default for `ch`, if any matches.
-    pub fn font_for(&self, ch: char) -> Option<&str> {
-        let cp = ch as u32;
-        self.entries
-            .iter()
-            .find(|(r, _)| r.contains(&cp))
-            .map(|(_, f)| f.as_str())
-    }
 }
 
 /// CSS generic families that always resolve without a source.

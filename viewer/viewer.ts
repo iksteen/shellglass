@@ -1,10 +1,11 @@
-// shellglass browser renderer.
+// shellglass browser renderer — THE renderer; nothing is painted server-side.
 //
-// Receives the compact cell-diff stream over SSE and renders it to HTML, mirroring
-// the Rust reference (`src/render.rs`) cell-for-cell: run coalescing with absolute
-// per-run positioning, SVG-scaled symbol glyphs, the xterm-256 palette, and
-// reverse/dim/bold/italic/underline styling. It keeps the full cell grid in memory
-// so a rectangle diff only needs to re-render the affected rows.
+// Receives the compact cell-diff stream over SSE and renders it to HTML: run
+// coalescing with absolute per-run positioning, SVG-scaled symbol glyphs, the
+// xterm-256 palette, and reverse/dim/bold/italic/underline styling. It keeps the
+// full cell grid in memory so a line diff only re-renders the affected rows. The
+// page arrives with an empty #screen and the first SSE event after the version
+// hello is always a full frame, so the initial paint lands one round-trip in.
 //
 // Compiled to viewer.js (see build.rs) and served at /viewer.js; the page injects
 // `window.SHELLGLASS = { events, cfg }` before loading this module.
