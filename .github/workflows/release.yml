@@ -11,8 +11,20 @@ permissions:
   contents: write
 
 jobs:
+  # Create the release ONCE before the matrix fans out — concurrent matrix jobs
+  # racing to create the same release hit "already_exists" and exhaust their
+  # retries (bit v0.8.1). Pre-created, uploads always take the exists→attach
+  # path. `|| true`: the release already existing (a rerun) is fine.
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag || true
+        env:
+          GH_TOKEN: ${{ github.token }}
+
   build:
     name: ${{ matrix.target }}
+    needs: create-release
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
