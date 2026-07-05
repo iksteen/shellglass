@@ -62,3 +62,4 @@ Wire framing for the streaming push: `frame_encode`/`frame_drain` (`[u32 BE leng
 - Deliberate simplifications are marked with `ponytail:` comments naming the ceiling and upgrade path — respect them; don't "fix" a documented shortcut without reason.
 - Non-SSE responses are compressed per-route; the SSE stream is never compressed (buffering would defeat realtime push).
 - Errors from the input backend surface as an in-page `render::banner`, not a failed HTTP request.
+- Shelved explorations are kept on `exp/<name>` branches pushed to origin (not deleted), so the code and the findings stay retrievable for future reference. Existing ones: `exp/procedural-glyph-geometry` — kitty-style procedural SVG geometry for box-drawing/block glyphs; shelved because the Nerd Font the default config auto-exports hints straight lines better than stretched-SVG rects can on a fractional device-pixel grid (see the branch's commit for the full reasoning).
