@@ -9,6 +9,7 @@ import {
   isFillGlyph,
   isCanvasGlyph,
   glyphOps,
+  sextantMask,
   renderRow,
   patchCells,
   decodeBlock,
@@ -113,23 +114,38 @@ test("wide cells advance two columns", () => {
   assert.match(split, /left:2ch;width:1ch;font-weight:bold;">a</);
 });
 
-test("all box-drawing + block glyphs route to the canvas as transparent text", () => {
-  // The whole U+2500–259F range draws on the overlay canvas; the DOM keeps the real
-  // glyph as transparent text (no SVG) so it stays selectable/copyable.
-  for (let cp = 0x2500; cp <= 0x259f; cp++) {
-    assert.ok(isCanvasGlyph(cp), `U+${cp.toString(16)} should be canvas-routed`);
+test("box/block/legacy/powerline glyphs route to the canvas as transparent text", () => {
+  // These ranges draw on the overlay canvas; the DOM keeps the real glyph as
+  // transparent text (no SVG) so it stays selectable/copyable.
+  const ranges = [[0x2500, 0x259f], [0x1fb00, 0x1fb3b], [0x1fb70, 0x1fb7b], [0xe0b0, 0xe0b3]];
+  for (const [lo, hi] of ranges) {
+    for (let cp = lo; cp <= hi; cp++) {
+      assert.ok(isCanvasGlyph(cp), `U+${cp.toString(16)} should be canvas-routed`);
+    }
   }
-  for (const g of ["│", "┼", "═", "╭", "░", "█", "▚"]) {
+  for (const cp of [0x2502, 0x253c, 0x2550, 0x256d, 0x2591, 0x2588, 0x259a, 0x1fb00, 0x1fb70, 0xe0b0]) {
+    const g = String.fromCodePoint(cp);
     const html = renderRow([{ t: g }], -1);
-    assert.doesNotMatch(html, /<svg/, `${g} emitted SVG`);
-    assert.match(html, new RegExp(`color:transparent">${g}</span>`), `${g} not transparent`);
+    assert.doesNotMatch(html, /<svg/, `U+${cp.toString(16)} emitted SVG`);
+    assert.match(html, new RegExp(`color:transparent">${g}</span>`), `U+${cp.toString(16)} not transparent`);
   }
 });
 
-test("non-canvas fill glyphs (powerline/legacy) still take the SVG path", () => {
-  // Only 2500–259F moved to the canvas; powerline separators and legacy-computing
-  // glyphs are outside it and keep the stretched-SVG font path.
-  for (const cp of [0xe0b0, 0x1fb00]) {
+test("isCanvasGlyph and glyphOps stay in lockstep (no invisible routing)", () => {
+  // A codepoint routed to the canvas but yielding no ops would paint nothing under its
+  // transparent DOM text. Sweep the neighbourhoods and assert the two agree.
+  for (let cp = 0x2500; cp <= 0x1fbff; cp++) {
+    if (cp === 0x25a0) cp = 0xe0a0; // skip the gap between box-drawing and powerline
+    if (cp === 0xe100) cp = 0x1fb00; // …and between powerline and legacy-computing
+    const has = glyphOps(cp, 0, 0, 10, 20, 1).length > 0;
+    assert.equal(has, isCanvasGlyph(cp), `U+${cp.toString(16)}: ops=${has} canvas=${isCanvasGlyph(cp)}`);
+  }
+});
+
+test("non-canvas fill glyphs (wedges/flames) still take the SVG path", () => {
+  // The seam-motivated subset moved to the canvas; the long tail (smooth-mosaic wedges,
+  // rounded/flame separators) stays on the stretched-SVG font path.
+  for (const cp of [0xe0b8, 0x1fb3c, 0x1fb8c]) {
     assert.ok(!isCanvasGlyph(cp));
     assert.ok(isFillGlyph(cp));
     assert.match(renderRow([{ t: String.fromCodePoint(cp) }], -1), /<svg /);
@@ -193,6 +209,33 @@ test("glyphOps emits pure device-pixel ops for the box/block range", () => {
   }
   // Higher DPR scales line thickness: light=2 doubles the ─ rail height.
   assert.equal((glyphOps(0x2500, 0, 0, 10, 20, 2)[0] as { h: number }).h, 2);
+});
+
+test("glyphOps emits legacy-computing and powerline geometry", () => {
+  // Cell 0,0..16,24 so halves/thirds/eighths land on integers.
+  const ops = (cp: number) => glyphOps(cp, 0, 0, 16, 24, 1);
+
+  // Sextant U+1FB00 = top-left cell only (mask 1): one 2×3-grid rect.
+  assert.deepEqual(ops(0x1fb00), [{ t: "rect", x: 0, y: 0, w: 8, h: 8 }]);
+  // U+1FB3B = every sextant but the top-left (mask 62): five rects.
+  assert.equal(ops(0x1fb3b).length, 5);
+  // The mask recovery skips the two half-column glyphs (21 ▌, 42 ▐).
+  assert.equal(sextantMask(0x1fb00), 1);
+  assert.equal(sextantMask(0x1fb3b), 62);
+
+  // Vertical one-eighth bar U+1FB70 (column 2): x in [2,4], full height.
+  assert.deepEqual(ops(0x1fb70), [{ t: "rect", x: 2, y: 0, w: 2, h: 24 }]);
+  // Horizontal one-eighth bar U+1FB76 (row 2): y in [3,6], full width.
+  assert.deepEqual(ops(0x1fb76), [{ t: "rect", x: 0, y: 3, w: 16, h: 3 }]);
+
+  // Powerline E0B0 ►: one solid triangle, base on the left, apex mid-right.
+  assert.deepEqual(ops(0xe0b0), [{ t: "poly", pts: [[0, 0], [16, 12], [0, 24]] }]);
+  // E0B2 ◄: mirror — base on the right, apex mid-left.
+  assert.deepEqual(ops(0xe0b2), [{ t: "poly", pts: [[16, 0], [0, 12], [16, 24]] }]);
+  // E0B1 (hollow): two stroked edges, no fill.
+  const hollow = ops(0xe0b1);
+  assert.equal(hollow.length, 2);
+  assert.ok(hollow.every((o) => o.t === "line"));
 });
 
 test("patchCells writes line patches and reports dirty rows", () => {

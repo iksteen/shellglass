@@ -149,7 +149,10 @@ function boxArms(cp) {
     return u || r || d || l ? [u, r, d, l] : null;
 }
 export function isCanvasGlyph(cp) {
-    return cp >= 0x2500 && cp <= 0x259f;
+    return ((cp >= 0x2500 && cp <= 0x259f) ||
+        (cp >= 0x1fb00 && cp <= 0x1fb3b) ||
+        (cp >= 0x1fb70 && cp <= 0x1fb7b) ||
+        (cp >= 0xe0b0 && cp <= 0xe0b3));
 }
 function cellFg(cell, isCursor) {
     let fg = resolveRgb(cell.f) ?? parseHex(cfg.defFg);
@@ -203,6 +206,12 @@ function cellRect(r, c) {
     ];
 }
 const rectOp = (x, y, w, h, alpha) => alpha === undefined ? { t: "rect", x, y, w, h } : { t: "rect", x, y, w, h, alpha };
+function fracRect(x0, y0, x1, y1, u0, v0, u1, v1, alpha) {
+    const W = x1 - x0, H = y1 - y0;
+    const a = Math.round(x0 + u0 * W), b = Math.round(x0 + u1 * W);
+    const c = Math.round(y0 + v0 * H), d = Math.round(y0 + v1 * H);
+    return rectOp(a, c, b - a, d - c, alpha);
+}
 function lw(weight, light) {
     return weight === 2 ? 2 * light : light;
 }
@@ -355,6 +364,47 @@ function blockOps(x0, y0, x1, y1, cp) {
         ops.push(R(0.5, 0.5, 1, 1));
     return ops;
 }
+export function sextantMask(cp) {
+    let m = cp - 0x1fb00 + 1;
+    if (m >= 21)
+        m += 1;
+    if (m >= 42)
+        m += 1;
+    return m;
+}
+function sextantOps(x0, y0, x1, y1, cp) {
+    const mask = sextantMask(cp);
+    const ops = [];
+    for (let i = 0; i < 6; i++) {
+        if (!(mask & (1 << i)))
+            continue;
+        const cx = i % 2, cy = (i / 2) | 0;
+        ops.push(fracRect(x0, y0, x1, y1, cx / 2, cy / 3, (cx + 1) / 2, (cy + 1) / 3));
+    }
+    return ops;
+}
+function eighthBarOps(x0, y0, x1, y1, cp) {
+    if (cp <= 0x1fb75) {
+        const n = cp - 0x1fb70 + 2;
+        return [fracRect(x0, y0, x1, y1, (n - 1) / 8, 0, n / 8, 1)];
+    }
+    const n = cp - 0x1fb76 + 2;
+    return [fracRect(x0, y0, x1, y1, 0, (n - 1) / 8, 1, n / 8)];
+}
+function powerlineOps(x0, y0, x1, y1, cp, light) {
+    const midY = Math.round((y0 + y1) / 2);
+    const right = cp === 0xe0b0 || cp === 0xe0b1;
+    const ax = right ? x1 : x0;
+    const bx = right ? x0 : x1;
+    if (cp === 0xe0b0 || cp === 0xe0b2) {
+        return [{ t: "poly", pts: [[bx, y0], [ax, midY], [bx, y1]] }];
+    }
+    const t = lw(1, light);
+    return [
+        { t: "line", x0: bx, y0, x1: ax, y1: midY, lw: t },
+        { t: "line", x0: ax, y0: midY, x1: bx, y1, lw: t },
+    ];
+}
 export function glyphOps(cp, x0, y0, x1, y1, light) {
     const arms = boxArms(cp);
     if (arms)
@@ -369,6 +419,12 @@ export function glyphOps(cp, x0, y0, x1, y1, light) {
         return diagOps(x0, y0, x1, y1, cp, light);
     if (cp >= 0x2580 && cp <= 0x259f)
         return blockOps(x0, y0, x1, y1, cp);
+    if (cp >= 0x1fb00 && cp <= 0x1fb3b)
+        return sextantOps(x0, y0, x1, y1, cp);
+    if (cp >= 0x1fb70 && cp <= 0x1fb7b)
+        return eighthBarOps(x0, y0, x1, y1, cp);
+    if (cp >= 0xe0b0 && cp <= 0xe0b3)
+        return powerlineOps(x0, y0, x1, y1, cp, light);
     return [];
 }
 function paintOps(g, color, ops) {
@@ -391,6 +447,14 @@ function paintOps(g, color, ops) {
             g.beginPath();
             g.ellipse(op.cx, op.cy, op.rx, op.ry, 0, op.a0, op.a1);
             g.stroke();
+        }
+        else if (op.t === "poly") {
+            g.beginPath();
+            g.moveTo(op.pts[0][0], op.pts[0][1]);
+            for (let i = 1; i < op.pts.length; i++)
+                g.lineTo(op.pts[i][0], op.pts[i][1]);
+            g.closePath();
+            g.fill();
         }
         else {
             g.lineWidth = op.lw;

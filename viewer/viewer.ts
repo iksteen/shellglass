@@ -283,9 +283,19 @@ function boxArms(cp: number): [number, number, number, number] | null {
   const l = +ARMS[o + 3];
   return u || r || d || l ? [u, r, d, l] : null;
 }
-// The full box-drawing + block-element range now draws on the canvas.
+// Codepoints the canvas overlay paints (as crisp device-pixel geometry). Must stay in
+// lockstep with glyphOps() — see its comment. The rest of the legacy-computing /
+// powerline fill ranges (wedges, seven-segment, rounded/flame separators) stay on the
+// stretched-font path via isFillGlyph().
+// ponytail: covers the seam-motivated subset (mosaics + thin bars + separators);
+// extend the ranges here and in glyphOps together when the long tail earns it.
 export function isCanvasGlyph(cp: number): boolean {
-  return cp >= 0x2500 && cp <= 0x259f;
+  return (
+    (cp >= 0x2500 && cp <= 0x259f) || // box drawing + block elements
+    (cp >= 0x1fb00 && cp <= 0x1fb3b) || // sextant mosaics
+    (cp >= 0x1fb70 && cp <= 0x1fb7b) || // one-eighth vertical/horizontal bars
+    (cp >= 0xe0b0 && cp <= 0xe0b3) // powerline triangle separators
+  );
 }
 
 // The line color for a box cell — fg after inverse/dim (mirrors cellStyle's fg path).
@@ -354,10 +364,20 @@ function cellRect(r: number, c: number): [number, number, number, number] {
 export type Op =
   | { t: "rect"; x: number; y: number; w: number; h: number; alpha?: number }
   | { t: "arc"; cx: number; cy: number; rx: number; ry: number; a0: number; a1: number; lw: number }
-  | { t: "line"; x0: number; y0: number; x1: number; y1: number; lw: number };
+  | { t: "line"; x0: number; y0: number; x1: number; y1: number; lw: number }
+  | { t: "poly"; pts: [number, number][] };
 
 const rectOp = (x: number, y: number, w: number, h: number, alpha?: number): Op =>
   alpha === undefined ? { t: "rect", x, y, w, h } : { t: "rect", x, y, w, h, alpha };
+
+// Rect from fractional cell coordinates (0..1 in both axes), rounded to device pixels
+// so adjacent fractions tile exactly. Used by block/sextant/eighth-bar geometry.
+function fracRect(x0: number, y0: number, x1: number, y1: number, u0: number, v0: number, u1: number, v1: number, alpha?: number): Op {
+  const W = x1 - x0, H = y1 - y0;
+  const a = Math.round(x0 + u0 * W), b = Math.round(x0 + u1 * W);
+  const c = Math.round(y0 + v0 * H), d = Math.round(y0 + v1 * H);
+  return rectOp(a, c, b - a, d - c, alpha);
+}
 
 // Line thickness for a weight (1 light, 2 heavy) given the light thickness.
 function lw(weight: number, light: number): number {
@@ -500,8 +520,59 @@ function blockOps(x0: number, y0: number, x1: number, y1: number, cp: number): O
   return ops;
 }
 
-// Pure: the device-pixel ops that render a box-drawing/block codepoint into the cell
-// rect (x0,y0,x1,y1). `light` is the 1-weight thickness. Exported for unit testing.
+// Legacy-computing sextants (U+1FB00–1FB3B): a 2×3 mosaic. Bit i fills cell
+// (col i%2, row i/2); numbering matches Unicode (1 TL, 2 TR … 6 BR). The range
+// omits the empty/full cell and the two half-column glyphs (masks 0, 21, 42, 63,
+// already block elements), so recover the 6-bit mask by skipping 21 and 42.
+export function sextantMask(cp: number): number {
+  let m = cp - 0x1fb00 + 1;
+  if (m >= 21) m += 1;
+  if (m >= 42) m += 1;
+  return m;
+}
+function sextantOps(x0: number, y0: number, x1: number, y1: number, cp: number): Op[] {
+  const mask = sextantMask(cp);
+  const ops: Op[] = [];
+  for (let i = 0; i < 6; i++) {
+    if (!(mask & (1 << i))) continue;
+    const cx = i % 2, cy = (i / 2) | 0;
+    ops.push(fracRect(x0, y0, x1, y1, cx / 2, cy / 3, (cx + 1) / 2, (cy + 1) / 3));
+  }
+  return ops;
+}
+
+// One-eighth bars: vertical stripe at column N (1FB70–75, N=2..7) or horizontal
+// stripe at row N (1FB76–7B, N=2..7). N=1/N=8 edges are existing block glyphs.
+function eighthBarOps(x0: number, y0: number, x1: number, y1: number, cp: number): Op[] {
+  if (cp <= 0x1fb75) {
+    const n = cp - 0x1fb70 + 2;
+    return [fracRect(x0, y0, x1, y1, (n - 1) / 8, 0, n / 8, 1)];
+  }
+  const n = cp - 0x1fb76 + 2;
+  return [fracRect(x0, y0, x1, y1, 0, (n - 1) / 8, 1, n / 8)];
+}
+
+// Powerline separators: solid (E0B0 ►, E0B2 ◄) or hollow (E0B1, E0B3) triangles
+// spanning the whole cell so they abut the neighbouring segment edge-to-edge.
+function powerlineOps(x0: number, y0: number, x1: number, y1: number, cp: number, light: number): Op[] {
+  const midY = Math.round((y0 + y1) / 2);
+  const right = cp === 0xe0b0 || cp === 0xe0b1; // apex points right
+  const ax = right ? x1 : x0;
+  const bx = right ? x0 : x1; // vertical base edge
+  if (cp === 0xe0b0 || cp === 0xe0b2) {
+    return [{ t: "poly", pts: [[bx, y0], [ax, midY], [bx, y1]] }];
+  }
+  const t = lw(1, light);
+  return [
+    { t: "line", x0: bx, y0, x1: ax, y1: midY, lw: t },
+    { t: "line", x0: ax, y0: midY, x1: bx, y1, lw: t },
+  ];
+}
+
+// Pure: the device-pixel ops that render a box-drawing/block/legacy codepoint into the
+// cell rect (x0,y0,x1,y1). `light` is the 1-weight thickness. Exported for unit testing.
+// Kept in lockstep with isCanvasGlyph(): a codepoint that routes to the canvas but yields
+// no ops would render invisibly (transparent DOM text with nothing painted under it).
 export function glyphOps(cp: number, x0: number, y0: number, x1: number, y1: number, light: number): Op[] {
   const arms = boxArms(cp);
   if (arms) return armsOps(x0, y0, x1, y1, arms, light);
@@ -510,6 +581,9 @@ export function glyphOps(cp: number, x0: number, y0: number, x1: number, y1: num
   if (cp >= 0x256d && cp <= 0x2570) return arcOps(x0, y0, x1, y1, cp, light);
   if (cp >= 0x2571 && cp <= 0x2573) return diagOps(x0, y0, x1, y1, cp, light);
   if (cp >= 0x2580 && cp <= 0x259f) return blockOps(x0, y0, x1, y1, cp);
+  if (cp >= 0x1fb00 && cp <= 0x1fb3b) return sextantOps(x0, y0, x1, y1, cp);
+  if (cp >= 0x1fb70 && cp <= 0x1fb7b) return eighthBarOps(x0, y0, x1, y1, cp);
+  if (cp >= 0xe0b0 && cp <= 0xe0b3) return powerlineOps(x0, y0, x1, y1, cp, light);
   return [];
 }
 
@@ -531,6 +605,12 @@ function paintOps(g: CanvasRenderingContext2D, color: string, ops: Op[]): void {
       g.beginPath();
       g.ellipse(op.cx, op.cy, op.rx, op.ry, 0, op.a0, op.a1);
       g.stroke();
+    } else if (op.t === "poly") {
+      g.beginPath();
+      g.moveTo(op.pts[0][0], op.pts[0][1]);
+      for (let i = 1; i < op.pts.length; i++) g.lineTo(op.pts[i][0], op.pts[i][1]);
+      g.closePath();
+      g.fill();
     } else {
       g.lineWidth = op.lw;
       g.beginPath();
