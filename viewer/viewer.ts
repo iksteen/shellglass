@@ -237,17 +237,6 @@ let cellW = 8;
 let cellH = 17;
 let dpr = 1;
 
-function measureMetrics(): void {
-  const cs = getComputedStyle(screenEl);
-  cellH = parseFloat(cs.getPropertyValue("--lh")) || 17;
-  const probe = document.createElement("span");
-  probe.textContent = "0".repeat(100);
-  probe.style.cssText = "position:absolute;visibility:hidden;white-space:pre";
-  screenEl.appendChild(probe);
-  cellW = probe.getBoundingClientRect().width / 100 || 8;
-  probe.remove();
-  dpr = window.devicePixelRatio || 1;
-}
 
 // Arm weights "urdl" (0 none, 1 light, 2 heavy) for U+2500–257F; "0000" = not
 // arms-coverable (dashes/doubles/arcs/diagonals → left to the font path).
@@ -310,15 +299,43 @@ function cellFg(cell: Cell, isCursor: boolean): RGB {
 let canvasEl: HTMLCanvasElement | null = null;
 let ctx: CanvasRenderingContext2D | null = null;
 
+let obsScreen: HTMLElement | null = null;
+let gCols = 0;
+let gRows = 0;
+let ro: ResizeObserver | null = null;
+
+// Derive cell size from .screen's ACTUAL rendered box (width/cols === 1ch, height/rows
+// === --lh), so the canvas grid is exact by construction — no probe, no font-load race,
+// no accumulating per-column drift. Sizing the backing store resets the canvas, so
+// callers redraw after. Re-run on any .screen reflow (webfont load, zoom, DPR) via a
+// ResizeObserver.
+function sizeCanvas(): void {
+  if (!canvasEl || !obsScreen || !gCols || !gRows) return;
+  const rect = obsScreen.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+  cellW = rect.width / gCols;
+  cellH = rect.height / gRows;
+  dpr = window.devicePixelRatio || 1;
+  canvasEl.width = Math.round(rect.width * dpr);
+  canvasEl.height = Math.round(rect.height * dpr);
+}
+
 function attachCanvas(cols: number, rows: number, screenDiv: HTMLElement): void {
   const c = document.createElement("canvas");
-  c.width = Math.round(cols * cellW * dpr);
-  c.height = Math.round(rows * cellH * dpr);
-  c.style.cssText =
-    `position:absolute;top:0;left:0;width:${cols * cellW}px;height:${rows * cellH}px;pointer-events:none`;
+  // Overlay .screen exactly; the backing store is sized in sizeCanvas().
+  c.style.cssText = "position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none";
   screenDiv.appendChild(c);
   canvasEl = c;
   ctx = c.getContext("2d");
+  obsScreen = screenDiv;
+  gCols = cols;
+  gRows = rows;
+  sizeCanvas();
+  if (typeof ResizeObserver !== "undefined") {
+    if (!ro) ro = new ResizeObserver(() => { sizeCanvas(); redrawCanvasAll(); });
+    ro.disconnect();
+    ro.observe(screenDiv);
+  }
 }
 
 function lineWidth(weight: number): number {
@@ -833,12 +850,6 @@ function main(): void {
   setConfig(boot.cfg);
   setProto(boot.proto, boot.js);
   screenEl = document.getElementById("screen")!;
-  measureMetrics();
-  // A served webfont can shift cellW after boot; re-measure and repaint the overlay.
-  document.fonts?.ready.then(() => {
-    measureMetrics();
-    redrawCanvasAll();
-  });
   connect(boot.events);
 }
 

@@ -106,17 +106,6 @@ export function cellStyle(cell, isCursor) {
 let cellW = 8;
 let cellH = 17;
 let dpr = 1;
-function measureMetrics() {
-    const cs = getComputedStyle(screenEl);
-    cellH = parseFloat(cs.getPropertyValue("--lh")) || 17;
-    const probe = document.createElement("span");
-    probe.textContent = "0".repeat(100);
-    probe.style.cssText = "position:absolute;visibility:hidden;white-space:pre";
-    screenEl.appendChild(probe);
-    cellW = probe.getBoundingClientRect().width / 100 || 8;
-    probe.remove();
-    dpr = window.devicePixelRatio || 1;
-}
 const ARMS = "0101020210102020" +
     "0000000000000000" +
     "0000000000000000" +
@@ -172,15 +161,38 @@ function cellFg(cell, isCursor) {
 }
 let canvasEl = null;
 let ctx = null;
+let obsScreen = null;
+let gCols = 0;
+let gRows = 0;
+let ro = null;
+function sizeCanvas() {
+    if (!canvasEl || !obsScreen || !gCols || !gRows)
+        return;
+    const rect = obsScreen.getBoundingClientRect();
+    if (!rect.width || !rect.height)
+        return;
+    cellW = rect.width / gCols;
+    cellH = rect.height / gRows;
+    dpr = window.devicePixelRatio || 1;
+    canvasEl.width = Math.round(rect.width * dpr);
+    canvasEl.height = Math.round(rect.height * dpr);
+}
 function attachCanvas(cols, rows, screenDiv) {
     const c = document.createElement("canvas");
-    c.width = Math.round(cols * cellW * dpr);
-    c.height = Math.round(rows * cellH * dpr);
-    c.style.cssText =
-        `position:absolute;top:0;left:0;width:${cols * cellW}px;height:${rows * cellH}px;pointer-events:none`;
+    c.style.cssText = "position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none";
     screenDiv.appendChild(c);
     canvasEl = c;
     ctx = c.getContext("2d");
+    obsScreen = screenDiv;
+    gCols = cols;
+    gRows = rows;
+    sizeCanvas();
+    if (typeof ResizeObserver !== "undefined") {
+        if (!ro)
+            ro = new ResizeObserver(() => { sizeCanvas(); redrawCanvasAll(); });
+        ro.disconnect();
+        ro.observe(screenDiv);
+    }
 }
 function lineWidth(weight) {
     const light = Math.max(1, Math.round(dpr));
@@ -634,11 +646,6 @@ function main() {
     setConfig(boot.cfg);
     setProto(boot.proto, boot.js);
     screenEl = document.getElementById("screen");
-    measureMetrics();
-    document.fonts?.ready.then(() => {
-        measureMetrics();
-        redrawCanvasAll();
-    });
     connect(boot.events);
 }
 if (typeof document !== "undefined" && window.SHELLGLASS) {
