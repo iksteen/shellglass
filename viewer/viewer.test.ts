@@ -7,6 +7,7 @@ import {
   resolveRgb,
   cellStyle,
   isFillGlyph,
+  isCanvasGlyph,
   renderRow,
   patchCells,
   decodeBlock,
@@ -111,27 +112,28 @@ test("wide cells advance two columns", () => {
   assert.match(split, /left:2ch;width:1ch;font-weight:bold;">a</);
 });
 
-test("fill glyphs render as stretched SVG, plain text does not", () => {
-  assert.ok(isFillGlyph("│".codePointAt(0)!));
+test("box-drawing lines route to the canvas as transparent (selectable) text", () => {
+  // │ ─ ┼ etc. are drawn on the overlay canvas; the DOM keeps the real glyph as
+  // transparent text (no SVG) so it stays selectable/copyable.
+  assert.ok(isCanvasGlyph("│".codePointAt(0)!));
+  assert.ok(isCanvasGlyph("┼".codePointAt(0)!));
   const box = renderRow([{ t: "│" }], -1);
-  assert.match(box, /<svg /);
-  assert.match(box, /preserveAspectRatio="none"/);
-  // Forced to the full viewBox width so lines fill the cell (no dashed dividers).
-  assert.match(box, /textLength="14" lengthAdjust="spacingAndGlyphs"/);
-  const plain = renderRow([{ t: "a" }], -1);
-  assert.doesNotMatch(plain, /<svg/);
+  assert.doesNotMatch(box, /<svg/);
+  assert.match(box, /color:transparent">│<\/span>/);
+  // A block glyph (not a line) is NOT a canvas glyph — still a stretched SVG.
+  assert.ok(!isCanvasGlyph("█".codePointAt(0)!));
+  assert.match(renderRow([{ t: "█" }], -1), /<svg /);
 });
 
-test("a run of the same solid line merges into one span; shades do not", () => {
-  const div = renderRow([{ t: "─" }, { t: "─" }, { t: "─" }, { t: "─" }, { t: "─" }], -1);
-  assert.equal((div.match(/<svg /g) ?? []).length, 1, "divider run not merged");
-  assert.match(div, /left:0ch;width:5ch;/);
-  // Shades stay per-cell (stretching one across the run would smear the pattern).
-  const shade = renderRow([{ t: "░" }, { t: "░" }, { t: "░" }], -1);
-  assert.equal((shade.match(/<svg /g) ?? []).length, 3, "shade wrongly merged");
-  // Distinct adjacent glyphs don't merge.
-  const mixed = renderRow([{ t: "─" }, { t: "┼" }, { t: "─" }], -1);
-  assert.equal((mixed.match(/<svg /g) ?? []).length, 3, "distinct glyphs merged");
+test("block fill runs still merge into one SVG; lines don't (they're canvas)", () => {
+  // █ is a mergeable fill glyph and not canvas-routed → one stretched span.
+  const bar = renderRow([{ t: "█" }, { t: "█" }, { t: "█" }], -1);
+  assert.equal((bar.match(/<svg /g) ?? []).length, 1, "block run not merged");
+  assert.match(bar, /left:0ch;width:3ch;/);
+  // A line run is canvas-routed: per-cell transparent spans, no SVG.
+  const div = renderRow([{ t: "─" }, { t: "─" }, { t: "─" }], -1);
+  assert.equal((div.match(/<svg /g) ?? []).length, 0, "line run went to SVG");
+  assert.equal((div.match(/color:transparent/g) ?? []).length, 3, "line cells not transparent");
 });
 
 test("patchCells writes line patches and reports dirty rows", () => {

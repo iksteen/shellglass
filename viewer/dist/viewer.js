@@ -103,6 +103,143 @@ export function cellStyle(cell, isCursor) {
         s += "text-decoration:underline;";
     return s;
 }
+let cellW = 8;
+let cellH = 17;
+let dpr = 1;
+function measureMetrics() {
+    const cs = getComputedStyle(screenEl);
+    cellH = parseFloat(cs.getPropertyValue("--lh")) || 17;
+    const probe = document.createElement("span");
+    probe.textContent = "0".repeat(100);
+    probe.style.cssText = "position:absolute;visibility:hidden;white-space:pre";
+    screenEl.appendChild(probe);
+    cellW = probe.getBoundingClientRect().width / 100 || 8;
+    probe.remove();
+    dpr = window.devicePixelRatio || 1;
+}
+const ARMS = "0101020210102020" +
+    "0000000000000000" +
+    "0000000000000000" +
+    "0110021001200220" +
+    "0011001200210022" +
+    "1100120021002200" +
+    "1001100220012002" +
+    "1110121021101120" +
+    "2120221012202220" +
+    "1011101220111021" +
+    "2021201210222022" +
+    "0111011202110212" +
+    "0121012202210222" +
+    "1101110212011202" +
+    "2101210222012202" +
+    "1111111212111212" +
+    "2111112121212112" +
+    "2211112212212212" +
+    "1222212222212222" +
+    "0000000000000000" +
+    "0000000000000000" +
+    "0000000000000000" +
+    "0000000000000000" +
+    "0000000000000000" +
+    "0000000000000000" +
+    "0000000000000000" +
+    "0000000000000000" +
+    "0000000000000000" +
+    "0000000000000000" +
+    "0001100001000010" +
+    "0002200002000020" +
+    "0201102001022010";
+function boxArms(cp) {
+    if (cp < 0x2500 || cp > 0x257f)
+        return null;
+    const o = (cp - 0x2500) * 4;
+    const u = +ARMS[o];
+    const r = +ARMS[o + 1];
+    const d = +ARMS[o + 2];
+    const l = +ARMS[o + 3];
+    return u || r || d || l ? [u, r, d, l] : null;
+}
+export function isCanvasGlyph(cp) {
+    return boxArms(cp) !== null;
+}
+function cellFg(cell, isCursor) {
+    let fg = resolveRgb(cell.f) ?? parseHex(cfg.defFg);
+    if (!!cell.n !== isCursor)
+        fg = resolveRgb(cell.g) ?? parseHex(cfg.defBg);
+    if (cell.d)
+        fg = [Math.floor(fg[0] / 10) * 6, Math.floor(fg[1] / 10) * 6, Math.floor(fg[2] / 10) * 6];
+    return fg;
+}
+let canvasEl = null;
+let ctx = null;
+function attachCanvas(cols, rows, screenDiv) {
+    const c = document.createElement("canvas");
+    c.width = Math.round(cols * cellW * dpr);
+    c.height = Math.round(rows * cellH * dpr);
+    c.style.cssText =
+        `position:absolute;top:0;left:0;width:${cols * cellW}px;height:${rows * cellH}px;pointer-events:none`;
+    screenDiv.appendChild(c);
+    canvasEl = c;
+    ctx = c.getContext("2d");
+}
+function lineWidth(weight) {
+    const light = Math.max(1, Math.round(dpr));
+    return weight === 2 ? 2 * light : light;
+}
+function drawBoxCell(r, c, arms, cell, isCursor) {
+    if (!ctx)
+        return;
+    const [u, rr, d, l] = arms;
+    const x0 = Math.round(c * cellW * dpr);
+    const x1 = Math.round((c + 1) * cellW * dpr);
+    const y0 = Math.round(r * cellH * dpr);
+    const y1 = Math.round((r + 1) * cellH * dpr);
+    const midX = Math.round((x0 + x1) / 2);
+    const midY = Math.round((y0 + y1) / 2);
+    const vw = lineWidth(Math.max(u, d));
+    const hw = lineWidth(Math.max(l, rr));
+    const hvw = Math.floor(vw / 2);
+    const hhw = Math.floor(hw / 2);
+    ctx.fillStyle = hex(cellFg(cell, isCursor));
+    if (u || d) {
+        const a = u ? y0 : midY - hhw;
+        const b = d ? y1 : midY + hhw;
+        ctx.fillRect(midX - hvw, a, vw, b - a);
+    }
+    if (l || rr) {
+        const a = l ? x0 : midX - hvw;
+        const b = rr ? x1 : midX + hvw;
+        ctx.fillRect(a, midY - hhw, b - a, hw);
+    }
+}
+function redrawCanvasRow(r) {
+    if (!ctx || !canvasEl)
+        return;
+    const row = screen.cells[r];
+    const y0 = Math.round(r * cellH * dpr);
+    const y1 = Math.round((r + 1) * cellH * dpr);
+    ctx.clearRect(0, y0, canvasEl.width, y1 - y0);
+    if (!row)
+        return;
+    let c = 0;
+    for (const cell of row) {
+        const w = cell.w ? 2 : 1;
+        const cp = cell.t ? cell.t.codePointAt(0) : 0;
+        const arms = cp ? boxArms(cp) : null;
+        if (arms) {
+            const isCursor = !!screen.cur && screen.cur[0] === r && screen.cur[1] === c;
+            drawBoxCell(r, c, arms, cell, isCursor);
+        }
+        c += w;
+    }
+}
+function redrawCanvasAll() {
+    if (!ctx || !canvasEl)
+        return;
+    ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+    for (let r = 0; r < screen.cells.length; r++)
+        redrawCanvasRow(r);
+}
 export function isFillGlyph(cp) {
     return ((cp >= 0xe0b0 && cp <= 0xe0d4) ||
         (cp >= 0x2500 && cp <= 0x259f) ||
@@ -172,6 +309,16 @@ export function renderRow(cells, cursorCol) {
     for (const cell of cells) {
         const isCursor = col === cursorCol;
         const w = cell.w ? 2 : 1;
+        const cp0 = cell.t ? cell.t.codePointAt(0) : 0;
+        if (cp0 && isCanvasGlyph(cp0)) {
+            flushText();
+            flushFill();
+            runStyle = null;
+            cols = 0;
+            out += `<span class="run" style="left:${col}ch;width:${w}ch;${cellStyle(cell, isCursor)}color:transparent">${esc(cell.t)}</span>`;
+            col += w;
+            continue;
+        }
         const font = svgFont(cell);
         if (font) {
             flushText();
@@ -258,6 +405,8 @@ function applyFull(m) {
         cur,
         rowEls: Array.from(screenDiv.children),
     };
+    attachCanvas(m.w, m.h, screenDiv);
+    redrawCanvasAll();
 }
 function decodeRow([r, l, text, style]) {
     if (typeof text === "string") {
@@ -276,6 +425,7 @@ function applyPatches(cur, rows) {
         if (!el)
             continue;
         el.innerHTML = renderRow(screen.cells[r] ?? [], cursorCol(screen.cur, r));
+        redrawCanvasRow(r);
     }
 }
 function applyDiff(m) {
@@ -329,6 +479,11 @@ function main() {
     setConfig(boot.cfg);
     setProto(boot.proto, boot.js);
     screenEl = document.getElementById("screen");
+    measureMetrics();
+    document.fonts?.ready.then(() => {
+        measureMetrics();
+        redrawCanvasAll();
+    });
     connect(boot.events);
 }
 if (typeof document !== "undefined" && window.SHELLGLASS) {

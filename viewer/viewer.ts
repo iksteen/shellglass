@@ -224,6 +224,163 @@ export function cellStyle(cell: Cell, isCursor: boolean): string {
   return s;
 }
 
+// ── canvas line overlay (exp) ─────────────────────────────────────────────────
+//
+// Box-drawing lines/junctions render on one <canvas> laid over #screen, drawn crisp at
+// device pixels: adjacent cells share ROUNDED pixel boundaries, so a vertical divider
+// tiles across rows with no seam and no font-hinting fight — the thing stretched SVG
+// couldn't do. The DOM keeps the real glyph as transparent text, so selection/copy still
+// work. Scope: the arms-coverable subset (lines, corners, tees, crosses, half-lines);
+// dashes/doubles/arcs/blocks stay on the font path for now.
+
+let cellW = 8;
+let cellH = 17;
+let dpr = 1;
+
+function measureMetrics(): void {
+  const cs = getComputedStyle(screenEl);
+  cellH = parseFloat(cs.getPropertyValue("--lh")) || 17;
+  const probe = document.createElement("span");
+  probe.textContent = "0".repeat(100);
+  probe.style.cssText = "position:absolute;visibility:hidden;white-space:pre";
+  screenEl.appendChild(probe);
+  cellW = probe.getBoundingClientRect().width / 100 || 8;
+  probe.remove();
+  dpr = window.devicePixelRatio || 1;
+}
+
+// Arm weights "urdl" (0 none, 1 light, 2 heavy) for U+2500–257F; "0000" = not
+// arms-coverable (dashes/doubles/arcs/diagonals → left to the font path).
+const ARMS =
+  "0101020210102020" + // 2500 ─ ━ │ ┃
+  "0000000000000000" + // 2504-2507 dashes
+  "0000000000000000" + // 2508-250B dashes
+  "0110021001200220" + // 250C ┌┍┎┏
+  "0011001200210022" + // 2510 ┐┑┒┓
+  "1100120021002200" + // 2514 └┕┖┗
+  "1001100220012002" + // 2518 ┘┙┚┛
+  "1110121021101120" + // 251C ├┝┞┟
+  "2120221012202220" + // 2520 ┠┡┢┣
+  "1011101220111021" + // 2524 ┤┥┦┧
+  "2021201210222022" + // 2528 ┨┩┪┫
+  "0111011202110212" + // 252C ┬┭┮┯
+  "0121012202210222" + // 2530 ┰┱┲┳
+  "1101110212011202" + // 2534 ┴┵┶┷
+  "2101210222012202" + // 2538 ┸┹┺┻
+  "1111111212111212" + // 253C ┼┽┾┿
+  "2111112121212112" + // 2540 ╀╁╂╃
+  "2211112212212212" + // 2544 ╄╅╆╇
+  "1222212222212222" + // 2548 ╈╉╊╋
+  "0000000000000000" + // 254C-254F dashes
+  "0000000000000000" + // 2550-2553 doubles
+  "0000000000000000" + // 2554-2557 doubles
+  "0000000000000000" + // 2558-255B doubles
+  "0000000000000000" + // 255C-255F doubles
+  "0000000000000000" + // 2560-2563 doubles
+  "0000000000000000" + // 2564-2567 doubles
+  "0000000000000000" + // 2568-256B doubles
+  "0000000000000000" + // 256C double, 256D-256F arcs
+  "0000000000000000" + // 2570 arc, 2571-2573 diagonals
+  "0001100001000010" + // 2574 ╴╵╶╷
+  "0002200002000020" + // 2578 ╸╹╺╻
+  "0201102001022010"; //  257C ╼╽╾╿
+
+function boxArms(cp: number): [number, number, number, number] | null {
+  if (cp < 0x2500 || cp > 0x257f) return null;
+  const o = (cp - 0x2500) * 4;
+  const u = +ARMS[o];
+  const r = +ARMS[o + 1];
+  const d = +ARMS[o + 2];
+  const l = +ARMS[o + 3];
+  return u || r || d || l ? [u, r, d, l] : null;
+}
+export function isCanvasGlyph(cp: number): boolean {
+  return boxArms(cp) !== null;
+}
+
+// The line color for a box cell — fg after inverse/dim (mirrors cellStyle's fg path).
+function cellFg(cell: Cell, isCursor: boolean): RGB {
+  let fg = resolveRgb(cell.f) ?? parseHex(cfg.defFg);
+  if (!!cell.n !== isCursor) fg = resolveRgb(cell.g) ?? parseHex(cfg.defBg);
+  if (cell.d) fg = [Math.floor(fg[0] / 10) * 6, Math.floor(fg[1] / 10) * 6, Math.floor(fg[2] / 10) * 6];
+  return fg;
+}
+
+let canvasEl: HTMLCanvasElement | null = null;
+let ctx: CanvasRenderingContext2D | null = null;
+
+function attachCanvas(cols: number, rows: number, screenDiv: HTMLElement): void {
+  const c = document.createElement("canvas");
+  c.width = Math.round(cols * cellW * dpr);
+  c.height = Math.round(rows * cellH * dpr);
+  c.style.cssText =
+    `position:absolute;top:0;left:0;width:${cols * cellW}px;height:${rows * cellH}px;pointer-events:none`;
+  screenDiv.appendChild(c);
+  canvasEl = c;
+  ctx = c.getContext("2d");
+}
+
+function lineWidth(weight: number): number {
+  const light = Math.max(1, Math.round(dpr));
+  return weight === 2 ? 2 * light : light;
+}
+
+function drawBoxCell(r: number, c: number, arms: [number, number, number, number], cell: Cell, isCursor: boolean): void {
+  if (!ctx) return;
+  const [u, rr, d, l] = arms;
+  // Rounded cell boundaries: cell (c+1).x0 === cell c.x1, so bars tile exactly.
+  const x0 = Math.round(c * cellW * dpr);
+  const x1 = Math.round((c + 1) * cellW * dpr);
+  const y0 = Math.round(r * cellH * dpr);
+  const y1 = Math.round((r + 1) * cellH * dpr);
+  const midX = Math.round((x0 + x1) / 2);
+  const midY = Math.round((y0 + y1) / 2);
+  const vw = lineWidth(Math.max(u, d));
+  const hw = lineWidth(Math.max(l, rr));
+  const hvw = Math.floor(vw / 2);
+  const hhw = Math.floor(hw / 2);
+  ctx.fillStyle = hex(cellFg(cell, isCursor));
+  if (u || d) {
+    const a = u ? y0 : midY - hhw;
+    const b = d ? y1 : midY + hhw;
+    ctx.fillRect(midX - hvw, a, vw, b - a);
+  }
+  if (l || rr) {
+    const a = l ? x0 : midX - hvw;
+    const b = rr ? x1 : midX + hvw;
+    ctx.fillRect(a, midY - hhw, b - a, hw);
+  }
+}
+
+// Redraw one row's band of the canvas from screen.cells (clears then repaints its box
+// cells). Self-contained: a cell's bars stay within its own [y0,y1], so a per-row redraw
+// never disturbs neighbours — matching the DOM's per-row update.
+function redrawCanvasRow(r: number): void {
+  if (!ctx || !canvasEl) return;
+  const row = screen.cells[r];
+  const y0 = Math.round(r * cellH * dpr);
+  const y1 = Math.round((r + 1) * cellH * dpr);
+  ctx.clearRect(0, y0, canvasEl.width, y1 - y0);
+  if (!row) return;
+  let c = 0;
+  for (const cell of row) {
+    const w = cell.w ? 2 : 1;
+    const cp = cell.t ? cell.t.codePointAt(0)! : 0;
+    const arms = cp ? boxArms(cp) : null;
+    if (arms) {
+      const isCursor = !!screen.cur && screen.cur[0] === r && screen.cur[1] === c;
+      drawBoxCell(r, c, arms, cell, isCursor);
+    }
+    c += w;
+  }
+}
+
+function redrawCanvasAll(): void {
+  if (!ctx || !canvasEl) return;
+  ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+  for (let r = 0; r < screen.cells.length; r++) redrawCanvasRow(r);
+}
+
 // ── symbol / fill glyphs (port of render.rs:is_fill_glyph + svg_font) ──────────
 
 export function isFillGlyph(cp: number): boolean {
@@ -337,6 +494,18 @@ export function renderRow(cells: Cell[], cursorCol: number): string {
   for (const cell of cells) {
     const isCursor = col === cursorCol;
     const w = cell.w ? 2 : 1;
+    const cp0 = cell.t ? cell.t.codePointAt(0)! : 0;
+    if (cp0 && isCanvasGlyph(cp0)) {
+      // The canvas paints the line; keep the real glyph as transparent text so it stays
+      // selectable/copyable. Own span (color forced transparent, background retained).
+      flushText();
+      flushFill();
+      runStyle = null;
+      cols = 0;
+      out += `<span class="run" style="left:${col}ch;width:${w}ch;${cellStyle(cell, isCursor)}color:transparent">${esc(cell.t!)}</span>`;
+      col += w;
+      continue;
+    }
     const font = svgFont(cell);
     if (font) {
       flushText();
@@ -432,12 +601,16 @@ function applyFull(m: FullMsg): void {
   html += "</div>";
   screenEl.innerHTML = html;
 
-  const screenDiv = screenEl.firstElementChild!;
+  const screenDiv = screenEl.firstElementChild as HTMLElement;
   screen = {
     cells: rows,
     cur,
     rowEls: Array.from(screenDiv.children) as HTMLElement[],
   };
+  // The canvas lives inside .screen (rebuilt each full frame), sized to the grid, and
+  // repainted from the fresh cells.
+  attachCanvas(m.w, m.h, screenDiv);
+  redrawCanvasAll();
 }
 
 function decodeRow([r, l, text, style]: WireRow): { r: number; l: number; cells: Cell[] } {
@@ -458,6 +631,7 @@ function applyPatches(cur: Cur | undefined, rows: { r: number; l: number; cells:
     const el = screen.rowEls[r];
     if (!el) continue;
     el.innerHTML = renderRow(screen.cells[r] ?? [], cursorCol(screen.cur, r));
+    redrawCanvasRow(r);
   }
 }
 
@@ -522,6 +696,12 @@ function main(): void {
   setConfig(boot.cfg);
   setProto(boot.proto, boot.js);
   screenEl = document.getElementById("screen")!;
+  measureMetrics();
+  // A served webfont can shift cellW after boot; re-measure and repaint the overlay.
+  document.fonts?.ready.then(() => {
+    measureMetrics();
+    redrawCanvasAll();
+  });
   connect(boot.events);
 }
 
