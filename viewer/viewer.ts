@@ -233,6 +233,21 @@ export function isFillGlyph(cp: number): boolean {
   );
 }
 
+// A fill glyph uniform along x, so a run of it renders as ONE stretched span instead
+// of N per-cell boxes — killing the sub-pixel seams that dash a horizontal divider at
+// fractional zoom. Solid horizontal strips only; shades/dashed/side-blocks would smear
+// if stretched across a run, so they stay per-cell. Mirrors render.rs::is_mergeable_fill.
+export function isMergeableFill(cp: number): boolean {
+  return (
+    cp === 0x2500 || // ─
+    cp === 0x2501 || // ━
+    cp === 0x2550 || // ═
+    cp === 0x2588 || // █ full block
+    (cp >= 0x2581 && cp <= 0x2587) || // ▁▂▃▄▅▆▇ lower strips
+    cp === 0x2594 // ▔ upper strip
+  );
+}
+
 function symbolFamily(cp: number): string | null {
   for (const [lo, hi, fam] of cfg.sym) {
     if (cp >= lo && cp <= hi) return fam;
@@ -254,21 +269,50 @@ function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function symbolCell(cell: Cell, isCursor: boolean, col: number, w: number, font: string): string {
-  const boxStyle = cellStyle(cell, isCursor);
-  const t = cell.t ?? " ";
-  const first = t.codePointAt(0) ?? 0x20;
-  const par = isFillGlyph(first) ? "none" : "xMidYMid meet";
+// Emit one SVG symbol span (already-escaped glyph, precomputed boxStyle) covering w
+// columns. Shared by single symbol cells and merged fill runs — for a merged run, w
+// is the run's total width and the one glyph stretches seamlessly across it (no
+// per-cell box boundaries to gap at fractional zoom). Mirrors render.rs.
+function symbolSpan(
+  col: number,
+  w: number,
+  boxStyle: string,
+  font: string,
+  glyph: string,
+  first: number,
+): string {
+  const fill = isFillGlyph(first);
+  const par = fill ? "none" : "xMidYMid meet";
+  // Fill glyphs span the whole box so lines tile; a monospace advance is only ~0.6em,
+  // so a bare none-stretch under-fills and horizontals dash. textLength forces the
+  // glyph to the viewBox width; none then maps it onto the full box.
+  const stretch = fill ? ' textLength="14" lengthAdjust="spacingAndGlyphs"' : "";
   return (
     `<span class="run" style="left:${col}ch;width:${w}ch;${boxStyle}">` +
     `<svg viewBox="0 0 14 14" preserveAspectRatio="${par}" style="display:block;width:100%;height:100%">` +
-    `<text x="0" y="12" font-family="${font}" font-size="14" fill="currentColor">${esc(t)}</text></svg></span>`
+    `<text x="0" y="12" font-family="${font}" font-size="14" fill="currentColor"${stretch}>${glyph}</text></svg></span>`
   );
+}
+
+function symbolCell(cell: Cell, isCursor: boolean, col: number, w: number, font: string): string {
+  const boxStyle = cellStyle(cell, isCursor);
+  const t = cell.t ?? " ";
+  return symbolSpan(col, w, boxStyle, font, esc(t), t.codePointAt(0) ?? 0x20);
 }
 
 // ── row rendering (port of render.rs:render_row) ──────────────────────────────
 
 // Render one row's cells to inner HTML. `cursorCol` is the cursor column, or -1.
+interface FillRun {
+  col: number;
+  width: number;
+  t: string; // raw glyph, for run-continuation comparison
+  glyph: string; // escaped, for emission
+  style: string;
+  font: string;
+  first: number;
+}
+
 export function renderRow(cells: Cell[], cursorCol: number): string {
   let out = "";
   let col = 0;
@@ -276,24 +320,46 @@ export function renderRow(cells: Cell[], cursorCol: number): string {
   let runCol = 0;
   let cols = 0;
   let text = "";
-  const flush = () => {
+  const flushText = () => {
     if (text.length === 0) return;
     out += `<span class="run" style="left:${runCol}ch;width:${cols}ch;${runStyle ?? ""}">${text}</span>`;
     text = "";
+  };
+  // A run of the same mergeable fill glyph, emitted as one stretched span.
+  let fill: FillRun | null = null;
+  const flushFill = () => {
+    if (fill) {
+      out += symbolSpan(fill.col, fill.width, fill.style, fill.font, fill.glyph, fill.first);
+      fill = null;
+    }
   };
   for (const cell of cells) {
     const isCursor = col === cursorCol;
     const w = cell.w ? 2 : 1;
     const font = svgFont(cell);
     if (font) {
-      flush();
+      flushText();
       runStyle = null;
       cols = 0;
-      out += symbolCell(cell, isCursor, col, w, font);
+      const t = cell.t ?? " ";
+      const first = t.codePointAt(0) ?? 0x20;
+      if (isMergeableFill(first)) {
+        const style = cellStyle(cell, isCursor);
+        if (fill && fill.t === t && fill.style === style && fill.font === font) {
+          fill.width += w;
+        } else {
+          flushFill();
+          fill = { col, width: w, t, glyph: esc(t), style, font, first };
+        }
+      } else {
+        flushFill();
+        out += symbolCell(cell, isCursor, col, w, font);
+      }
     } else {
+      flushFill();
       const style = cellStyle(cell, isCursor);
       if (runStyle !== style) {
-        flush();
+        flushText();
         runStyle = style;
         cols = 0;
       }
@@ -303,7 +369,8 @@ export function renderRow(cells: Cell[], cursorCol: number): string {
     }
     col += w;
   }
-  flush();
+  flushText();
+  flushFill();
   return out;
 }
 

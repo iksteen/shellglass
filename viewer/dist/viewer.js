@@ -108,6 +108,14 @@ export function isFillGlyph(cp) {
         (cp >= 0x2500 && cp <= 0x259f) ||
         (cp >= 0x1fb00 && cp <= 0x1fbaf));
 }
+export function isMergeableFill(cp) {
+    return (cp === 0x2500 ||
+        cp === 0x2501 ||
+        cp === 0x2550 ||
+        cp === 0x2588 ||
+        (cp >= 0x2581 && cp <= 0x2587) ||
+        cp === 0x2594);
+}
 function symbolFamily(cp) {
     for (const [lo, hi, fam] of cfg.sym) {
         if (cp >= lo && cp <= hi)
@@ -128,14 +136,18 @@ function svgFont(cell) {
 function esc(s) {
     return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
+function symbolSpan(col, w, boxStyle, font, glyph, first) {
+    const fill = isFillGlyph(first);
+    const par = fill ? "none" : "xMidYMid meet";
+    const stretch = fill ? ' textLength="14" lengthAdjust="spacingAndGlyphs"' : "";
+    return (`<span class="run" style="left:${col}ch;width:${w}ch;${boxStyle}">` +
+        `<svg viewBox="0 0 14 14" preserveAspectRatio="${par}" style="display:block;width:100%;height:100%">` +
+        `<text x="0" y="12" font-family="${font}" font-size="14" fill="currentColor"${stretch}>${glyph}</text></svg></span>`);
+}
 function symbolCell(cell, isCursor, col, w, font) {
     const boxStyle = cellStyle(cell, isCursor);
     const t = cell.t ?? " ";
-    const first = t.codePointAt(0) ?? 0x20;
-    const par = isFillGlyph(first) ? "none" : "xMidYMid meet";
-    return (`<span class="run" style="left:${col}ch;width:${w}ch;${boxStyle}">` +
-        `<svg viewBox="0 0 14 14" preserveAspectRatio="${par}" style="display:block;width:100%;height:100%">` +
-        `<text x="0" y="12" font-family="${font}" font-size="14" fill="currentColor">${esc(t)}</text></svg></span>`);
+    return symbolSpan(col, w, boxStyle, font, esc(t), t.codePointAt(0) ?? 0x20);
 }
 export function renderRow(cells, cursorCol) {
     let out = "";
@@ -144,26 +156,49 @@ export function renderRow(cells, cursorCol) {
     let runCol = 0;
     let cols = 0;
     let text = "";
-    const flush = () => {
+    const flushText = () => {
         if (text.length === 0)
             return;
         out += `<span class="run" style="left:${runCol}ch;width:${cols}ch;${runStyle ?? ""}">${text}</span>`;
         text = "";
+    };
+    let fill = null;
+    const flushFill = () => {
+        if (fill) {
+            out += symbolSpan(fill.col, fill.width, fill.style, fill.font, fill.glyph, fill.first);
+            fill = null;
+        }
     };
     for (const cell of cells) {
         const isCursor = col === cursorCol;
         const w = cell.w ? 2 : 1;
         const font = svgFont(cell);
         if (font) {
-            flush();
+            flushText();
             runStyle = null;
             cols = 0;
-            out += symbolCell(cell, isCursor, col, w, font);
+            const t = cell.t ?? " ";
+            const first = t.codePointAt(0) ?? 0x20;
+            if (isMergeableFill(first)) {
+                const style = cellStyle(cell, isCursor);
+                if (fill && fill.t === t && fill.style === style && fill.font === font) {
+                    fill.width += w;
+                }
+                else {
+                    flushFill();
+                    fill = { col, width: w, t, glyph: esc(t), style, font, first };
+                }
+            }
+            else {
+                flushFill();
+                out += symbolCell(cell, isCursor, col, w, font);
+            }
         }
         else {
+            flushFill();
             const style = cellStyle(cell, isCursor);
             if (runStyle !== style) {
-                flush();
+                flushText();
                 runStyle = style;
                 cols = 0;
             }
@@ -174,7 +209,8 @@ export function renderRow(cells, cursorCol) {
         }
         col += w;
     }
-    flush();
+    flushText();
+    flushFill();
     return out;
 }
 function cursorCol(cur, row) {

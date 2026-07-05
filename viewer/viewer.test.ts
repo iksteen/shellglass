@@ -116,8 +116,22 @@ test("fill glyphs render as stretched SVG, plain text does not", () => {
   const box = renderRow([{ t: "│" }], -1);
   assert.match(box, /<svg /);
   assert.match(box, /preserveAspectRatio="none"/);
+  // Forced to the full viewBox width so lines fill the cell (no dashed dividers).
+  assert.match(box, /textLength="14" lengthAdjust="spacingAndGlyphs"/);
   const plain = renderRow([{ t: "a" }], -1);
   assert.doesNotMatch(plain, /<svg/);
+});
+
+test("a run of the same solid line merges into one span; shades do not", () => {
+  const div = renderRow([{ t: "─" }, { t: "─" }, { t: "─" }, { t: "─" }, { t: "─" }], -1);
+  assert.equal((div.match(/<svg /g) ?? []).length, 1, "divider run not merged");
+  assert.match(div, /left:0ch;width:5ch;/);
+  // Shades stay per-cell (stretching one across the run would smear the pattern).
+  const shade = renderRow([{ t: "░" }, { t: "░" }, { t: "░" }], -1);
+  assert.equal((shade.match(/<svg /g) ?? []).length, 3, "shade wrongly merged");
+  // Distinct adjacent glyphs don't merge.
+  const mixed = renderRow([{ t: "─" }, { t: "┼" }, { t: "─" }], -1);
+  assert.equal((mixed.match(/<svg /g) ?? []).length, 3, "distinct glyphs merged");
 });
 
 test("patchCells writes line patches and reports dirty rows", () => {

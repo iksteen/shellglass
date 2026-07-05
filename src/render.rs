@@ -231,19 +231,49 @@ fn render_row(
     let mut run_col: u16 = 0;
     let mut cols: u16 = 0;
     let mut text = String::new();
+    // A run of the same mergeable fill glyph (same glyph, style, font) emitted as one
+    // stretched span — see `is_mergeable_fill`. Extends across cells; flushed on any
+    // other cell or at row end.
+    let mut fill: Option<FillRun> = None;
 
     for cell in row {
         let is_cursor = cursor_col == Some(col);
         let w = if cell.wide { 2 } else { 1 };
 
-        // Symbol cells (font override) render as a scaled SVG in their own box;
-        // they never coalesce, so flush any pending text run first.
         if let Some(font) = svg_font(cell, resolver, config) {
+            // Symbol cells render as a scaled SVG, never inside a text run.
             flush_text_run(out, &run_style, run_col, cols, &mut text);
             run_style = None;
             cols = 0;
-            emit_symbol_cell(out, cell, is_cursor, col, w, &font);
+            let first = cell.text.chars().next().unwrap_or(' ');
+            if is_mergeable_fill(first) {
+                let style = cell_box_style(cell, is_cursor);
+                let same = fill
+                    .as_ref()
+                    .is_some_and(|f| f.text == cell.text && f.style == style && f.font == font);
+                if same {
+                    let f = fill.as_mut().expect("same ⇒ present");
+                    f.width += w;
+                } else {
+                    flush_fill_run(out, fill.take());
+                    let mut glyph = String::new();
+                    escape_into(&mut glyph, &cell.text);
+                    fill = Some(FillRun {
+                        col,
+                        width: w,
+                        text: &cell.text,
+                        glyph,
+                        style,
+                        font,
+                        first,
+                    });
+                }
+            } else {
+                flush_fill_run(out, fill.take());
+                emit_symbol_cell(out, cell, is_cursor, col, w, &font);
+            }
         } else {
+            flush_fill_run(out, fill.take());
             let style = cell_box_style(cell, is_cursor);
             if run_style.as_ref() != Some(&style) {
                 flush_text_run(out, &run_style, run_col, cols, &mut text);
@@ -264,6 +294,24 @@ fn render_row(
         col += w;
     }
     flush_text_run(out, &run_style, run_col, cols, &mut text);
+    flush_fill_run(out, fill);
+}
+
+/// A pending run of one mergeable fill glyph (see [`is_mergeable_fill`]).
+struct FillRun<'a> {
+    col: u16,
+    width: u16,
+    text: &'a str, // raw glyph, for run-continuation comparison
+    glyph: String, // escaped, for emission
+    style: String, // precomputed box style
+    font: String,
+    first: char,
+}
+
+fn flush_fill_run(out: &mut String, run: Option<FillRun>) {
+    if let Some(f) = run {
+        emit_symbol_span(out, f.col, f.width, &f.style, &f.font, &f.glyph, f.first);
+    }
 }
 
 /// Emit a run of plain text as one fixed-width `inline-block` box that occupies
@@ -301,22 +349,43 @@ fn emit_symbol_cell(
 ) {
     let box_style = cell_box_style(cell, is_cursor);
     let first = cell.text.chars().next().unwrap_or(' ');
-    let par = if is_fill_glyph(first) {
-        "none"
-    } else {
-        "xMidYMid meet"
-    };
     let mut glyph = String::new();
     escape_into(&mut glyph, &cell.text);
-    // viewBox is the glyph's ~1em design box (advance≈em); preserveAspectRatio
-    // maps it onto the actual cell box (width:{w}ch × --lh).
+    emit_symbol_span(out, col, w, &box_style, font, &glyph, first);
+}
+
+/// Emit one SVG symbol span (already-escaped `glyph`, precomputed `box_style`)
+/// covering `w` columns at `col`. Shared by single symbol cells and merged fill
+/// runs — for a merged run, `w` is the run's total width and the one glyph stretches
+/// seamlessly across it (no per-cell box boundaries to gap at fractional zoom).
+fn emit_symbol_span(
+    out: &mut String,
+    col: u16,
+    w: u16,
+    box_style: &str,
+    font: &str,
+    glyph: &str,
+    first: char,
+) {
+    let fill = is_fill_glyph(first);
+    let par = if fill { "none" } else { "xMidYMid meet" };
+    // A fill glyph must span the whole box so lines tile, but a monospace glyph's
+    // advance is only ~0.6em, so a bare `none`-stretch of the 14-wide viewBox leaves
+    // ~40% blank — a horizontal divider renders as dashes. Force the glyph to fill
+    // the viewBox width with textLength, then `none` maps it onto the full box
+    // (width:{w}ch × --lh). Fit glyphs (icons) keep their aspect.
+    let stretch = if fill {
+        " textLength=\"14\" lengthAdjust=\"spacingAndGlyphs\""
+    } else {
+        ""
+    };
     let _ = write!(
         out,
         "<span class=\"run\" style=\"left:{col}ch;width:{w}ch;{box_style}\">\
          <svg viewBox=\"0 0 14 14\" preserveAspectRatio=\"{par}\" \
          style=\"display:block;width:100%;height:100%\">\
          <text x=\"0\" y=\"12\" font-family=\"{font}\" font-size=\"14\" \
-         fill=\"currentColor\">{glyph}</text></svg></span>"
+         fill=\"currentColor\"{stretch}>{glyph}</text></svg></span>"
     );
 }
 
@@ -334,6 +403,22 @@ fn is_fill_glyph(c: char) -> bool {
     // scale proportionally, not stretch. Octants (U+1CD00+) omitted until a font/tool
     // in the wild needs them; base fonts rarely carry the glyphs, so SVG'ing them
     // would just stretch tofu.
+}
+
+/// A fill glyph whose ink is uniform along x, so a run of it can render as ONE
+/// stretched span instead of N per-cell boxes — killing the sub-pixel seams that
+/// otherwise dash a long horizontal divider at fractional zoom. Restricted to solid
+/// horizontal strips: stretching a shade (`░▒▓`), a dashed line, or a left/right
+/// partial block across a run would smear its pattern, so those stay per-cell.
+fn is_mergeable_fill(c: char) -> bool {
+    matches!(
+        c,
+        '\u{2500}' | '\u{2501}' | '\u{2550}'  // ─ ━ ═ horizontal lines
+        | '\u{2588}'                          // █ full block
+        | '\u{2581}'
+            ..='\u{2587}'             // ▁▂▃▄▅▆▇ lower strips
+        | '\u{2594}' // ▔ upper strip
+    )
 }
 
 /// Font stack for rendering `cell` as a scaled SVG glyph, or `None` for plain text.
@@ -522,6 +607,11 @@ mod tests {
             html.contains("preserveAspectRatio=\"xMidYMid meet\""),
             "icon glyph should fit proportionally: {html}"
         );
+        // A fit glyph keeps its aspect — it must NOT be stretched to the cell width.
+        assert!(
+            !html.contains("textLength"),
+            "icon glyph should not be width-stretched: {html}"
+        );
     }
 
     #[test]
@@ -564,11 +654,57 @@ mod tests {
             html.contains("preserveAspectRatio=\"none\""),
             "box-drawing divider not stretch-filled: {html}"
         );
+        // ...and the glyph is forced to the full viewBox width, else a monospace
+        // advance (~0.6em) under-fills and horizontal lines render as dashes.
+        assert!(
+            html.contains(
+                "fill=\"currentColor\" textLength=\"14\" lengthAdjust=\"spacingAndGlyphs\">"
+            ),
+            "fill glyph not stretched to the full cell width: {html}"
+        );
         // A legacy-computing sextant (U+1FB00) tiles like a block element too.
         let sextant = render_fragment(&grid_from("\u{1FB00}", 2, 1), &cfg, &res);
         assert!(
             sextant.contains("preserveAspectRatio=\"none\""),
             "legacy sextant not stretch-filled: {sextant}"
+        );
+    }
+
+    #[test]
+    fn horizontal_divider_run_merges_into_one_span() {
+        // A run of the same solid horizontal line renders as ONE stretched span, not
+        // five — so there are no per-cell box seams to dash the line at fractional
+        // zoom. The single span spans the whole run width.
+        let cfg = Config::default();
+        let res = Resolver::build(&cfg).unwrap();
+        let html = render_fragment(
+            &grid_from("\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}", 5, 1),
+            &cfg,
+            &res,
+        );
+        assert_eq!(
+            html.matches("<svg ").count(),
+            1,
+            "divider run not merged: {html}"
+        );
+        assert!(
+            html.contains("style=\"left:0ch;width:5ch;"),
+            "merged divider doesn't span the whole run: {html}"
+        );
+        // Shades must NOT merge — stretching one across the run would smear the
+        // pattern — so a run of `░` stays one box per cell.
+        let shade = render_fragment(&grid_from("\u{2591}\u{2591}\u{2591}", 3, 1), &cfg, &res);
+        assert_eq!(
+            shade.matches("<svg ").count(),
+            3,
+            "shade wrongly merged: {shade}"
+        );
+        // Different adjacent glyphs don't merge: `┼` between two `─` breaks the run.
+        let mixed = render_fragment(&grid_from("\u{2500}\u{253C}\u{2500}", 3, 1), &cfg, &res);
+        assert_eq!(
+            mixed.matches("<svg ").count(),
+            3,
+            "distinct glyphs merged: {mixed}"
         );
     }
 
