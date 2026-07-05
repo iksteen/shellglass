@@ -112,28 +112,27 @@ test("wide cells advance two columns", () => {
   assert.match(split, /left:2ch;width:1ch;font-weight:bold;">a</);
 });
 
-test("box-drawing lines route to the canvas as transparent (selectable) text", () => {
-  // │ ─ ┼ etc. are drawn on the overlay canvas; the DOM keeps the real glyph as
-  // transparent text (no SVG) so it stays selectable/copyable.
-  assert.ok(isCanvasGlyph("│".codePointAt(0)!));
-  assert.ok(isCanvasGlyph("┼".codePointAt(0)!));
-  const box = renderRow([{ t: "│" }], -1);
-  assert.doesNotMatch(box, /<svg/);
-  assert.match(box, /color:transparent">│<\/span>/);
-  // A block glyph (not a line) is NOT a canvas glyph — still a stretched SVG.
-  assert.ok(!isCanvasGlyph("█".codePointAt(0)!));
-  assert.match(renderRow([{ t: "█" }], -1), /<svg /);
+test("all box-drawing + block glyphs route to the canvas as transparent text", () => {
+  // The whole U+2500–259F range draws on the overlay canvas; the DOM keeps the real
+  // glyph as transparent text (no SVG) so it stays selectable/copyable.
+  for (let cp = 0x2500; cp <= 0x259f; cp++) {
+    assert.ok(isCanvasGlyph(cp), `U+${cp.toString(16)} should be canvas-routed`);
+  }
+  for (const g of ["│", "┼", "═", "╭", "░", "█", "▚"]) {
+    const html = renderRow([{ t: g }], -1);
+    assert.doesNotMatch(html, /<svg/, `${g} emitted SVG`);
+    assert.match(html, new RegExp(`color:transparent">${g}</span>`), `${g} not transparent`);
+  }
 });
 
-test("block fill runs still merge into one SVG; lines don't (they're canvas)", () => {
-  // █ is a mergeable fill glyph and not canvas-routed → one stretched span.
-  const bar = renderRow([{ t: "█" }, { t: "█" }, { t: "█" }], -1);
-  assert.equal((bar.match(/<svg /g) ?? []).length, 1, "block run not merged");
-  assert.match(bar, /left:0ch;width:3ch;/);
-  // A line run is canvas-routed: per-cell transparent spans, no SVG.
-  const div = renderRow([{ t: "─" }, { t: "─" }, { t: "─" }], -1);
-  assert.equal((div.match(/<svg /g) ?? []).length, 0, "line run went to SVG");
-  assert.equal((div.match(/color:transparent/g) ?? []).length, 3, "line cells not transparent");
+test("non-canvas fill glyphs (powerline/legacy) still take the SVG path", () => {
+  // Only 2500–259F moved to the canvas; powerline separators and legacy-computing
+  // glyphs are outside it and keep the stretched-SVG font path.
+  for (const cp of [0xe0b0, 0x1fb00]) {
+    assert.ok(!isCanvasGlyph(cp));
+    assert.ok(isFillGlyph(cp));
+    assert.match(renderRow([{ t: String.fromCodePoint(cp) }], -1), /<svg /);
+  }
 });
 
 test("patchCells writes line patches and reports dirty rows", () => {
