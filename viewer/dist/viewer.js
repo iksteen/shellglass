@@ -198,14 +198,24 @@ function drawArms(x0, y0, x1, y1, arms) {
     const [u, r, d, l] = arms;
     const midX = Math.round((x0 + x1) / 2);
     const midY = Math.round((y0 + y1) / 2);
-    const vw = lineWidth(Math.max(u, d));
-    const hw = lineWidth(Math.max(l, r));
-    const hvw = vw >> 1;
-    const hhw = hw >> 1;
-    if (u || d)
-        ctx.fillRect(midX - hvw, u ? y0 : midY - hhw, vw, (d ? y1 : midY + hhw) - (u ? y0 : midY - hhw));
-    if (l || r)
-        ctx.fillRect(l ? x0 : midX - hvw, midY - hhw, (r ? x1 : midX + hvw) - (l ? x0 : midX - hvw), hw);
+    const vh = lineWidth(Math.max(u, d)) >> 1;
+    const hh = lineWidth(Math.max(l, r)) >> 1;
+    if (u) {
+        const t = lineWidth(u);
+        ctx.fillRect(midX - (t >> 1), y0, t, midY + hh - y0);
+    }
+    if (d) {
+        const t = lineWidth(d);
+        ctx.fillRect(midX - (t >> 1), midY - hh, t, y1 - (midY - hh));
+    }
+    if (l) {
+        const t = lineWidth(l);
+        ctx.fillRect(x0, midY - (t >> 1), midX + vh - x0, t);
+    }
+    if (r) {
+        const t = lineWidth(r);
+        ctx.fillRect(midX - vh, midY - (t >> 1), x1 - (midX - vh), t);
+    }
 }
 function drawDashes(x0, y0, x1, y1, cp) {
     let horiz, n, weight;

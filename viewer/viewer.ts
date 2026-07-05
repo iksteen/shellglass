@@ -337,18 +337,19 @@ function cellRect(r: number, c: number): [number, number, number, number] {
   ];
 }
 
-// Box-drawing arms (lines, corners, tees, crosses, half-lines): a vertical and/or
-// horizontal bar meeting at centre. Per-axis max weight (light/heavy).
+// Box-drawing arms (lines, corners, tees, crosses, half-lines). Each of the four arms
+// is drawn with its OWN weight (so mixed light/heavy junctions like ┿ ╁ ┞ are faithful),
+// extended past centre by the crossing bar's half-extent so the junction fills solid.
 function drawArms(x0: number, y0: number, x1: number, y1: number, arms: [number, number, number, number]): void {
   const [u, r, d, l] = arms;
   const midX = Math.round((x0 + x1) / 2);
   const midY = Math.round((y0 + y1) / 2);
-  const vw = lineWidth(Math.max(u, d));
-  const hw = lineWidth(Math.max(l, r));
-  const hvw = vw >> 1;
-  const hhw = hw >> 1;
-  if (u || d) ctx!.fillRect(midX - hvw, u ? y0 : midY - hhw, vw, (d ? y1 : midY + hhw) - (u ? y0 : midY - hhw));
-  if (l || r) ctx!.fillRect(l ? x0 : midX - hvw, midY - hhw, (r ? x1 : midX + hvw) - (l ? x0 : midX - hvw), hw);
+  const vh = lineWidth(Math.max(u, d)) >> 1; // half-width of the vertical bar
+  const hh = lineWidth(Math.max(l, r)) >> 1; // half-height of the horizontal bar
+  if (u) { const t = lineWidth(u); ctx!.fillRect(midX - (t >> 1), y0, t, midY + hh - y0); }
+  if (d) { const t = lineWidth(d); ctx!.fillRect(midX - (t >> 1), midY - hh, t, y1 - (midY - hh)); }
+  if (l) { const t = lineWidth(l); ctx!.fillRect(x0, midY - (t >> 1), midX + vh - x0, t); }
+  if (r) { const t = lineWidth(r); ctx!.fillRect(midX - vh, midY - (t >> 1), x1 - (midX - vh), t); }
 }
 
 function drawDashes(x0: number, y0: number, x1: number, y1: number, cp: number): void {
