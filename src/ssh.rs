@@ -25,7 +25,7 @@ use russh::{Channel, ChannelId};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
 
@@ -46,22 +46,18 @@ impl Target {
     }
 }
 
-/// Client terminal state shared from the handler to the render task: current size
-/// (updated by pty/window-change requests) and a quit flag (set by a quit keystroke).
+/// Client terminal size, shared from the handler to the render task (updated by
+/// pty-req / window-change). Quit is detected in the render task itself, from the
+/// input it drains off the channel — see [`view_loop`].
 #[derive(Clone, Copy)]
 struct Ctl {
     cols: u16,
     rows: u16,
-    quit: bool,
 }
 
 impl Default for Ctl {
     fn default() -> Self {
-        Ctl {
-            cols: 80,
-            rows: 24,
-            quit: false,
-        }
+        Ctl { cols: 80, rows: 24 }
     }
 }
 
@@ -262,65 +258,80 @@ impl Handler for SshHandler {
         Ok(())
     }
 
-    async fn data(
-        &mut self,
-        _channel: ChannelId,
-        data: &[u8],
-        _session: &mut Session,
-    ) -> Result<()> {
-        // Quit only on a lone quit keypress — scanning the whole chunk would let
-        // pasted text or a multi-byte key sequence (e.g. SS3 `\x1bOq`) that merely
-        // contains these bytes disconnect the viewer. ESC is deliberately not a quit
-        // key — it's the prefix of arrow-key sequences.
-        if matches!(data, [b'q'] | [0x03] | [0x04]) {
-            self.ctl.send_modify(|c| c.quit = true);
-        }
-        Ok(())
-    }
+    // No `data` override: input is drained (and quit-detected) by the render task,
+    // which reads the channel directly. Relying on `Handler::data` alone would leave
+    // the channel's own inbound buffer unread — russh enqueues every byte there too
+    // (a `data.clone()` before the callback), and once it fills (default 100) russh's
+    // per-connection select blocks in `chan.send().await`, wedging the whole
+    // connection bidirectionally. Reading the channel is what actually drains it.
 }
 
 /// Render `live` to the SSH channel until the client quits or the connection drops.
 /// Subscribes to ticks first, then always paints the latest snapshot — see the module
 /// docs for why bursts/lag collapse to "newest frame".
-async fn view_loop(channel: Channel<Msg>, live: Arc<diff::Live>, mut ctl: watch::Receiver<Ctl>) {
-    // Pin so AsyncWriteExt methods (which need Unpin) work on the returned writer.
+///
+/// Crucially it also **reads** the channel every iteration. That drains russh's
+/// per-channel inbound buffer (which it fills on every keystroke regardless of the
+/// `data` callback); leaving it unread wedges the whole connection once it hits the
+/// buffer cap. The read doubles as quit detection.
+async fn view_loop(
+    mut channel: Channel<Msg>,
+    live: Arc<diff::Live>,
+    mut ctl: watch::Receiver<Ctl>,
+) {
+    // make_writer returns a 'static writer (owns a sender clone), so it doesn't borrow
+    // `channel` — leaving `channel` free to lend `make_reader` a &mut below. Pin so the
+    // AsyncWriteExt methods (which need Unpin) work.
     let mut w = Box::pin(channel.make_writer());
     // Alt screen + hidden cursor + clear.
     if w.write_all(b"\x1b[?1049h\x1b[?25l\x1b[2J").await.is_err() {
         return;
     }
     let mut ticks = live.ticks();
-    let mut last: Option<Arc<Frame>> = None;
-    loop {
-        let ctl_now = *ctl.borrow_and_update();
-        if ctl_now.quit {
-            break;
-        }
-        let frame = live.frame();
-        let changed = last.as_ref().is_none_or(|l| !Arc::ptr_eq(l, &frame));
-        if changed {
-            let bytes = ansi::paint(last.as_deref(), &frame, (ctl_now.cols, ctl_now.rows));
-            // write_all is the backpressure point: while it blocks on the SSH window,
-            // ticks pile up and the next iteration skips straight to the latest frame.
-            if w.write_all(bytes.as_bytes()).await.is_err() || w.flush().await.is_err() {
-                break;
-            }
-            last = Some(frame);
-        }
-        tokio::select! {
-            r = ticks.recv() => match r {
-                Ok(_) => {}                                        // tick: repaint latest
-                Err(broadcast::error::RecvError::Lagged(_)) => {}  // fell behind: catch up
-                Err(broadcast::error::RecvError::Closed) => break, // publisher gone
-            },
-            // Resize (or quit) → full repaint / re-evaluate on the next iteration.
-            res = ctl.changed() => {
-                if res.is_err() {
+    {
+        let mut reader = Box::pin(channel.make_reader());
+        let mut inbuf = [0u8; 256];
+        let mut last: Option<Arc<Frame>> = None;
+        loop {
+            let (cols, rows) = {
+                let c = *ctl.borrow_and_update();
+                (c.cols, c.rows)
+            };
+            let frame = live.frame();
+            let changed = last.as_ref().is_none_or(|l| !Arc::ptr_eq(l, &frame));
+            if changed {
+                let bytes = ansi::paint(last.as_deref(), &frame, (cols, rows));
+                // write_all is the backpressure point: while it blocks on the SSH
+                // window, ticks pile up and the next iteration skips to the latest frame.
+                if w.write_all(bytes.as_bytes()).await.is_err() || w.flush().await.is_err() {
                     break;
                 }
-                last = None;
+                last = Some(frame);
+            }
+            tokio::select! {
+                r = ticks.recv() => match r {
+                    Ok(_) => {}                                        // tick: repaint latest
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}  // fell behind: catch up
+                    Err(broadcast::error::RecvError::Closed) => break, // publisher gone
+                },
+                // Resize → full repaint on the next iteration.
+                res = ctl.changed() => {
+                    if res.is_err() {
+                        break;
+                    }
+                    last = None;
+                }
+                // Drain client input (keeps russh's inbound buffer from filling). A lone
+                // q / Ctrl-C / Ctrl-D quits; anything else — pastes, arrow-key/SS3
+                // sequences, mouse reports — is read and discarded (read-only viewer).
+                res = reader.read(&mut inbuf) => match res {
+                    Ok(0) | Err(_) => break, // EOF / error → client gone
+                    Ok(n) if matches!(&inbuf[..n], [b'q'] | [0x03] | [0x04]) => break,
+                    Ok(_) => {}
+                }
             }
         }
+        // `reader` drops here, releasing its &mut borrow of `channel` for the cleanup.
     }
     // Best-effort restore: leave alt screen, show cursor, end the channel.
     let _ = w.write_all(b"\x1b[?1049l\x1b[?25h").await;
