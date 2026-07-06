@@ -236,9 +236,17 @@ impl Live {
                 Event::default().id(seq.to_string()).data(&*data),
             ))
         });
-        Sse::new(hello.chain(head).chain(tail))
+        let mut resp = Sse::new(hello.chain(head).chain(tail))
             .keep_alive(KeepAlive::default())
-            .into_response()
+            .into_response();
+        // Tell nginx (and other proxies that honor it) not to buffer this response:
+        // its default `proxy_buffering on` batches SSE events and defeats realtime
+        // push. Harmless where unrecognized. The stream is never compressed either.
+        resp.headers_mut().insert(
+            "x-accel-buffering",
+            axum::http::HeaderValue::from_static("no"),
+        );
+        resp
     }
 }
 
