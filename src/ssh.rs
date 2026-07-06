@@ -20,14 +20,14 @@ use anyhow::{Context, Result};
 use russh::keys::ssh_key::LineEnding;
 use russh::keys::ssh_key::private::Ed25519Keypair;
 use russh::keys::{HashAlg, PrivateKey};
-use russh::server::{Auth, ChannelOpenHandle, Config, Handler, Msg, Server, Session};
+use russh::server::{Auth, ChannelOpenHandle, Config, Handler, Msg, Session, run_stream};
 use russh::{Channel, ChannelId};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, watch};
 
 /// Which sessions the SSH server exposes: the one standalone session (username
 /// ignored), or a hub's session table keyed by the id in the username.
@@ -79,9 +79,20 @@ pub fn setup(addr: SocketAddr, key_path: Option<&Path>, hint_user: &str) -> Resu
     Ok(key)
 }
 
+/// Cap on concurrent *pre-auth* SSH connections — the SSH analogue of sshd's
+/// `MaxStartups`. Auth accepts everyone, so the cheap flood is opening sockets and
+/// stalling in the handshake: each holds a socket + task at no cost to the attacker.
+/// We hand-roll the accept loop russh's `run_on_socket` would otherwise own so every
+/// connection takes a permit for the handshake phase and *releases it the moment auth
+/// completes* — established viewers don't count against the cap, only connections
+/// still handshaking. At the cap a new connection is dropped immediately (freeing the
+/// fd) rather than queued; the inactivity timeout cycles slots held by pre-auth
+/// stalls. ponytail: flat cap — plenty for this tool's scale.
+const MAX_PREAUTH_CONNS: usize = 1024;
+
 /// Run the SSH viewer server on an already-bound listener until it stops.
 pub async fn serve(listener: TcpListener, key: PrivateKey, target: Target) -> Result<()> {
-    let config = Config {
+    let config = Arc::new(Config {
         keys: vec![key],
         // Bound every connection's idle time. Its most important job is the pre-auth
         // handshake: russh wraps the initial SSH-banner read in this timeout, so with
@@ -98,27 +109,40 @@ pub async fn serve(listener: TcpListener, key: PrivateKey, target: Target) -> Re
         keepalive_interval: Some(std::time::Duration::from_secs(30)),
         nodelay: true,
         ..Default::default()
-    };
-    let mut server = SshServer { target };
-    server.run_on_socket(Arc::new(config), &listener).await?;
-    Ok(())
-}
-
-struct SshServer {
-    target: Target,
-}
-
-impl Server for SshServer {
-    type Handler = SshHandler;
-    fn new_client(&mut self, _peer: Option<SocketAddr>) -> SshHandler {
-        let (ctl, _) = watch::channel(Ctl::default());
-        SshHandler {
-            target: self.target.clone(),
-            user: String::new(),
-            channel: None,
-            saw_pty: false,
-            ctl,
+    });
+    let slots = Arc::new(Semaphore::new(MAX_PREAUTH_CONNS));
+    loop {
+        let (socket, _peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            // A transient accept error (momentary fd exhaustion, etc.) shouldn't kill
+            // the whole SSH server — log and keep accepting.
+            Err(e) => {
+                eprintln!("shellglass ssh: accept error: {e}");
+                continue;
+            }
+        };
+        // At the cap: drop the socket now (its fd closes) rather than hold it — not
+        // accumulating fds is the whole point. ponytail: silent drop; logging every
+        // rejected connection under a flood would be its own log-spam DoS.
+        let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
+            drop(socket);
+            continue;
+        };
+        if config.nodelay {
+            let _ = socket.set_nodelay(true);
         }
+        // The permit moves into the handler, which drops it on auth success (or when
+        // the handler drops — a handshake that fails or stalls out — releasing the
+        // pre-auth slot either way).
+        let handler = SshHandler::new(target.clone(), permit);
+        let config = Arc::clone(&config);
+        tokio::spawn(async move {
+            // Handshake failure (bad SSH banner, kex) drops the connection silently —
+            // every port scanner trips it, so logging would be noise.
+            if let Ok(session) = run_stream(config, socket, handler).await {
+                let _ = session.await;
+            }
+        });
     }
 }
 
@@ -128,6 +152,34 @@ struct SshHandler {
     channel: Option<Channel<Msg>>,
     saw_pty: bool,
     ctl: watch::Sender<Ctl>,
+    /// Held for the pre-auth handshake; dropped on auth success (see [`accept`]) so
+    /// established connections don't count against [`MAX_PREAUTH_CONNS`].
+    ///
+    /// [`accept`]: SshHandler::accept
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl SshHandler {
+    fn new(target: Target, permit: OwnedSemaphorePermit) -> Self {
+        let (ctl, _) = watch::channel(Ctl::default());
+        SshHandler {
+            target,
+            user: String::new(),
+            channel: None,
+            saw_pty: false,
+            ctl,
+            permit: Some(permit),
+        }
+    }
+
+    /// Accept auth: record the username (the id is the capability) and release the
+    /// pre-auth permit — the handshake is done, so this connection stops occupying a
+    /// startup slot.
+    fn accept(&mut self, user: &str) -> Auth {
+        self.user = user.to_string();
+        self.permit = None;
+        Auth::Accept
+    }
 }
 
 impl SshHandler {
@@ -153,13 +205,11 @@ impl Handler for SshHandler {
     // The id in the username is the capability, so every method accepts; `auth_none`
     // means `ssh id@host` connects with no password prompt.
     async fn auth_none(&mut self, user: &str) -> Result<Auth> {
-        self.user = user.to_string();
-        Ok(Auth::Accept)
+        Ok(self.accept(user))
     }
 
     async fn auth_password(&mut self, user: &str, _password: &str) -> Result<Auth> {
-        self.user = user.to_string();
-        Ok(Auth::Accept)
+        Ok(self.accept(user))
     }
 
     async fn auth_publickey(
@@ -167,8 +217,7 @@ impl Handler for SshHandler {
         user: &str,
         _key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<Auth> {
-        self.user = user.to_string();
-        Ok(Auth::Accept)
+        Ok(self.accept(user))
     }
 
     async fn channel_open_session(
