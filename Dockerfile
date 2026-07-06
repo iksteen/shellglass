@@ -21,9 +21,11 @@ COPY --from=build /src/target/release/shellglass /usr/local/bin/shellglass
 # certificate across restarts (pass --acme-cache /data/acme).
 VOLUME /data
 USER shellglass
-EXPOSE 443
 ENTRYPOINT ["shellglass"]
-# Override with your own flags, e.g.:
+# Override with your own flags. Behind a TLS-terminating reverse proxy (it handles
+# HTTPS and forwards plain HTTP — e.g. Traefik):
+#   docker run -v shellglass-data:/data IMAGE hub --bind 0.0.0.0:80 --allow <ID>
+# Or terminate TLS in-process via ACME (no proxy):
 #   docker run -p 443:443 -v shellglass-acme:/data IMAGE \
 #     hub --bind 0.0.0.0:443 --allow <ID> \
 #     --acme-domain hub.example.com --acme-email you@example.com \

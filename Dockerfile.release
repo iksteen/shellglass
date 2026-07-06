@@ -17,6 +17,5 @@ RUN chmod +x /usr/local/bin/shellglass
 # certificate across restarts (pass --acme-cache /data/acme).
 VOLUME /data
 USER shellglass
-EXPOSE 443
 ENTRYPOINT ["shellglass"]
 CMD ["--help"]
