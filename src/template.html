@@ -42,6 +42,15 @@ a { color:var(--accent-2); text-decoration:none; }
   70%  { box-shadow:0 0 0 7px transparent; }
   100% { box-shadow:0 0 0 0 transparent; }
 }
+/* Not live — viewer.ts sets body[data-offline="hub"|"operator"] when the SSE link
+   drops or (hub mode) the operator stops pushing: the orb goes red and pulses
+   faster/harder as an at-a-glance signal that what you're seeing is frozen. */
+body[data-offline] .dot { background:#ef4444; animation:pulse-off 1s infinite; }
+@keyframes pulse-off {
+  0%   { box-shadow:0 0 0 0 rgba(239,68,68,.6); }
+  70%  { box-shadow:0 0 0 8px transparent; }
+  100% { box-shadow:0 0 0 0 transparent; }
+}
 .nav .meta { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12.5px; color:var(--text-mute); }
 .nav-right { display:flex; align-items:center; gap:16px; }
 .toggle { display:inline-flex; align-items:center; gap:7px; cursor:pointer; user-select:none;
@@ -136,7 +145,7 @@ footer { max-width:1140px; width:100%; margin:0 auto; padding:14px clamp(16px,5v
 @keyframes crt-sweep { 0% { background-position:0 -30%; } 100% { background-position:0 130%; } }
 @keyframes crt-flicker { 0% { opacity:.86; } 100% { opacity:1; } }
 @media (prefers-reduced-motion: reduce) {
-  .crt-scan, .crt-bar, .dot { animation:none; }
+  .crt-scan, .crt-bar, .dot, body[data-offline] .dot, .offline text { animation:none; }
 }
 /* Header toggle: unchecking "CRT" flattens the tube — hide the overlays and drop
    phosphor bloom, chromatic fringe, glass curve + vignette, leaving plain text.
@@ -153,6 +162,30 @@ body:has(#crt:not(:checked)) #screen { filter:none; text-shadow:none; }
 /* Hug the terminal so the panel shrink-wraps it, and so the ResizeObserver in the
    fit script below fires on grid width changes too (not just height). */
 #screen { width:fit-content; }
+
+/* ── Offline takeover ───────────────────────────────────────────────────────
+   When the stream isn't live, cover the terminal with a big label: "HUB OFFLINE"
+   (viewer.ts can't reach the server) or "OPERATOR OFFLINE" (server up, push source
+   gone). The label is an SVG that scales to fill the panel — textLength fills the
+   width, font-size fills the height, preserveAspectRatio letterboxes the rest — so
+   it's dramatic at any terminal size with no measuring JS. Sits above the CRT
+   overlays (z-index) and paints an opaque backdrop, so it replaces the frozen
+   screen rather than layering over it. */
+.offline {
+  position:absolute; inset:0; z-index:20; display:none;
+  align-items:center; justify-content:center; padding:8% 6%;
+  background:#040705; border-radius:inherit;
+}
+.offline svg { display:none; width:100%; height:100%;
+  filter:drop-shadow(0 0 16px rgba(239,68,68,.45)); }
+.offline text {
+  fill:#ef4444; font-family:var(--sans); font-weight:800; font-size:140px;
+  letter-spacing:.02em; animation:offline-pulse 1.3s ease-in-out infinite;
+}
+@keyframes offline-pulse { 0%,100% { opacity:1; } 50% { opacity:.45; } }
+body[data-offline] .offline { display:flex; }
+body[data-offline="hub"] .offline .off-hub { display:block; }
+body[data-offline="operator"] .offline .off-op { display:block; }
 </style>
 </head>
 <body>
@@ -188,6 +221,16 @@ body:has(#crt:not(:checked)) #screen { filter:none; text-shadow:none; }
       <div class="crt-scan"></div>
       <div class="crt-bar"></div>
       <div class="crt-vig"></div>
+    </div>
+    <div class="offline" aria-hidden="true">
+      <svg class="off-hub" viewBox="0 0 1000 170" preserveAspectRatio="xMidYMid meet">
+        <text x="500" y="85" text-anchor="middle" dominant-baseline="central"
+              textLength="950" lengthAdjust="spacingAndGlyphs">HUB OFFLINE</text>
+      </svg>
+      <svg class="off-op" viewBox="0 0 1000 170" preserveAspectRatio="xMidYMid meet">
+        <text x="500" y="85" text-anchor="middle" dominant-baseline="central"
+              textLength="950" lengthAdjust="spacingAndGlyphs">OPERATOR OFFLINE</text>
+      </svg>
     </div>
   </div>
 </main>

@@ -316,6 +316,15 @@ async fn push_session(st: HubState, id: String, base: String, mut socket: WebSoc
             }
         }
     }
+    // Pusher gone (drop, error, or shutdown): flag the operator offline so viewers
+    // see the session is no longer live. The session + last frame are kept, so the
+    // frozen screen stays up. `None` = died before registering; nothing to flag.
+    // ponytail: last-writer-wins if two pushers share one id — the rarer one exiting
+    // marks the session offline while the other still streams. Single-pusher is the
+    // norm; add a refcount if concurrent pushers become real.
+    if let Some(l) = &live {
+        l.set_online(false);
+    }
 }
 
 /// Create or refresh the session for `id` from a register message and return its
@@ -340,6 +349,9 @@ fn register_session(
         s.template = reg.template;
         s.render_cfg = reg.render_cfg;
         s.fonts = fonts;
+        // A reconnect: the operator is back (push_session marked it offline on the
+        // previous drop). New sessions start online, so only this branch needs it.
+        s.live.set_online(true);
         Arc::clone(&s.live)
     } else {
         let live = diff::Live::new(Arc::new(Frame::Banner(render::banner(

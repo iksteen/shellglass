@@ -713,10 +713,29 @@ export function apply(m) {
     else
         applyDiff(m);
 }
+let sseDown = false;
+let operatorDown = false;
+function refreshLive() {
+    const state = sseDown ? "hub" : operatorDown ? "operator" : "";
+    if (state)
+        document.body.dataset.offline = state;
+    else
+        delete document.body.dataset.offline;
+}
 function connect(events) {
     const es = new EventSource(events);
+    es.onopen = () => {
+        sseDown = false;
+        refreshLive();
+    };
     es.onmessage = (e) => apply(JSON.parse(e.data));
+    es.addEventListener("operator", (e) => {
+        operatorDown = e.data === "0";
+        refreshLive();
+    });
     es.onerror = () => {
+        sseDown = true;
+        refreshLive();
         if (es.readyState === EventSource.CLOSED) {
             setTimeout(() => connect(events), 2000);
         }

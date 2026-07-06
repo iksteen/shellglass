@@ -54,6 +54,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{broadcast, watch};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::WatchStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use crate::model::{Color, Frame, Grid, StyledCell};
@@ -106,6 +107,12 @@ pub struct Live {
     /// Serializes publishers; connects never touch it.
     writer: Mutex<()>,
     diffs: broadcast::Sender<(u64, Arc<str>)>,
+    /// Operator (push source) presence, surfaced to viewers as a named `operator`
+    /// SSE event (`1`/`0`) alongside the frame stream — the hub flips it on push
+    /// (re)connect and on push disconnect. Standalone leaves it `true`: there the
+    /// operator IS the process, and its death drops the SSE stream instead. A `watch`
+    /// so a viewer connecting mid-outage reads the current value, not just changes.
+    online: watch::Sender<bool>,
 }
 
 impl Live {
@@ -113,6 +120,7 @@ impl Live {
     /// first real frame will see).
     pub fn new(initial: Arc<Frame>) -> Arc<Live> {
         let (diffs, _) = broadcast::channel(BACKLOG);
+        let (online, _) = watch::channel(true);
         Arc::new(Live {
             state: ArcSwap::from_pointee(State {
                 seq: 0,
@@ -121,6 +129,7 @@ impl Live {
             }),
             writer: Mutex::new(()),
             diffs,
+            online,
         })
     }
 
@@ -201,6 +210,13 @@ impl Live {
         Arc::clone(&self.state.load().frame)
     }
 
+    /// Mark the operator (push source) online/offline. Every connected viewer gets
+    /// an `operator` SSE event at once, and viewers connecting later read the current
+    /// value. Hub-only in practice (see the `online` field).
+    pub fn set_online(&self, on: bool) {
+        self.online.send_replace(on);
+    }
+
     /// Subscribe a viewer: an SSE response that emits a full snapshot first, then
     /// each broadcast delta. **Takes no locks** — subscribe first, snapshot second,
     /// and skip deltas the snapshot already covers (seq ≤ snapshot's). On `Lagged`
@@ -236,7 +252,19 @@ impl Live {
                 Event::default().id(seq.to_string()).data(&*data),
             ))
         });
-        let mut resp = Sse::new(hello.chain(head).chain(tail))
+        // Operator-presence stream, merged in as named `operator` events (1/0). Its
+        // own channel (a watch, current value on subscribe) so it's independent of
+        // the frame seq/snapshot reconciliation and carries no `id:` (mustn't move
+        // lastEventId). A named event → the renderer handles it separately from the
+        // wire messages, so this needs no PROTO bump.
+        let status = WatchStream::new(self.online.subscribe()).map(|on| {
+            Ok::<_, Infallible>(
+                Event::default()
+                    .event("operator")
+                    .data(if on { "1" } else { "0" }),
+            )
+        });
+        let mut resp = Sse::new(hello.chain(head).chain(tail).merge(status))
             .keep_alive(KeepAlive::default())
             .into_response();
         // Tell nginx (and other proxies that honor it) not to buffer this response:

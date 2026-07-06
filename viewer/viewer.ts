@@ -960,10 +960,37 @@ export function apply(m: Msg): void {
 // CLOSED with a fixed retry; the server sends a full frame on every (re)connect,
 // so no client state needs resetting. The last screen stays frozen meanwhile.
 // ponytail: fixed 2s retry, no backoff — it's one idle HTTP request per tick.
+// Two independent "not live" sources drive the page chrome: the SSE link to the
+// server, and — in hub mode — the operator (push source) behind it, reported via a
+// named `operator` event (1/0). We publish the combined state as
+// body[data-offline="hub"|"operator"] (absent = live); the default template pulses
+// its header orb red and drops a big sized-to-fit label over the terminal. A lost
+// SSE link ("HUB OFFLINE") outranks a gone operator — if we can't reach the server,
+// its last operator status is stale. Harmless for a custom template that ignores
+// the attribute, and for standalone (no `operator` events, so a dead source lands
+// as the SSE link dropping).
+let sseDown = false;
+let operatorDown = false;
+function refreshLive(): void {
+  const state = sseDown ? "hub" : operatorDown ? "operator" : "";
+  if (state) document.body.dataset.offline = state;
+  else delete document.body.dataset.offline;
+}
+
 function connect(events: string): void {
   const es = new EventSource(events);
+  es.onopen = () => {
+    sseDown = false;
+    refreshLive();
+  };
   es.onmessage = (e) => apply(JSON.parse(e.data) as Msg);
+  es.addEventListener("operator", (e) => {
+    operatorDown = (e as MessageEvent).data === "0";
+    refreshLive();
+  });
   es.onerror = () => {
+    sseDown = true;
+    refreshLive();
     if (es.readyState === EventSource.CLOSED) {
       setTimeout(() => connect(events), 2000);
     }
