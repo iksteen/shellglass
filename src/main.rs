@@ -405,10 +405,16 @@ async fn serve_hub(
         }
     }
     let app = hub::app(hub_state);
+    // ConnectInfo::<SocketAddr> so auth-failure logging can record the source IP
+    // (fail2ban) — required on every serving path or the extractor 500s.
+    let make = || {
+        app.clone()
+            .into_make_service_with_connect_info::<std::net::SocketAddr>()
+    };
     match tls {
         Tls::None => {
             println!("shellglass hub at http://{local}/");
-            axum::serve(listener, app).await?;
+            axum::serve(listener, make()).await?;
         }
         Tls::Static { cert, key } => {
             use axum_server::tls_rustls::RustlsConfig;
@@ -418,7 +424,7 @@ async fn serve_hub(
             let std_listener = listener.into_std()?;
             println!("shellglass hub at https://{local}/");
             axum_server::from_tcp_rustls(std_listener, config)?
-                .serve(app.into_make_service())
+                .serve(make())
                 .await?;
         }
         Tls::Acme {
@@ -458,7 +464,7 @@ async fn serve_hub(
             println!("shellglass hub at https://{local}/ (ACME {env}: {domains:?})");
             axum_server::from_tcp(std_listener)?
                 .acceptor(acceptor)
-                .serve(app.into_make_service())
+                .serve(make())
                 .await?;
         }
     }

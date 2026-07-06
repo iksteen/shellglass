@@ -15,7 +15,7 @@ use crate::model::Frame;
 use crate::proto::{self, KEY_HEADER, session_id};
 use crate::render;
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
@@ -24,6 +24,7 @@ use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio_stream::StreamExt;
 use tower_http::compression::CompressionLayer;
@@ -72,14 +73,45 @@ impl HubState {
 /// Resolve a request's key to its (allowed) session id, or the status to reject
 /// with: `401` if no key, `403` if the key isn't pre-registered on the hub.
 /// Hashes the key once (Argon2 is deliberately expensive).
-fn authorize(st: &HubState, headers: &HeaderMap) -> Result<String, StatusCode> {
-    let key = key_of(headers).ok_or(StatusCode::UNAUTHORIZED)?;
+///
+/// Every rejection logs a parseable line to stderr for fail2ban: the argon2 grind
+/// on an unregistered key is a DoS vector, so an operator can ban a source IP that
+/// keeps failing. `peer` is the real TCP source (unspoofable); `client` prefers
+/// `X-Forwarded-For` for the proxied case — see [`reject_ip`].
+fn authorize(
+    st: &HubState,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+    route: &str,
+) -> Result<String, StatusCode> {
+    let Some(key) = key_of(headers) else {
+        log_reject(headers, peer, route, StatusCode::UNAUTHORIZED);
+        return Err(StatusCode::UNAUTHORIZED);
+    };
     let id = session_id(&key);
     if st.allowed.contains(&id) {
         Ok(id)
     } else {
+        log_reject(headers, peer, route, StatusCode::FORBIDDEN);
         Err(StatusCode::FORBIDDEN)
     }
+}
+
+/// Parseable auth-failure line for fail2ban. `client` is the effective client IP
+/// (first `X-Forwarded-For` hop if present, else the socket peer); `peer` is always
+/// the raw TCP source so a directly-exposed hub can ban on it — XFF is
+/// attacker-controlled unless a trusted proxy sets it.
+fn log_reject(headers: &HeaderMap, peer: SocketAddr, route: &str, code: StatusCode) {
+    let client = header_str(headers, "x-forwarded-for")
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map_or_else(|| peer.ip().to_string(), str::to_string);
+    eprintln!(
+        "shellglass: push auth failure {} on {route} client={client} peer={}",
+        code.as_u16(),
+        peer.ip()
+    );
 }
 
 pub fn app(state: HubState) -> Router {
@@ -140,10 +172,11 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 /// Store (or refresh) a session's CSS and served fonts. Creates the session if new.
 async fn register(
     State(st): State<HubState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(reg): Json<proto::RegisterBody>,
 ) -> Response {
-    let id = match authorize(&st, &headers) {
+    let id = match authorize(&st, &headers, peer, "/register") {
         Ok(id) => id,
         Err(code) => return code.into_response(),
     };
@@ -213,8 +246,13 @@ async fn font(State(st): State<HubState>, Path((id, key)): Path<(String, String)
 /// [`proto::frame_encode`]). Each complete frame becomes the session's latest
 /// screen. One connection carries the whole session, so pushes aren't gated by a
 /// per-frame HTTP round-trip. `409` if the session hasn't been registered first.
-async fn stream(State(st): State<HubState>, headers: HeaderMap, body: Body) -> Response {
-    let id = match authorize(&st, &headers) {
+async fn stream(
+    State(st): State<HubState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let id = match authorize(&st, &headers, peer, "/stream") {
         Ok(id) => id,
         Err(code) => return code.into_response(),
     };

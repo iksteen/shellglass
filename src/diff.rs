@@ -1152,17 +1152,30 @@ fn apply_wire(prev: &Frame, msg: WireMsgIn) -> Option<Frame> {
         return None; // a diff can't apply to a banner — drop it
     };
     let mut grid = grid.clone();
+    // A row is never wider than the screen. Clamp the write column to `cols` so a
+    // malformed/malicious diff can't drive the blank-padding growth below into a
+    // multi-gigabyte allocation from a tiny message (the wire `l` is an unbounded
+    // usize) — and so `patch.l + dx` can't integer-overflow. ponytail: `cols` is
+    // itself attacker-set via a full frame, but that's MAX_FRAME-bounded; a per-frame
+    // dimension cap is the follow-up.
+    let cols = grid.cols as usize;
     for patch in rows {
         let Some(row) = grid.rows.get_mut(patch.r) else {
             continue; // out-of-range row: same_layout should prevent this
         };
+        if patch.l >= cols {
+            continue; // starts past the screen edge — nothing visible to write
+        }
         for (dx, cell) in decode_block(patch.block).into_iter().enumerate() {
             let i = patch.l + dx;
+            if i >= cols {
+                break; // rest of the run is off-screen
+            }
             if i < row.len() {
                 row[i] = cell;
             } else {
                 // Mirror viewer.ts: a jagged row can grow — pad with canonical
-                // blanks (spaces), then push.
+                // blanks (spaces), then push. Bounded by `cols` now.
                 while row.len() < i {
                     row.push(blank().clone());
                 }
@@ -1570,6 +1583,31 @@ mod tests {
             g
         };
         assert_eq!(trim(a), trim(b));
+    }
+
+    #[test]
+    fn diff_column_clamped_to_screen_width() {
+        // A diff whose column index is absurd must not grow the row — otherwise a
+        // ~25-byte message could push hundreds of millions of blank cells (DoS).
+        let prev = Frame::Screen(grid(&["abc"])); // cols = 3
+        let Some(Frame::Screen(g)) = apply(&prev, r#"{"c":[0,500000000,"x"]}"#) else {
+            panic!("applies")
+        };
+        assert_eq!(g.cols, 3);
+        assert!(
+            g.rows[0].len() <= 3,
+            "row not grown past cols: {}",
+            g.rows[0].len()
+        );
+        // A run spilling past the right edge is truncated at `cols`, not grown.
+        let Some(Frame::Screen(g2)) = apply(&prev, r#"{"c":[0,2,"XYZ"]}"#) else {
+            panic!("applies")
+        };
+        assert_eq!(g2.rows[0].len(), 3);
+        assert_eq!(
+            g2.rows[0][2].text, "X",
+            "the one in-bounds cell was written"
+        );
     }
 
     #[test]
