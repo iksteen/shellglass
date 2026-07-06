@@ -97,6 +97,14 @@ pub fn start(command: &[String]) -> Result<(watch::Receiver<Arc<Frame>>, Notifie
 
     // Raw mode now, before the child draws anything.
     let raw = RawMode::acquire();
+    // Clear the local terminal so the mirrored session starts from a blank screen,
+    // matching the fresh (blank) parser that viewers see.
+    {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(b"\x1b[2J\x1b[H");
+        let _ = out.flush();
+    }
     let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
     let (frame_tx, frame_rx) = watch::channel(frame_from(&new_parser(rows, cols)));
 
