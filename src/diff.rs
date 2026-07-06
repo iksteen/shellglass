@@ -186,6 +186,21 @@ impl Live {
         let _ = self.diffs.send((seq, msg)); // Err only means no viewers — fine.
     }
 
+    /// Subscribe to state-change ticks (the SSH viewer's wake-up signal). The payload
+    /// is the same `(seq, wire)` the SSE path broadcasts, but the SSH consumer ignores
+    /// it and re-reads [`Live::frame`] instead — the broadcast is used purely as "the
+    /// screen changed". `Lagged` under a slow client just means "catch up to latest",
+    /// which loading the current frame does anyway.
+    pub fn ticks(&self) -> broadcast::Receiver<(u64, Arc<str>)> {
+        self.diffs.subscribe()
+    }
+
+    /// The current frame, lock-free (the same `ArcSwap` snapshot viewers connect
+    /// against). Pairs with [`Live::ticks`] for the SSH renderer.
+    pub fn frame(&self) -> Arc<Frame> {
+        Arc::clone(&self.state.load().frame)
+    }
+
     /// Subscribe a viewer: an SSE response that emits a full snapshot first, then
     /// each broadcast delta. **Takes no locks** — subscribe first, snapshot second,
     /// and skip deltas the snapshot already covers (seq ≤ snapshot's). On `Lagged`

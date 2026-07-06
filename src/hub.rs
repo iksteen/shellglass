@@ -60,6 +60,13 @@ impl HubState {
             base: base.into(),
         }
     }
+
+    /// The `Live` publisher for a session id, if one exists (a client has registered).
+    /// Used by the SSH viewer to resolve `ssh <id>@hub` to the session's frames.
+    pub(crate) fn live(&self, id: &str) -> Option<Arc<diff::Live>> {
+        let map = self.sessions.lock().unwrap();
+        map.get(id).map(|s| Arc::clone(&s.live))
+    }
 }
 
 /// Resolve a request's key to its (allowed) session id, or the status to reject

@@ -1,5 +1,6 @@
 //! shellglass — mirror an interactive terminal command as live HTML.
 
+mod ansi;
 mod client;
 mod config;
 mod diff;
@@ -11,6 +12,7 @@ mod proto;
 mod pty;
 mod render;
 mod server;
+mod ssh;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -51,6 +53,16 @@ enum Action {
         /// Address to bind the HTTP server.
         #[arg(short, long, default_value = "127.0.0.1:8080")]
         bind: String,
+
+        /// Also serve a read-only ANSI view over SSH on this address (e.g.
+        /// `127.0.0.1:2222`). Any username connects — `ssh -p 2222 x@host`.
+        #[arg(long)]
+        ssh_bind: Option<String>,
+
+        /// OpenSSH-format host key for the SSH view. Generated + persisted (0600) at
+        /// this path on first run; without it, a key under `$XDG_STATE_HOME` is used.
+        #[arg(long)]
+        ssh_host_key: Option<PathBuf>,
     },
 
     /// Mirror a terminal and push frames to a remote hub instead of serving locally.
@@ -142,6 +154,17 @@ struct HubArgs {
     /// Use the Let's Encrypt production directory (default: staging).
     #[arg(long)]
     acme_production: bool,
+
+    /// Also serve a read-only ANSI view over SSH on this address (e.g.
+    /// `0.0.0.0:2222`). Connect with the session id as the username:
+    /// `ssh -p 2222 <session-id>@host`.
+    #[arg(long)]
+    ssh_bind: Option<String>,
+
+    /// OpenSSH-format host key for the SSH view. Generated + persisted (0600) at
+    /// this path on first run; without it, a key under `$XDG_STATE_HOME` is used.
+    #[arg(long)]
+    ssh_host_key: Option<PathBuf>,
 }
 
 /// How the hub should terminate TLS.
@@ -192,7 +215,12 @@ async fn main() -> Result<()> {
             println!("{}", proto::session_id(&key.key));
             Ok(())
         }
-        Action::Serve { source, bind } => run_serve(source, &bind).await,
+        Action::Serve {
+            source,
+            bind,
+            ssh_bind,
+            ssh_host_key,
+        } => run_serve(source, &bind, ssh_bind, ssh_host_key).await,
         Action::Push { url, key, source } => run_push(url, key.key, source).await,
         Action::Hub(hub) => {
             let tls = Tls::from_args(&hub)?;
@@ -202,7 +230,7 @@ async fn main() -> Result<()> {
                     "shellglass: warning — no --allow session ids; the hub will reject all pushes (403)"
                 );
             }
-            serve_hub(allowed, &hub.bind, tls).await
+            serve_hub(allowed, &hub.bind, tls, hub.ssh_bind, hub.ssh_host_key).await
         }
     }
 }
@@ -252,10 +280,31 @@ fn setup(source: &SourceArgs) -> Result<Setup> {
     })
 }
 
-/// Standalone live viewer: render locally and serve the page + SSE over HTTP.
-async fn run_serve(source: SourceArgs, bind_addr: &str) -> Result<()> {
+/// Standalone live viewer: render locally and serve the page + SSE over HTTP (and,
+/// with `--ssh-bind`, a read-only ANSI view over SSH). When the mirrored command
+/// exits, `pty.rs` exits the whole process, so the SSH connection drops and the
+/// client's own tty is restored by its ssh.
+async fn run_serve(
+    source: SourceArgs,
+    bind_addr: &str,
+    ssh_bind: Option<String>,
+    ssh_host_key: Option<PathBuf>,
+) -> Result<()> {
     let listener = bind(bind_addr)?;
     let s = setup(&source)?;
+    // Bind + resolve the SSH host key before the PTY takes the terminal, so the hint
+    // and fingerprint print cleanly (raw mode hasn't started yet). A failure here must
+    // NOT abort the HTTP mirror — log and continue without the SSH view.
+    let ssh_ready = match &ssh_bind {
+        Some(addr) => match prepare_ssh(addr, ssh_host_key.as_deref(), "x") {
+            Ok(ready) => Some(ready),
+            Err(e) => {
+                eprintln!("shellglass: SSH view disabled — {e:#}");
+                None
+            }
+        },
+        None => None,
+    };
     // Print the URL before the PTY switches the terminal to raw mode.
     println!(
         "shellglass: mirroring {} at http://{}/",
@@ -263,13 +312,23 @@ async fn run_serve(source: SourceArgs, bind_addr: &str) -> Result<()> {
         listener.local_addr()?
     );
     let (rx, _notifier) = pty::start(&source.command())?;
+    let live = diff::Live::spawn(rx);
+    if let Some((l, key)) = ssh_ready {
+        let target = ssh::Target::Single(Arc::clone(&live));
+        // ponytail: unsupervised — an SSH failure logs and dies; HTTP is unaffected.
+        tokio::spawn(async move {
+            if let Err(e) = ssh::serve(l, key, target).await {
+                eprintln!("shellglass: ssh server error: {e}");
+            }
+        });
+    }
     let state = AppState {
         font_css: Arc::new(render::font_face_css(&s.fonts, "/fonts/")),
         config: s.config,
         resolver: s.resolver,
         fonts: s.fonts,
         template: s.template,
-        live: diff::Live::spawn(rx),
+        live,
     };
     axum::serve(listener, server::app(state)).await?;
     Ok(())
@@ -305,7 +364,13 @@ fn describe_source(source: &SourceArgs) -> String {
 /// Serve the hub, terminating TLS per `tls`. Plain HTTP keeps the `SO_REUSEADDR`
 /// listener via `axum::serve`; the TLS paths hand the same reuseaddr listener to
 /// `axum-server`. ACME drives certificate issuance/renewal on a background task.
-async fn serve_hub(allowed: std::collections::HashSet<String>, addr: &str, tls: Tls) -> Result<()> {
+async fn serve_hub(
+    allowed: std::collections::HashSet<String>,
+    addr: &str,
+    tls: Tls,
+    ssh_bind: Option<String>,
+    ssh_host_key: Option<PathBuf>,
+) -> Result<()> {
     let listener = bind(addr)?;
     let local = listener.local_addr()?;
     // Public base for the view URLs the hub logs. For ACME the cert is for the
@@ -320,7 +385,25 @@ async fn serve_hub(allowed: std::collections::HashSet<String>, addr: &str, tls: 
             )
         }
     };
-    let app = hub::app(hub::HubState::new(allowed, base));
+    let hub_state = hub::HubState::new(allowed, base);
+    // Optional read-only SSH view: the session id is the SSH username. A setup failure
+    // must not abort the hub's HTTP service — log and continue without the SSH view.
+    if let Some(ssh_addr) = &ssh_bind {
+        match prepare_ssh(ssh_addr, ssh_host_key.as_deref(), "<session-id>") {
+            Ok((l, key)) => {
+                let target = ssh::Target::Hub(hub_state.clone());
+                // ponytail: unsupervised — an SSH runtime failure logs and dies; HTTP
+                // is unaffected.
+                tokio::spawn(async move {
+                    if let Err(e) = ssh::serve(l, key, target).await {
+                        eprintln!("shellglass: ssh server error: {e}");
+                    }
+                });
+            }
+            Err(e) => eprintln!("shellglass: SSH view disabled — {e:#}"),
+        }
+    }
+    let app = hub::app(hub_state);
     match tls {
         Tls::None => {
             println!("shellglass hub at http://{local}/");
@@ -379,6 +462,20 @@ async fn serve_hub(allowed: std::collections::HashSet<String>, addr: &str, tls: 
         }
     }
     Ok(())
+}
+
+/// Bind the SSH listener and resolve its host key (printing the connection hint +
+/// fingerprint). Returned as a pair the caller spawns `ssh::serve` on. Fallible so a
+/// privileged/in-use port or an unwritable host key disables only the SSH view, never
+/// the HTTP service.
+fn prepare_ssh(
+    addr: &str,
+    key_path: Option<&std::path::Path>,
+    hint_user: &str,
+) -> Result<(tokio::net::TcpListener, russh::keys::PrivateKey)> {
+    let l = bind(addr)?;
+    let key = ssh::setup(l.local_addr()?, key_path, hint_user)?;
+    Ok((l, key))
 }
 
 /// Bind with `SO_REUSEADDR` so a hub restart can rebind immediately — otherwise the

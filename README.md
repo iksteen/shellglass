@@ -105,6 +105,8 @@ Flags by command:
 | `[CMD]…` (positional) | serve, push | interactive command to mirror in a PTY; put it last (after `--`). Omit for your `$SHELL` |
 | `--config <path>` | serve, push | TOML config (fonts, `symbol_map`, `template`); omit for defaults |
 | `--bind <addr>` | serve, hub | HTTP listen address (default `127.0.0.1:8080`) |
+| `--ssh-bind <addr>` | serve, hub | also serve a read-only ANSI view over SSH here; connect with `ssh -p <port> …` |
+| `--ssh-host-key <path>` | serve, hub | OpenSSH host key for the SSH view (generated + persisted 0600 if absent) |
 | `--key <secret>` | push, print-id | secret key (or `SHELLGLASS_KEY` env var) |
 | `--allow <id>` | hub | a session id permitted to push; repeat per client. Others get `403` |
 | `--tls-cert <path>` / `--tls-key <path>` | hub | serve HTTPS with your own PEM cert chain + key |
@@ -139,6 +141,34 @@ per session and re-serves the client's CSS, fonts, and render config. If the con
 drops (hub restart, network blip) the client re-registers and reconnects automatically —
 and the local session pauses cleanly, showing the outage in your terminal until it's
 back.
+
+## Read-only SSH view
+
+Add `--ssh-bind <addr>` to `serve` or `hub` to also expose the session as a **read-only
+ANSI terminal view** over SSH — a live mirror in a plain terminal, no browser needed:
+
+```sh
+# standalone: any username connects
+./target/release/shellglass serve --ssh-bind 127.0.0.1:2222 -- htop
+ssh -p 2222 x@127.0.0.1
+
+# hub: the session id is the SSH username
+./target/release/shellglass hub --bind 127.0.0.1:8080 --ssh-bind 0.0.0.0:2222 --allow "$ID"
+ssh -p 2222 "$ID"@hub.example.com
+```
+
+The **session id is the SSH username** — it's already the public read capability (the
+same id that goes in the `/s/<id>` URL), so there's nothing to enter. The view is strictly
+read-only: input is dropped except `q` / Ctrl-C / Ctrl-D, which disconnect. A viewer
+terminal smaller than the session shows a top-left crop with a one-line status notice, and
+reflows on resize.
+
+The SSH server uses its **own** ed25519 host key, kept separate from the machine's
+`/etc/ssh` identity on purpose — a shared key would extend the host's SSH trust to this
+accept-any read-only endpoint. Point `--ssh-host-key <path>` at a key to reuse across
+runs; without it a key is generated and persisted (0600) under
+`$XDG_STATE_HOME/shellglass/` so its fingerprint stays stable. The SSH view is optional
+and unsupervised: if it can't bind (e.g. a privileged port), the HTTP mirror still runs.
 
 ## Fonts
 
@@ -240,10 +270,15 @@ custom pages work off-box too.
   matches the proxy's public address, not the hub's internal bind.
 - The hub trusts allowed clients: it caps the `/register` body at 64 MB (uploaded fonts
   are large) but does not otherwise rate-limit. Don't expose an open hub to the internet.
+- The read-only SSH view (`--ssh-bind`) authorizes by the **session id in the username** —
+  the same read capability as the view URL. It accepts any connection and shows the session
+  read-only, so treat exposing it like sharing the view URL. It uses a dedicated ed25519
+  host key, never the machine's `/etc/ssh` key.
 
 ## Status
 
 Mirror an interactive command in a PTY (the `script(1)` model, one screen) with live
-rendering, standalone + client/hub push, viewer templating (built-in page with a CRT
-toggle, or a custom template), and optional hub TLS (own cert or ACME/Let's Encrypt).
-Not yet: scrollback, multiple sessions/panes in one view.
+rendering, standalone + client/hub push, an optional read-only SSH view (`--ssh-bind`),
+viewer templating (built-in page with a CRT toggle, or a custom template), and optional
+hub TLS (own cert or ACME/Let's Encrypt). Not yet: scrollback, multiple sessions/panes in
+one view.
