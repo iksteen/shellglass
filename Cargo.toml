@@ -1,6 +1,8 @@
 [package]
 name = "shellglass"
-version = "0.10.0"
+# Placeholder: the real version is stamped from the git tag at release time (see
+# .github/workflows/release.yml). Local/dev builds report the placeholder on purpose.
+version = "0.0.0-dev"
 edition = "2024"
 
 [dependencies]

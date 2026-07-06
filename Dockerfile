@@ -1,3 +1,7 @@
+# From-source image for local use (`docker build .`). Reports version 0.0.0-dev (the
+# tag-stamped version is only applied in CI). The published multi-arch image is built
+# from pre-compiled release binaries instead — see ./Dockerfile.release.
+#
 # Build: aws-lc-rs (via rustls-acme) needs cmake + a C compiler.
 FROM rust:1-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends cmake && rm -rf /var/lib/apt/lists/*

@@ -1,8 +1,12 @@
 name: release
 
-# Build release binaries for each target on a version tag and attach them to a
-# GitHub Release. Linux aarch64 goes through `cross` (its container carries the
-# cross toolchain + cmake that aws-lc-rs needs); everything else builds natively.
+# On a version tag: build release binaries for each target, attach them to a GitHub
+# Release, then assemble the multi-arch Docker image from those pre-built binaries.
+# Linux aarch64 goes through `cross` (its container carries the cross toolchain +
+# cmake that aws-lc-rs needs); everything else builds natively.
+#
+# The crate version is a placeholder in Cargo.toml (0.0.0-dev) and stamped here from
+# the tag, so a release never needs a manual version-bump commit — just tag and push.
 on:
   push:
     tags: ["v*"]
@@ -46,6 +50,14 @@ jobs:
       - if: matrix.cross
         uses: taiki-e/install-action@cross
 
+      # Stamp the tag version (vX.Y.Z -> X.Y.Z) into Cargo.toml + Cargo.lock. Anchored
+      # to the `version =` line so it can't touch anything else; both files stay
+      # consistent so --locked still holds.
+      - name: Stamp version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "s/^version = \"0\\.0\\.0-dev\"/version = \"${VERSION}\"/" Cargo.toml Cargo.lock
+
       - name: Build
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
@@ -60,3 +72,53 @@ jobs:
       - uses: softprops/action-gh-release@v3
         with:
           files: shellglass-${{ matrix.target }}.tar.gz
+
+      # Hand the raw binary to the docker job (Linux targets are the two image archs).
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/shellglass
+
+  # Assemble the multi-arch image from the already-built Linux binaries — no second
+  # Rust compile, so no slow aws-lc-rs build under arm64 QEMU. Only the tiny runtime
+  # stage (apt + useradd) runs emulated.
+  docker:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-x86_64-unknown-linux-gnu
+          path: dist/amd64
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-aarch64-unknown-linux-gnu
+          path: dist/arm64
+
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Derive tags/labels from the git ref: vX.Y.Z -> X.Y.Z and X.Y (+ latest).
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/shellglass
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

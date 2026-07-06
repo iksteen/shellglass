@@ -25,6 +25,7 @@ use std::sync::Arc;
 #[derive(Parser, Debug)]
 #[command(
     name = "shellglass",
+    version,
     about = "Mirror an interactive terminal command as live HTML"
 )]
 struct Cli {

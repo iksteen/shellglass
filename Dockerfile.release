@@ -1,0 +1,22 @@
+# Release image: package a *pre-built* binary — no Rust compile. CI (the `docker`
+# job in .github/workflows/release.yml) drops the release binaries at
+# dist/<arch>/shellglass, where <arch> is buildx's TARGETARCH (amd64 / arm64), so
+# the arm64 image is assembled from the natively cross-compiled binary instead of a
+# multi-minute compile under QEMU emulation. For a from-source local image use the
+# plain ./Dockerfile.
+FROM debian:bookworm-slim
+ARG TARGETARCH
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -u 10001 shellglass \
+    && mkdir /data && chown shellglass /data
+COPY dist/${TARGETARCH}/shellglass /usr/local/bin/shellglass
+RUN chmod +x /usr/local/bin/shellglass
+
+# ACME cache lives here — mount a named volume at /data to keep the account +
+# certificate across restarts (pass --acme-cache /data/acme).
+VOLUME /data
+USER shellglass
+EXPOSE 443
+ENTRYPOINT ["shellglass"]
+CMD ["--help"]
