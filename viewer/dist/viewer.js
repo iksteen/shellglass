@@ -576,7 +576,7 @@ export function renderRow(cells, cursorCol) {
         const isCursor = col === cursorCol;
         const w = cell.w ? 2 : 1;
         const cp0 = cell.t ? cell.t.codePointAt(0) : 0;
-        if (cp0 && isCanvasGlyph(cp0)) {
+        if (cp0 && isCanvasGlyph(cp0) && !(cp0 >= 0xe000 && symbolFamily(cp0))) {
             flushText();
             runStyle = null;
             cols = 0;

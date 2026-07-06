@@ -152,6 +152,19 @@ test("non-canvas fill glyphs (wedges/flames) still take the SVG path", () => {
   }
 });
 
+test("symbol_map overrides the canvas for PUA arrows but not standard box glyphs", () => {
+  // A user who maps the powerline arrows to a Nerd Font wins over the canvas (E0B0–B3);
+  // a map over the standard box range loses — the canvas owns it unconditionally.
+  setConfig({ ...CFG, sym: [[0x2500, 0x259f, "Box Font"], [0xe0b0, 0xe0b3, "Arrow Font"]] });
+  const arrow = renderRow([{ t: String.fromCodePoint(0xe0b0) }], -1);
+  assert.match(arrow, /font-family="Arrow Font"/, "mapped PUA arrow should take the SVG font path");
+  assert.doesNotMatch(arrow, /color:transparent/, "mapped arrow should not stay a canvas glyph");
+  const box = renderRow([{ t: String.fromCodePoint(0x2500) }], -1);
+  assert.doesNotMatch(box, /<svg/, "canvas box glyph must ignore its symbol_map entry");
+  assert.match(box, /color:transparent/);
+  setConfig(CFG);
+});
+
 test("glyphOps emits pure device-pixel ops for the box/block range", () => {
   // Cell rect 0,0..10,20 with light=1 → midX 5, midY 10.
   const ops = (cp: number) => glyphOps(cp, 0, 0, 10, 20, 1);

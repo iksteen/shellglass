@@ -168,9 +168,20 @@ family name differs from the key.
 
 [`fontdb`]: https://docs.rs/fontdb
 
+**Lines, blocks and powerline arrows are drawn, not fonted.** Box-drawing and block
+elements (`U+2500–259F`), the legacy-computing mosaics (sextants `U+1FB00–1FB3B` and
+one-eighth bars `U+1FB70–1FB7B`) and the powerline arrow separators (`U+E0B0–E0B3`) are
+synthesized as geometry on a `<canvas>` laid over the text — snapped to device pixels, so
+lines stay crisp, tile without seams, and render mixed light/heavy junctions (`┿ ╂ ┝`)
+faithfully at any zoom or display scale (including moving a window between a HiDPI and a
+regular monitor). These need **no font at all**, and the real glyph is kept underneath as
+transparent text so selection and copy/paste still work. Only the long tail — smooth-mosaic
+wedges, seven-segment and the rounded/flame powerline separators (`U+E0B4–E0D4`), plus
+anything you point `symbol_map` at — falls through to the SVG-scaled font path below.
+
 `symbol_map` is still useful alongside the stack: its matched glyphs are SVG-scaled to
-lock to exactly one cell (powerline separators tile seamlessly), which plain fallback —
-rendering at the font's own advance — doesn't do. Separators (`U+E0B0–E0D4`) stretch to
+lock to exactly one cell (so they tile seamlessly), which plain fallback — rendering at
+the font's own advance — doesn't do. The remaining separators (`U+E0B4–E0D4`) stretch to
 fill; other icons fit proportionally. `config.kitty.toml` reproduces kitty's zero-config
 powerline rendering by serving kitty's bundled `Symbols Nerd Font Mono` as a fallback.
 

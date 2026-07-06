@@ -711,7 +711,7 @@ function redrawCanvasAll(): void {
 // symbol_map glyph that happens to fall in these ranges.
 export function isFillGlyph(cp: number): boolean {
   return (
-    (cp >= 0xe0b0 && cp <= 0xe0d4) || // powerline separators (E0B0–B3 are canvas)
+    (cp >= 0xe0b0 && cp <= 0xe0d4) || // powerline separators (E0B0–B3 canvas unless symbol_mapped)
     (cp >= 0x1fb00 && cp <= 0x1fbaf) // legacy computing (sextants + eighth bars are canvas)
   );
 }
@@ -786,7 +786,11 @@ export function renderRow(cells: Cell[], cursorCol: number): string {
     const isCursor = col === cursorCol;
     const w = cell.w ? 2 : 1;
     const cp0 = cell.t ? cell.t.codePointAt(0)! : 0;
-    if (cp0 && isCanvasGlyph(cp0)) {
+    // Canvas paints box/block/legacy geometry, always winning over symbol_map there. The
+    // one exception is the PUA powerline arrows (E0B0–B3): a user who symbol_maps them to a
+    // Nerd Font did so deliberately, so a mapping hit defers to the font path. The cp>=0xe000
+    // guard short-circuits before symbolFamily() on every standard box glyph — the hot path.
+    if (cp0 && isCanvasGlyph(cp0) && !(cp0 >= 0xe000 && symbolFamily(cp0))) {
       // The canvas paints the line; keep the real glyph as transparent text so it stays
       // selectable/copyable. Own span (color forced transparent, background retained).
       flushText();
