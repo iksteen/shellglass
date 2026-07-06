@@ -9,10 +9,11 @@ use argon2::Argon2;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 
-/// One font the client serves to viewers, uploaded on `/register`. The hub stores
-/// it per session and serves the bytes at `/s/<id>/fonts/<key>`, which the page's
-/// `@font-face` references — so a viewer renders the glyphs even without the font
-/// installed. Per-session storage means two clients' fonts never clash.
+/// One font the client serves to viewers, uploaded in the register message (the
+/// `/push` WebSocket's first message). The hub stores it per session and serves the
+/// bytes at `/s/<id>/fonts/<key>`, which the page's `@font-face` references — so a
+/// viewer renders the glyphs even without the font installed. Per-session storage
+/// means two clients' fonts never clash.
 #[derive(Serialize, Deserialize)]
 pub struct FontAsset {
     /// URL-safe id, unique within the session (the font's index).
@@ -22,9 +23,9 @@ pub struct FontAsset {
     pub b64: String,
 }
 
-/// `/register` payload: the page CSS, the viewer template, and the fonts the CSS
-/// references. The client renders locally, so it owns the template too and pushes
-/// it here; the hub just fills it per request.
+/// Register message: the first message on the `/push` WebSocket — the page CSS, the
+/// viewer template, and the fonts the CSS references. The client renders locally, so
+/// it owns the template too and pushes it here; the hub just fills it per request.
 #[derive(Serialize, Deserialize)]
 pub struct RegisterBody {
     pub css: String,
@@ -41,7 +42,7 @@ pub struct RegisterBody {
     pub fonts: Vec<FontAsset>,
 }
 
-/// Header carrying the secret key on `/register` and `/stream`.
+/// Header carrying the secret key on the `/push` WebSocket upgrade.
 pub const KEY_HEADER: &str = "x-shellglass-key";
 
 /// Fixed application salt. The id must be a pure function of the secret (client
@@ -50,18 +51,21 @@ pub const KEY_HEADER: &str = "x-shellglass-key";
 /// brute force here.
 ///
 /// The version suffix does double duty: it versions the derivation scheme AND
-/// guards against protocol skew. Bump it on every breaking wire change — a
-/// version-skewed client/hub pair then disagrees on `key → id`, so the stale side
-/// fails loudly at `/register` (403, "register its session id") instead of
-/// streaming frames the other side silently drops. The cost of a bump is that
-/// operators re-run `print-id` and update `--allow` + view URLs; keys stay valid.
+/// guards against protocol skew. Bump it on a breaking change to the **wire
+/// messages** ([`crate::diff`]) a mismatched pair could both speak yet interpret
+/// differently — a version-skewed client/hub then disagrees on `key → id`, so the
+/// stale side fails loudly at the `/push` upgrade (403, "register its session id")
+/// instead of streaming frames the other side silently drops. (A change that adds or
+/// renames an *endpoint* needs no bump: an old client hits a route that's gone — a
+/// loud 404, not a silent misread.) The cost of a bump is that operators re-run
+/// `print-id` and update `--allow` + view URLs; keys stay valid.
 const SALT: &[u8] = b"shellglass/session-id/v4";
 
 /// Underivable session id for a secret key: Argon2id (memory- and compute-hard)
 /// rendered as lowercase hex. Memory-hardness makes brute-forcing a weak secret
 /// from the public id expensive; with a strong random secret it's belt-and-
 /// suspenders. Hex (never `-`) so the id is safe as a CLI value and URL path.
-/// Cost is paid once per client connection (at `/register`), not per frame.
+/// Cost is paid once per client connection (at the `/push` upgrade), not per frame.
 pub fn session_id(key: &str) -> String {
     let mut out = [0u8; 32];
     Argon2::default()
@@ -73,44 +77,15 @@ pub fn session_id(key: &str) -> String {
     })
 }
 
-/// Upper bound on a single streamed frame; guards the hub against a corrupt or
-/// hostile length prefix. A rendered screen is far smaller than this.
-pub const MAX_FRAME: usize = 16 * 1024 * 1024;
-
-/// Frame a payload for the streaming push body: `[u32 BE length][payload bytes]`.
-/// A persistent POST carries a sequence of these, so the client never waits for a
-/// per-frame HTTP response (that round-trip is what made the hub feel laggy). The
-/// payload is a [`crate::diff`] wire message — a full picture on (re)connect, then
-/// rectangle deltas — which the hub applies to its own matrix and forwards to
-/// viewers verbatim.
-pub fn frame_encode(payload: &str) -> Vec<u8> {
-    let mut v = Vec::with_capacity(4 + payload.len());
-    v.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    v.extend_from_slice(payload.as_bytes());
-    v
-}
-
-/// Pull every complete frame out of `buf`, leaving any partial trailing frame.
-/// `Err` means a length prefix exceeded [`MAX_FRAME`] — the stream is corrupt and
-/// the caller should drop the connection.
-pub fn frame_drain(buf: &mut Vec<u8>) -> Result<Vec<String>, ()> {
-    let mut out = Vec::new();
-    let mut pos = 0;
-    while buf.len() - pos >= 4 {
-        let len = u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
-        if len > MAX_FRAME {
-            return Err(());
-        }
-        if buf.len() - pos - 4 < len {
-            break; // frame not fully arrived yet
-        }
-        let start = pos + 4;
-        out.push(String::from_utf8_lossy(&buf[start..start + len]).into_owned());
-        pos = start + len;
-    }
-    buf.drain(..pos);
-    Ok(out)
-}
+/// Upper bound on a single WebSocket message the hub will accept from a pusher.
+/// Sized for the **register** message — the first one, which carries every exported
+/// font base64-encoded in one JSON blob (a heavy/CJK bundle is tens of MB, +33% for
+/// base64); the old `/register` route capped its body at 64 MB for the same reason.
+/// Every later message is a [`crate::diff`] wire message (a rendered screen, far
+/// smaller). Guards against a client making the hub buffer an unbounded message; the
+/// client checks its register against this before connecting so an over-limit bundle
+/// fails with a clear error instead of an endless reconnect.
+pub const MAX_WS_MESSAGE: usize = 64 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -129,26 +104,5 @@ mod tests {
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
             "id must be lowercase hex (no '-', CLI/URL safe): {id}"
         );
-    }
-
-    #[test]
-    fn framing_roundtrips_and_keeps_partials() {
-        // Two frames concatenated, plus a partial third, arriving in one buffer.
-        let mut buf = proto_frames(&["<a>", "hello 世界"]);
-        let partial = frame_encode("later");
-        buf.extend_from_slice(&partial[..3]); // only part of the length prefix
-
-        let frames = frame_drain(&mut buf).unwrap();
-        assert_eq!(frames, vec!["<a>".to_string(), "hello 世界".to_string()]);
-        assert_eq!(buf, &partial[..3], "partial frame must stay buffered");
-
-        // A bogus oversized length is rejected.
-        let mut bad = (u32::MAX).to_be_bytes().to_vec();
-        bad.push(0);
-        assert!(frame_drain(&mut bad).is_err());
-    }
-
-    fn proto_frames(payloads: &[&str]) -> Vec<u8> {
-        payloads.iter().flat_map(|p| frame_encode(p)).collect()
     }
 }

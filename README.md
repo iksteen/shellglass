@@ -246,7 +246,7 @@ custom pages work off-box too.
 - The **secret** is a bearer capability. Anyone who has it can push to that session;
   anyone with the **view URL** can watch. Use a long random secret and share the URL
   only with people who should see the session.
-- The secret travels in a header on `/register` and `/stream`. Terminate TLS so it
+- The secret travels in a header on the `/push` WebSocket upgrade. Terminate TLS so it
   isn't sent in the clear. The hub can do this itself:
 
   ```sh
@@ -267,9 +267,15 @@ custom pages work off-box too.
   Otherwise, run behind a TLS-terminating reverse proxy (Traefik, nginx, …). The
   client's `push` URL just needs to be `https://…`, and the hub honors
   `X-Forwarded-Proto`/`X-Forwarded-Host` so the view URL it prints on connect
-  matches the proxy's public address, not the hub's internal bind.
-- The hub trusts allowed clients: it caps the `/register` body at 64 MB (uploaded fonts
-  are large) but does not otherwise rate-limit. Don't expose an open hub to the internet.
+  matches the proxy's public address, not the hub's internal bind. The push is a
+  WebSocket (`/push`), so forward the `Upgrade`/`Connection` headers — nginx then
+  tunnels it without buffering (its default `proxy_request_buffering on` would
+  otherwise stall the stream). Viewer streams (`/s/<id>/events`, SSE) send
+  `X-Accel-Buffering: no`, so nginx won't buffer those either.
+- The hub trusts allowed clients: it caps a single pushed WebSocket message at 16 MB
+  (a full frame with fonts is smaller) but does not otherwise rate-limit the content.
+  A bad-key flood is bounded (concurrent auth hashes are capped and each rejection is
+  logged for fail2ban), but don't expose an open hub to the internet.
 - The read-only SSH view (`--ssh-bind`) authorizes by the **session id in the username** —
   the same read capability as the view URL. It accepts any connection and shows the session
   read-only, so treat exposing it like sharing the view URL. It uses a dedicated ed25519

@@ -9,7 +9,7 @@ edition = "2024"
 anyhow = "1.0.103"
 arc-swap = "1"
 argon2 = "0.5"
-axum = "0.8.9"
+axum = { version = "0.8.9", features = ["ws"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.22.1"
 bytes = "1"
@@ -28,6 +28,9 @@ tokio-stream = { version = "0.1.17", features = ["sync"] }
 tower-http = { version = "0.7", features = ["compression-br", "compression-gzip"] }
 toml = "1.1.2"
 vt100 = "0.16.2"
+reqwest-websocket = "0.6.0"
+futures-util = { version = "0.3.32", default-features = false, features = ["sink", "std"] }
+tungstenite = { version = "0.29", default-features = false }
 
 [profile.release]
 strip = true

@@ -404,6 +404,9 @@ async fn serve_hub(
             Err(e) => eprintln!("shellglass: SSH view disabled — {e:#}"),
         }
     }
+    // Kept for the SIGTERM path: triggers a WS Close to every pusher so they detect
+    // the shutdown at once (see shutdown_signal / graceful).
+    let shutdown = hub_state.clone();
     let app = hub::app(hub_state);
     // ConnectInfo::<SocketAddr> so auth-failure logging can record the source IP
     // (fail2ban) — required on every serving path or the extractor 500s.
@@ -414,7 +417,13 @@ async fn serve_hub(
     match tls {
         Tls::None => {
             println!("shellglass hub at http://{local}/");
-            axum::serve(listener, make()).await?;
+            // On SIGTERM: tell pushers to close, then drop the server — its
+            // connections FIN while the container network is still up, so viewers
+            // and pushers reconnect instead of black-holing until a TCP timeout.
+            tokio::select! {
+                r = axum::serve(listener, make()) => r?,
+                _ = shutdown_signal() => graceful(&shutdown).await,
+            }
         }
         Tls::Static { cert, key } => {
             use axum_server::tls_rustls::RustlsConfig;
@@ -423,7 +432,10 @@ async fn serve_hub(
                 .with_context(|| format!("loading TLS cert {cert:?} + key {key:?}"))?;
             let std_listener = listener.into_std()?;
             println!("shellglass hub at https://{local}/");
+            let handle = axum_server::Handle::new();
+            spawn_tls_shutdown(handle.clone(), shutdown.clone());
             axum_server::from_tcp_rustls(std_listener, config)?
+                .handle(handle)
                 .serve(make())
                 .await?;
         }
@@ -462,13 +474,53 @@ async fn serve_hub(
             let std_listener = listener.into_std()?;
             let env = if production { "production" } else { "staging" };
             println!("shellglass hub at https://{local}/ (ACME {env}: {domains:?})");
+            let handle = axum_server::Handle::new();
+            spawn_tls_shutdown(handle.clone(), shutdown.clone());
             axum_server::from_tcp(std_listener)?
                 .acceptor(acceptor)
+                .handle(handle)
                 .serve(make())
                 .await?;
         }
     }
     Ok(())
+}
+
+/// Resolve when the process is asked to stop: SIGTERM (`docker stop`/`restart`,
+/// systemd, k8s) or SIGINT (Ctrl-C).
+///
+/// Installing these matters most in a container: shellglass runs as PID 1, and the
+/// kernel *ignores* any signal with no installed handler for PID 1 — so an unhandled
+/// SIGTERM makes `docker stop` wait the full grace period, then SIGKILL, which severs
+/// connections as the network namespace is torn down (no FIN reaches clients — they
+/// black-hole until a TCP timeout). Handling it lets us close cleanly while the
+/// network is still up.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = int.recv() => {}
+    }
+}
+
+/// Signal every pusher to close (WS Close → prompt reconnect), then give the closes a
+/// moment to flush before the caller drops the plain-HTTP server (which FINs the rest).
+async fn graceful(hub: &hub::HubState) {
+    hub.trigger_shutdown();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+}
+
+/// TLS-path shutdown: axum-server can't be dropped mid-`serve` like `axum::serve`, so
+/// drive its `Handle` — signal pushers, then force-close connections after a short
+/// grace (infinite SSE/WS would otherwise never drain).
+fn spawn_tls_shutdown(handle: axum_server::Handle<std::net::SocketAddr>, hub: hub::HubState) {
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        hub.trigger_shutdown();
+        handle.graceful_shutdown(Some(std::time::Duration::from_millis(500)));
+    });
 }
 
 /// Bind the SSH listener and resolve its host key (printing the connection hint +

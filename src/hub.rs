@@ -1,34 +1,44 @@
 //! Multi-session hub server: receives pushes from clients and serves viewers.
 //!
-//! It renders nothing and re-diffs nothing — a client pushes its page CSS + render
-//! config (`/register`) then streams pre-encoded wire messages (a full picture,
-//! then deltas) over a single persistent `/stream` POST, keyed by
-//! `session_id(secret)`. The hub applies each message to the session's full matrix
-//! ([`diff::Live::publish_wire`], so late-joining viewers get a correct snapshot)
-//! and forwards the bytes to viewers verbatim. Viewers open `/s/<id>` and stream
-//! from `/s/<id>/events`. The id is the read capability; the secret (never sent to
-//! viewers) is the write capability.
+//! It renders nothing and re-diffs nothing. A client opens one WebSocket to `/push`
+//! (keyed by `session_id(secret)`, authorized once at the upgrade) and runs a tiny
+//! state machine over it: the **first** message is a [`proto::RegisterBody`] (page
+//! CSS + render config + fonts), every message **after** is a pre-encoded wire
+//! message (a full picture, then deltas). The hub applies each wire message to the
+//! session's full matrix ([`diff::Live::publish_wire`], so late-joining viewers get
+//! a correct snapshot) and forwards the bytes to viewers verbatim. Viewers open
+//! `/s/<id>` and stream from `/s/<id>/events`. The id is the read capability; the
+//! secret (never sent to viewers) is the write capability.
+//!
+//! One WebSocket (vs the old `/register` + `/stream` POST pair) means one auth, no
+//! `409` ordering race, no length-framing layer, and — with a client ping/pong
+//! heartbeat and a SIGTERM Close — prompt detection of a dead or restarting hub.
 
 use crate::diff;
 use crate::fonts::CACHE_CONTROL_FONT;
 use crate::model::Frame;
 use crate::proto::{self, KEY_HEADER, session_id};
 use crate::render;
-use axum::body::Body;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, State};
+use axum::Router;
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::routing::get;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use tokio::sync::Semaphore;
-use tokio_stream::StreamExt;
+use tokio::sync::{Semaphore, broadcast};
 use tower_http::compression::CompressionLayer;
+// ponytail: pinned to axum's tungstenite (0.29) so the downcast below matches the
+// concrete error axum boxes. On an axum WebSocket-stack bump, move this in lockstep —
+// a mismatched major makes the downcast miss and the 1009 classification quietly
+// falls back to a plain drop (graceful, but no "message too big" signal).
+use tungstenite::Error as WsError;
+use tungstenite::error::CapacityError;
 
 struct Session {
     css: String,
@@ -62,15 +72,20 @@ pub struct HubState {
     base: Arc<str>,
     /// Permits gating concurrent argon2 hashes (see [`HASH_SLOTS`]).
     hash_slots: Arc<Semaphore>,
+    /// Fires once on SIGTERM: each open `/push` WebSocket sends a Close and returns
+    /// so pushers detect the shutdown immediately (see `main`'s graceful path).
+    shutdown: broadcast::Sender<()>,
 }
 
 impl HubState {
     pub fn new(allowed: HashSet<String>, base: String) -> Self {
+        let (shutdown, _) = broadcast::channel(1);
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             allowed: Arc::new(allowed),
             base: base.into(),
             hash_slots: Arc::new(Semaphore::new(HASH_SLOTS)),
+            shutdown,
         }
     }
 
@@ -79,6 +94,12 @@ impl HubState {
     pub(crate) fn live(&self, id: &str) -> Option<Arc<diff::Live>> {
         let map = self.sessions.lock().unwrap();
         map.get(id).map(|s| Arc::clone(&s.live))
+    }
+
+    /// Signal every open `/push` WebSocket to close (graceful shutdown). Called from
+    /// `main`'s SIGTERM handler; a no-op if no pushers are connected.
+    pub fn trigger_shutdown(&self) {
+        let _ = self.shutdown.send(());
     }
 }
 
@@ -135,21 +156,27 @@ fn log_reject(headers: &HeaderMap, peer: SocketAddr, route: &str, code: StatusCo
     );
 }
 
+/// Whether a WebSocket recv error is a message that exceeded the size limit — i.e.
+/// answer it with a 1009 "Message Too Big" Close. axum boxes the raw tungstenite
+/// error, so this matches on the `Capacity(MessageTooLong)` variant rather than its
+/// text. A version mismatch (see the `tungstenite` import note) just makes the
+/// downcast miss and returns false — a graceful fall back to a plain drop.
+fn is_message_too_long(err: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    matches!(
+        err.downcast_ref::<WsError>(),
+        Some(WsError::Capacity(CapacityError::MessageTooLong { .. }))
+    )
+}
+
 pub fn app(state: HubState) -> Router {
     // Compress the page + fonts, but never the SSE stream (compression buffers and
     // would defeat the realtime push). So layer per-route, not globally.
     let compress = CompressionLayer::new();
     Router::new()
         .route("/", get(index))
-        // /register carries the page CSS plus base64 fonts, which blows past axum's
-        // 2 MB default. Allowed clients are trusted, so cap generously.
-        .route(
-            "/register",
-            post(register).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
-        )
-        // /stream is an unbounded, never-ending push body — the default limit would
-        // cut it off, so disable it here.
-        .route("/stream", post(stream).layer(DefaultBodyLimit::disable()))
+        // The push client's single WebSocket: register-then-stream state machine,
+        // authorized once at the upgrade. Replaces the old /register + /stream POSTs.
+        .route("/push", get(ws_push))
         .route("/viewer.js", get(viewer_js).layer(compress.clone()))
         .route("/favicon.svg", get(favicon).layer(compress.clone()))
         .route("/s/{id}", get(view).layer(compress.clone()))
@@ -190,17 +217,116 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name)?.to_str().ok()
 }
 
-/// Store (or refresh) a session's CSS and served fonts. Creates the session if new.
-async fn register(
+/// The push client's WebSocket. Authorize once at the upgrade (moving the argon2
+/// semaphore + fail2ban guards here — one hash per connection, not one per
+/// register *and* one per stream), then run the register-then-stream state machine.
+async fn ws_push(
     State(st): State<HubState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(reg): Json<proto::RegisterBody>,
+    ws: WebSocketUpgrade,
 ) -> Response {
-    let id = match authorize(&st, &headers, peer, "/register").await {
+    let id = match authorize(&st, &headers, peer, "/push").await {
         Ok(id) => id,
         Err(code) => return code.into_response(),
     };
+    // The view URL to announce on first registration — computed now, while we still
+    // have the upgrade request's proxy headers.
+    let base = view_base(&headers, &st.base);
+    // Cap both the message and the *frame*: tungstenite sends a message as one
+    // unfragmented frame, so the frame limit (16 MiB by default) would otherwise
+    // reject a 16–64 MiB register before the message limit ever applied. A frame
+    // over the cap is rejected at its header — the body is never buffered.
+    ws.max_message_size(proto::MAX_WS_MESSAGE)
+        .max_frame_size(proto::MAX_WS_MESSAGE)
+        .on_upgrade(move |socket| push_session(st, id, base, socket))
+}
+
+/// Drive one push connection: the first Text is the [`proto::RegisterBody`] (creates
+/// or refreshes the session), every Text after is a wire message applied to the
+/// session's matrix + forwarded to viewers. Ends on Close, a socket error, or the
+/// shutdown signal (sends a Close so the pusher reconnects promptly). On exit the
+/// session + its last frame are **kept** so viewers still see the frozen screen.
+async fn push_session(st: HubState, id: String, base: String, mut socket: WebSocket) {
+    let mut shutdown = st.shutdown.subscribe();
+    // None until the register message arrives; the state machine is "have we a Live".
+    let mut live: Option<Arc<diff::Live>> = None;
+    loop {
+        tokio::select! {
+            _ = shutdown.recv() => {
+                let _ = socket.send(Message::Close(None)).await;
+                break;
+            }
+            msg = socket.recv() => {
+                let msg = match msg {
+                    Some(Ok(m)) => m,
+                    // A recv error — a message over MAX_WS_MESSAGE, a protocol
+                    // violation, or an abrupt drop. (Our own client refuses to send an
+                    // oversized register; this handles other or buggy clients.)
+                    Some(Err(e)) => {
+                        let phase = if live.is_none() { "register" } else { "stream" };
+                        // Match the size case on the error *variant* (not its text):
+                        // axum boxes the raw tungstenite error, so downcast and check
+                        // for Capacity(MessageTooLong). If so, answer precisely with a
+                        // 1009 "Message Too Big" Close + reason, so a client sees an
+                        // actionable error instead of a bare drop it treats as a
+                        // transient blip and retries forever. The frame-size limit
+                        // rejected it at the header, so the body was never buffered.
+                        // Best-effort: a client mid-send of a huge message isn't
+                        // reading and may only observe the drop.
+                        let inner = e.into_inner();
+                        if is_message_too_long(&*inner) {
+                            let mib = proto::MAX_WS_MESSAGE / (1024 * 1024);
+                            let _ = socket
+                                .send(Message::Close(Some(CloseFrame {
+                                    code: close_code::SIZE,
+                                    reason: format!("message exceeds the {mib} MiB limit").into(),
+                                })))
+                                .await;
+                            eprintln!("shellglass: push {id} sent an over-limit {phase} message ({inner})");
+                        } else {
+                            eprintln!("shellglass: push {id} dropped during {phase}: {inner}");
+                        }
+                        break;
+                    }
+                    None => break, // clean close
+                };
+                match msg {
+                    Message::Text(t) => match &live {
+                        // AwaitingRegister: the first message must parse as a
+                        // RegisterBody; anything else is a protocol error → close.
+                        None => match serde_json::from_str::<proto::RegisterBody>(t.as_str()) {
+                            Ok(reg) => live = Some(register_session(&st, &id, &base, reg)),
+                            Err(e) => {
+                                eprintln!(
+                                    "shellglass: push {id} sent an invalid register message ({e}) — closing"
+                                );
+                                let _ = socket.send(Message::Close(None)).await;
+                                break;
+                            }
+                        },
+                        // Streaming: apply + forward. publish_wire drops malformed or
+                        // out-of-sync messages rather than the whole session.
+                        Some(l) => l.publish_wire(t.as_str()),
+                    },
+                    Message::Close(_) => break,
+                    // Ping is auto-ponged by axum; Pong/Binary are ignored.
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Create or refresh the session for `id` from a register message and return its
+/// `Live`. New sessions get a "waiting…" banner (replaced by the first pushed frame)
+/// and announce their view URL once — reconnects hit the refresh branch, so no spam.
+fn register_session(
+    st: &HubState,
+    id: &str,
+    base: &str,
+    reg: proto::RegisterBody,
+) -> Arc<diff::Live> {
     // Decode uploaded fonts; silently drop any with bad base64 (the family just
     // falls back in the browser rather than failing the whole registration).
     let fonts: HashMap<String, (String, Vec<u8>)> = reg
@@ -209,35 +335,29 @@ async fn register(
         .filter_map(|f| Some((f.key, (f.mime, B64.decode(f.b64).ok()?))))
         .collect();
     let mut map = st.sessions.lock().unwrap();
-    if let Some(s) = map.get_mut(&id) {
+    if let Some(s) = map.get_mut(id) {
         s.css = reg.css;
         s.template = reg.template;
         s.render_cfg = reg.render_cfg;
         s.fonts = fonts;
+        Arc::clone(&s.live)
     } else {
         let live = diff::Live::new(Arc::new(Frame::Banner(render::banner(
             "waiting for client…",
         ))));
         map.insert(
-            id.clone(),
+            id.to_string(),
             Session {
                 css: reg.css,
                 template: reg.template,
                 render_cfg: reg.render_cfg,
-                live,
+                live: Arc::clone(&live),
                 fonts,
             },
         );
-        // First registration for this id (a new client, or after a hub
-        // restart) — announce where to watch it. Stream reconnects re-hit the
-        // Some branch, so this doesn't spam. Honor reverse-proxy headers so the
-        // URL matches the public address, not the hub's internal bind.
-        println!(
-            "shellglass: session connected — view at {}/s/{id}",
-            view_base(&headers, &st.base)
-        );
+        println!("shellglass: session connected — view at {base}/s/{id}");
+        live
     }
-    (StatusCode::OK, id).into_response()
 }
 
 /// Serve a session's uploaded font bytes (the page's `@font-face` points here).
@@ -261,48 +381,6 @@ async fn font(State(st): State<HubState>, Path((id, key)): Path<(String, String)
             .into_response(),
         None => (StatusCode::NOT_FOUND, "unknown font").into_response(),
     }
-}
-
-/// Persistent push: the body is a stream of length-prefixed frames (see
-/// [`proto::frame_encode`]). Each complete frame becomes the session's latest
-/// screen. One connection carries the whole session, so pushes aren't gated by a
-/// per-frame HTTP round-trip. `409` if the session hasn't been registered first.
-async fn stream(
-    State(st): State<HubState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    body: Body,
-) -> Response {
-    let id = match authorize(&st, &headers, peer, "/stream").await {
-        Ok(id) => id,
-        Err(code) => return code.into_response(),
-    };
-    // Clone the publisher out (don't hold the lock while streaming). It keeps the
-    // latest frame even with no browser subscribed.
-    let live = match st.sessions.lock().unwrap().get(&id) {
-        Some(s) => Arc::clone(&s.live),
-        None => return StatusCode::CONFLICT.into_response(),
-    };
-
-    let mut data = body.into_data_stream();
-    let mut buf: Vec<u8> = Vec::new();
-    while let Some(Ok(chunk)) = data.next().await {
-        buf.extend_from_slice(&chunk);
-        match proto::frame_drain(&mut buf) {
-            Ok(frames) => {
-                for f in frames {
-                    // Each payload is a wire message (full/diff/banner) the client
-                    // encoded. publish_wire applies it to the session's matrix and
-                    // forwards the bytes verbatim — and skips malformed or
-                    // out-of-sync ones rather than dropping the whole session
-                    // (e.g. a version-skewed client).
-                    live.publish_wire(&f);
-                }
-            }
-            Err(()) => break, // corrupt length prefix — drop the connection
-        }
-    }
-    StatusCode::OK.into_response()
 }
 
 async fn view(State(st): State<HubState>, Path(id): Path<String>) -> Response {
@@ -385,6 +463,63 @@ mod tests {
         // An empty allowlist rejects everything (no implicit open hub).
         let empty = HubState::new(HashSet::new(), String::new());
         assert!(!empty.allowed.contains(&session_id("good-secret")));
+    }
+
+    fn reg(css: &str) -> proto::RegisterBody {
+        proto::RegisterBody {
+            css: css.into(),
+            template: String::new(),
+            render_cfg: String::new(),
+            fonts: vec![],
+        }
+    }
+
+    #[test]
+    fn message_too_long_is_classified_by_variant() {
+        // Construct the exact error axum boxes for an over-limit frame, then confirm
+        // the classifier keys on the variant (this is what triggers the 1009 Close).
+        let err = axum::Error::new(WsError::Capacity(CapacityError::MessageTooLong {
+            size: 100 * 1024 * 1024,
+            max_size: proto::MAX_WS_MESSAGE,
+        }));
+        assert!(
+            is_message_too_long(&*err.into_inner()),
+            "MessageTooLong → 1009"
+        );
+
+        // An unrelated WS error is not a size rejection, so it must NOT send 1009.
+        let other = axum::Error::new(WsError::AlreadyClosed);
+        assert!(
+            !is_message_too_long(&*other.into_inner()),
+            "a non-capacity error must fall through to a plain drop"
+        );
+    }
+
+    #[test]
+    fn register_creates_then_reconnect_reuses_the_live() {
+        let id = session_id("secret");
+        let st = HubState::new(HashSet::from([id.clone()]), "http://h".into());
+        assert!(
+            st.live(&id).is_none(),
+            "no session before the first register"
+        );
+
+        // First register (the WS's first message) creates the session + its Live.
+        let live1 = register_session(&st, &id, "http://h", reg("a{}"));
+        assert!(st.live(&id).is_some(), "session exists after register");
+
+        // A reconnect re-registers: the CSS refreshes but the same Live is reused, so
+        // viewers already subscribed don't get orphaned.
+        let live2 = register_session(&st, &id, "http://h", reg("b{}"));
+        assert!(
+            Arc::ptr_eq(&live1, &live2),
+            "reconnect must reuse the session's Live, not replace it"
+        );
+        assert_eq!(
+            st.sessions.lock().unwrap().get(&id).unwrap().css,
+            "b{}",
+            "re-register refreshes the pushed CSS"
+        );
     }
 
     #[test]

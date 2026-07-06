@@ -38,8 +38,8 @@ PTY output bytes → vt100::Parser → model::Grid (StyledCell cells)
 
 **Three serving modes** (all in `main.rs`):
 - Standalone (`server.rs`) — local axum server: `GET /` page, `GET /events` SSE deltas, `GET /viewer.js` the baked renderer.
-- Client (`client.rs`) — keeps the previously-sent frame and streams `diff.rs` wire messages to a remote hub over one persistent `/stream` POST: a full picture on each (re)connect, then only deltas (a resize is a layout change, which `encode_delta` turns into a full). Re-registers + reconnects on drop.
-- Hub (`hub.rs`, `hub` subcommand) — renders nothing and re-diffs nothing; stores each client's pushed CSS/fonts/render-config, applies each pushed wire message to the session's full matrix (`diff::Live::publish_wire`) and forwards the bytes to viewers verbatim; serves viewers at `/s/<id>`.
+- Client (`client.rs`) — keeps the previously-sent frame and streams `diff.rs` wire messages to a remote hub over one `/push` **WebSocket**: a `RegisterBody` (CSS/fonts/render-config) as the first message, then a full picture on each (re)connect, then only deltas (a resize is a layout change, which `encode_delta` turns into a full). Pings for liveness (a run of unanswered pongs, or a send stalled past a timeout, ⇒ dead ⇒ reconnect — so a black-holed hub is caught in seconds, not the kernel's ~15-min TCP timeout). Re-registers + reconnects on drop.
+- Hub (`hub.rs`, `hub` subcommand) — renders nothing and re-diffs nothing; the `/push` WebSocket runs a `AwaitingRegister → Streaming` state machine (first message = register, rest = wire messages), authorized once at the upgrade. Stores each client's pushed CSS/fonts/render-config, applies each pushed wire message to the session's full matrix (`diff::Live::publish_wire`) and forwards the bytes to viewers verbatim; serves viewers at `/s/<id>`. On SIGTERM it Closes every push WebSocket (see `main`'s graceful path) so pushers reconnect promptly instead of black-holing.
 
 **Key layers:**
 - `model.rs` — parser-agnostic in-memory IR (`StyledCell`, `Grid`, `Frame`); only `Color` carries serde (embedded in the wire's cell styles). Nothing here depends on `vt100`.
@@ -53,9 +53,9 @@ PTY output bytes → vt100::Parser → model::Grid (StyledCell cells)
 
 ## Capability model (proto.rs)
 
-The **secret key** is the write capability. The **session id** = `hex(argon2id(key))` with a fixed salt (`SALT`) is the read capability that goes in the view URL — one-way, so viewers can't recover the key. The hub screens pushes against a pre-registered `--allow` set of ids (`authorize` in `hub.rs`); it never sees secrets. `session_id` is intentionally memory-hard — call it once per connection, never per frame. The salt's version suffix is **also the protocol-skew guard**: bump it on every breaking wire change so a mismatched client/hub pair fails loudly at `/register` (they derive different ids from the same key) instead of silently dropping frames.
+The **secret key** is the write capability. The **session id** = `hex(argon2id(key))` with a fixed salt (`SALT`) is the read capability that goes in the view URL — one-way, so viewers can't recover the key. The hub screens pushes against a pre-registered `--allow` set of ids (`authorize` in `hub.rs`, at the `/push` upgrade — one argon2 per connection, semaphore-capped + fail2ban-logged on rejection); it never sees secrets. `session_id` is intentionally memory-hard — call it once per connection, never per frame. The salt's version suffix is **also the protocol-skew guard**: bump it on a breaking change to the **wire messages** (`diff.rs`) so a mismatched client/hub pair fails loudly at the `/push` upgrade (they derive different ids from the same key) instead of silently dropping frames. A new/renamed *endpoint* needs no bump (an old client hits a gone route — a loud 404, not a silent misread), which is why the WebSocket migration kept `v4`.
 
-Wire framing for the streaming push: `frame_encode`/`frame_drain` (`[u32 BE length][payload]`), capped at `MAX_FRAME`.
+Push transport: one `/push` WebSocket per session. WS self-frames, so there's no length-prefix layer — one WS **Text** message = one wire message (register JSON, then `diff.rs` wire strings), capped at `proto::MAX_WS_MESSAGE`. Client ↔ hub liveness rides on WS ping/pong (axum auto-pongs; the client runs the timeout).
 
 ## Conventions
 
