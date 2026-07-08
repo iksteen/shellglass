@@ -185,8 +185,14 @@ pub fn start(command: &[String]) -> Result<(watch::Receiver<Arc<Frame>>, Notifie
     // Screen thread: sole owner of the real terminal (raw mode + stdout) and the
     // parser. Tees shell output immediately, renders to the browser at ≤30fps, and
     // handles hub notices with a clean pause/restore.
+    // Pixel size of one cell, to size natural (no cell-hint) images. Roughly
+    // constant across resizes, so the initial value is kept for the session.
+    let cell = (
+        (geom.px_w / geom.cols.max(1)).max(1),
+        (geom.px_h / geom.rows.max(1)).max(1),
+    );
     std::thread::spawn(move || {
-        screen_thread(msg_rx, frame_tx, raw, new_parser(rows, cols));
+        screen_thread(msg_rx, frame_tx, raw, new_parser(rows, cols), cell);
     });
 
     // When the command exits, tell the screen thread to restore the terminal + quit.
@@ -206,6 +212,7 @@ fn screen_thread(
     frame_tx: watch::Sender<Arc<Frame>>,
     raw: RawMode,
     mut parser: vt100::Parser,
+    cell: (u16, u16),
 ) {
     let mut out = std::io::stdout();
     let mut connected = true; // teeing shell output to the terminal
@@ -244,9 +251,18 @@ fn screen_thread(
                         Segment::Pass(bytes) => parser.process(&bytes),
                         Segment::Image(img) => {
                             let (row, col) = parser.screen().cursor_position();
-                            let (cols, rows) = img
-                                .cells
-                                .map_or((None, None), |(c, r)| (Some(c), Some(r)));
+                            // App-given cell size, else derived from pixel size ÷ cell
+                            // size so a natural-size image still advances the cursor.
+                            let cells = img.cells.or_else(|| {
+                                img.px.map(|(w, h)| {
+                                    (
+                                        (w.div_ceil(u32::from(cell.0)) as u16).max(1),
+                                        (h.div_ceil(u32::from(cell.1)) as u16).max(1),
+                                    )
+                                })
+                            });
+                            let (cols, rows) =
+                                cells.map_or((None, None), |(c, r)| (Some(c), Some(r)));
                             images.push(ImagePlacement {
                                 row,
                                 col,

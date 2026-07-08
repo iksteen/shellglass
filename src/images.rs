@@ -28,6 +28,15 @@ pub struct Image {
     /// Display size in terminal cells (cols, rows) if the app specified one;
     /// otherwise the browser renders the image at its natural pixel size.
     pub cells: Option<(u16, u16)>,
+    /// Source pixel dimensions (width, height). Used to derive a cell count when
+    /// the app gave none, so the cursor advances below a natural-size image.
+    pub px: Option<(u32, u32)>,
+}
+
+/// Pixel dimensions from an encoded image's header (any format the browser takes).
+fn dims(bytes: &[u8]) -> Option<(u32, u32)> {
+    let s = imagesize::blob_size(bytes).ok()?;
+    Some((s.width as u32, s.height as u32))
 }
 
 /// What the interceptor emits for a run of input.
@@ -211,15 +220,21 @@ impl Interceptor {
                 mime: sniff_mime(&bytes)?.to_string(),
                 base64: B64.encode(&bytes),
                 cells: acc.cells,
+                px: dims(&bytes),
             },
             KittyFmt::Rgba | KittyFmt::Rgb => {
                 let (w, h) = acc.px?;
-                let channels = if matches!(acc.fmt, KittyFmt::Rgba) { 4 } else { 3 };
+                let channels = if matches!(acc.fmt, KittyFmt::Rgba) {
+                    4
+                } else {
+                    3
+                };
                 let png = encode_png(w, h, channels, &bytes)?;
                 Image {
                     mime: "image/png".to_string(),
                     base64: B64.encode(&png),
                     cells: acc.cells,
+                    px: Some((w, h)),
                 }
             }
             KittyFmt::Unsupported => return None,
@@ -292,6 +307,7 @@ fn image_from_b64(base64: String, cells: Option<(u16, u16)>) -> Option<Image> {
         mime: mime.to_string(),
         base64: base64.trim().to_string(),
         cells,
+        px: dims(&bytes),
     })
 }
 
@@ -340,10 +356,7 @@ fn clear_len(rest: &[u8]) -> Option<usize> {
         b"\x1b[?47h",
         b"\x1b[?47l",
     ];
-    CLEARS
-        .iter()
-        .find(|c| rest.starts_with(c))
-        .map(|c| c.len())
+    CLEARS.iter().find(|c| rest.starts_with(c)).map(|c| c.len())
 }
 
 /// Find the end (one past the terminator) of an image sequence starting at `s[0]`.
@@ -432,6 +445,16 @@ mod tests {
     }
 
     #[test]
+    fn image_carries_pixel_dims() {
+        // px lets pty.rs derive a cell count (and advance the cursor) for an image
+        // with no app-given size. png_b64 is a 1x1 PNG.
+        let mut it = Interceptor::new();
+        let s = format!("\x1b]1337;File=inline=1:{}\x07", png_b64());
+        let imgs = only_images(it.feed(s.as_bytes()));
+        assert_eq!(imgs[0].px, Some((1, 1)));
+    }
+
+    #[test]
     fn sequence_split_across_two_reads() {
         let mut it = Interceptor::new();
         let b64 = png_b64();
@@ -466,7 +489,10 @@ mod tests {
         let src = [
             255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
         ];
-        let s = format!("\x1b_Ga=T,f=32,t=d,s=2,v=2,c=1,r=1;{}\x1b\\", B64.encode(src));
+        let s = format!(
+            "\x1b_Ga=T,f=32,t=d,s=2,v=2,c=1,r=1;{}\x1b\\",
+            B64.encode(src)
+        );
         let imgs = only_images(it.feed(s.as_bytes()));
         assert_eq!(imgs.len(), 1);
         assert_eq!(imgs[0].mime, "image/png");
@@ -478,7 +504,11 @@ mod tests {
         assert_eq!(reader.info().color_type, png::ColorType::Rgba);
         let mut buf = vec![0; reader.output_buffer_size().unwrap()];
         let frame = reader.next_frame(&mut buf).unwrap();
-        assert_eq!(&buf[..frame.buffer_size()], &src[..], "pixels round-trip exactly");
+        assert_eq!(
+            &buf[..frame.buffer_size()],
+            &src[..],
+            "pixels round-trip exactly"
+        );
     }
 
     #[test]

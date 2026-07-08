@@ -17,6 +17,7 @@ clap = { version = "4.6.1", features = ["derive", "env"] }
 flate2 = "1"
 fontdb = "0.23"
 getrandom = "0.3"
+imagesize = "0.14"
 libc = "0.2"
 portable-pty = "0.9"
 reqwest = { version = "0.13", default-features = false, features = ["stream", "rustls"] }
