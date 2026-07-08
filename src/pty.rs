@@ -63,13 +63,19 @@ impl Notifier {
 /// latest screen [`Frame`] plus a [`Notifier`] for hub status. Puts the terminal in
 /// raw mode, bridges stdin/stdout, and exits the process when the command exits.
 pub fn start(command: &[String]) -> Result<(watch::Receiver<Arc<Frame>>, Notifier)> {
-    let (cols, rows) = term_size().unwrap_or((80, 24));
+    let geom = term_geom().unwrap_or(TermGeom {
+        cols: 80,
+        rows: 24,
+        px_w: 80 * FALLBACK_CELL.0,
+        px_h: 24 * FALLBACK_CELL.1,
+    });
+    let (cols, rows) = (geom.cols, geom.rows);
     let pair = native_pty_system()
         .openpty(PtySize {
             rows,
             cols,
-            pixel_width: 0,
-            pixel_height: 0,
+            pixel_width: geom.px_w,
+            pixel_height: geom.px_h,
         })
         .context("opening pty")?;
 
@@ -157,17 +163,16 @@ pub fn start(command: &[String]) -> Result<(watch::Receiver<Arc<Frame>>, Notifie
             };
             let mut last = (cols, rows);
             for _ in &mut signals {
-                match term_size() {
-                    Some(size) if size != last => {
-                        last = size;
-                        let (c, r) = size;
+                match term_geom() {
+                    Some(g) if (g.cols, g.rows) != last => {
+                        last = (g.cols, g.rows);
                         let _ = master.resize(PtySize {
-                            rows: r,
-                            cols: c,
-                            pixel_width: 0,
-                            pixel_height: 0,
+                            rows: g.rows,
+                            cols: g.cols,
+                            pixel_width: g.px_w,
+                            pixel_height: g.px_h,
                         });
-                        if msg_tx.send(Msg::Resize(r, c)).is_err() {
+                        if msg_tx.send(Msg::Resize(g.rows, g.cols)).is_err() {
                             break;
                         }
                     }
@@ -317,10 +322,42 @@ fn frame_from(parser: &vt100::Parser, images: &[ImagePlacement]) -> Arc<Frame> {
     Arc::new(Frame::Screen(grid))
 }
 
-/// Our controlling terminal's size as (cols, rows), if stdin is a tty.
-fn term_size() -> Option<(u16, u16)> {
+/// Controlling-terminal geometry: cell counts plus the PTY's pixel dimensions.
+/// Pixel-aware apps (kitty/sixel image tools) refuse to draw unless the terminal
+/// reports a non-zero pixel size, so we pass through the outer terminal's reported
+/// pixels and, when it reports none, synthesize them from an assumed cell size.
+struct TermGeom {
+    cols: u16,
+    rows: u16,
+    px_w: u16,
+    px_h: u16,
+}
+
+/// Assumed cell size when the outer terminal reports no pixel dimensions. The
+/// browser rescales each image to its cell box regardless, so this only sets the
+/// source resolution a tool picks — a sane default, not a measurement.
+// ponytail: bump if graphics come out mis-scaled on terminals that report 0 pixels.
+const FALLBACK_CELL: (u16, u16) = (8, 16);
+
+/// Our controlling terminal's geometry, if stdin is a tty.
+fn term_geom() -> Option<TermGeom> {
     let ws = rustix::termios::tcgetwinsize(std::io::stdin()).ok()?;
-    (ws.ws_col > 0).then_some((ws.ws_col, ws.ws_row))
+    if ws.ws_col == 0 {
+        return None;
+    }
+    let px = |reported: u16, cells: u16, cell: u16| {
+        if reported > 0 {
+            reported
+        } else {
+            cells.saturating_mul(cell)
+        }
+    };
+    Some(TermGeom {
+        cols: ws.ws_col,
+        rows: ws.ws_row,
+        px_w: px(ws.ws_xpixel, ws.ws_col, FALLBACK_CELL.0),
+        px_h: px(ws.ws_ypixel, ws.ws_row, FALLBACK_CELL.1),
+    })
 }
 
 /// Owns the terminal's raw-mode state: `acquire` enters raw and remembers the

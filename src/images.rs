@@ -57,11 +57,26 @@ pub struct Interceptor {
     kitty: Option<KittyAccum>,
 }
 
-#[derive(Default)]
 struct KittyAccum {
     payload: String,
     cells: Option<(u16, u16)>,
-    supported: bool, // false once we see an unsupported format/medium — skip on flush
+    fmt: KittyFmt,
+    /// Source pixel dimensions (kitty `s`×`v`), needed to encode raw formats.
+    px: Option<(u32, u32)>,
+    /// `o=z`: the payload is zlib-compressed.
+    zlib: bool,
+}
+
+/// The kitty pixel formats we can turn into something the browser renders.
+enum KittyFmt {
+    /// `f=100`: already an encoded image file — forward as-is.
+    Png,
+    /// `f=32`: raw RGBA pixels — re-encode as PNG.
+    Rgba,
+    /// `f=24`: raw RGB pixels — re-encode as PNG.
+    Rgb,
+    /// Unknown format or non-direct transfer medium — drop.
+    Unsupported,
 }
 
 impl Interceptor {
@@ -157,15 +172,24 @@ impl Interceptor {
         let ctrl = parse_kv(control, b',');
         let more = ctrl.get("m").map(|v| v == "1").unwrap_or(false);
 
-        // Start (or restart) an accumulator on the first chunk of a transfer — the
-        // one that carries the format/medium/size control keys.
+        // Start an accumulator on the first chunk of a transfer — the one that
+        // carries the format/medium/size control keys (continuation chunks only
+        // repeat `m`).
         if self.kitty.is_none() {
-            let fmt_ok = ctrl.get("f").map(|f| f == "100").unwrap_or(true); // default 100=PNG-ish; accept absent
-            let medium_ok = ctrl.get("t").map(|t| t == "d").unwrap_or(true); // default d=direct
+            let direct = ctrl.get("t").map(|t| t == "d").unwrap_or(true); // default d=direct
+            let fmt = match ctrl.get("f").map(String::as_str) {
+                Some("100") => KittyFmt::Png,
+                Some("32") | None => KittyFmt::Rgba, // kitty's default format is 32
+                Some("24") => KittyFmt::Rgb,
+                _ => KittyFmt::Unsupported,
+            };
             self.kitty = Some(KittyAccum {
                 payload: String::new(),
                 cells: cells_from(ctrl.get("c"), ctrl.get("r")),
-                supported: fmt_ok && medium_ok,
+                fmt: if direct { fmt } else { KittyFmt::Unsupported },
+                px: cells_from(ctrl.get("s"), ctrl.get("v"))
+                    .map(|(w, h)| (u32::from(w), u32::from(h))),
+                zlib: ctrl.get("o").map(|o| o == "z").unwrap_or(false),
             });
         }
         if let Some(acc) = self.kitty.as_mut() {
@@ -175,13 +199,68 @@ impl Interceptor {
         if more {
             return None; // wait for the rest
         }
-        // Last chunk — flush.
+        // Last chunk — flush. Decode base64 (and zlib, if o=z), then render per format.
         let acc = self.kitty.take()?;
-        if !acc.supported {
+        if matches!(acc.fmt, KittyFmt::Unsupported) {
             return None;
         }
-        image_from_b64(acc.payload, acc.cells).map(Segment::Image)
+        let raw = B64.decode(acc.payload.trim()).ok()?;
+        let bytes = if acc.zlib { zlib_inflate(&raw)? } else { raw };
+        let image = match acc.fmt {
+            KittyFmt::Png => Image {
+                mime: sniff_mime(&bytes)?.to_string(),
+                base64: B64.encode(&bytes),
+                cells: acc.cells,
+            },
+            KittyFmt::Rgba | KittyFmt::Rgb => {
+                let (w, h) = acc.px?;
+                let channels = if matches!(acc.fmt, KittyFmt::Rgba) { 4 } else { 3 };
+                let png = encode_png(w, h, channels, &bytes)?;
+                Image {
+                    mime: "image/png".to_string(),
+                    base64: B64.encode(&png),
+                    cells: acc.cells,
+                }
+            }
+            KittyFmt::Unsupported => return None,
+        };
+        Some(Segment::Image(image))
     }
+}
+
+/// Inflate a zlib stream (kitty `o=z` payloads).
+fn zlib_inflate(data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    flate2::read::ZlibDecoder::new(data)
+        .read_to_end(&mut out)
+        .ok()?;
+    Some(out)
+}
+
+/// Encode a raw pixel buffer as PNG (via the `png` crate). `channels` is 3 (RGB) or
+/// 4 (RGBA); the buffer must hold at least `width*height*channels` bytes.
+fn encode_png(width: u32, height: u32, channels: u8, pixels: &[u8]) -> Option<Vec<u8>> {
+    let color = match channels {
+        3 => png::ColorType::Rgb,
+        4 => png::ColorType::Rgba,
+        _ => return None,
+    };
+    let need = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(channels as usize)?;
+    if width == 0 || height == 0 || pixels.len() < need {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut enc = png::Encoder::new(&mut out, width, height);
+    enc.set_color(color);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header().ok()?;
+    // Slice to the exact expected length — a sender may pad the buffer.
+    writer.write_image_data(&pixels[..need]).ok()?;
+    writer.finish().ok()?;
+    Some(out)
 }
 
 #[derive(Clone, Copy)]
@@ -380,10 +459,33 @@ mod tests {
     }
 
     #[test]
-    fn kitty_raw_format_skipped() {
+    fn kitty_raw_rgba_reencoded_as_png() {
         let mut it = Interceptor::new();
-        // f=32 (RGBA pixels) — browser can't render a bare buffer; must be dropped.
-        let s = format!("\x1b_Ga=T,f=32,t=d;{}\x1b\\", png_b64());
+        // 2x2 raw RGBA with s/v pixel dims — must come out as a PNG that decodes
+        // back to the exact same pixels (round-trip through the real png crate).
+        let src = [
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ];
+        let s = format!("\x1b_Ga=T,f=32,t=d,s=2,v=2,c=1,r=1;{}\x1b\\", B64.encode(src));
+        let imgs = only_images(it.feed(s.as_bytes()));
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].mime, "image/png");
+
+        let png = B64.decode(&imgs[0].base64).unwrap();
+        let decoder = png::Decoder::new(std::io::Cursor::new(&png));
+        let mut reader = decoder.read_info().expect("valid PNG");
+        assert_eq!((reader.info().width, reader.info().height), (2, 2));
+        assert_eq!(reader.info().color_type, png::ColorType::Rgba);
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+        let frame = reader.next_frame(&mut buf).unwrap();
+        assert_eq!(&buf[..frame.buffer_size()], &src[..], "pixels round-trip exactly");
+    }
+
+    #[test]
+    fn kitty_nondirect_transfer_skipped() {
+        let mut it = Interceptor::new();
+        // t=f (file transfer) — we won't read the sender's local files; must drop.
+        let s = format!("\x1b_Ga=T,f=100,t=f;{}\x1b\\", png_b64());
         assert!(only_images(it.feed(s.as_bytes())).is_empty());
     }
 

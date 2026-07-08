@@ -14,6 +14,7 @@ axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.22.1"
 bytes = "1"
 clap = { version = "4.6.1", features = ["derive", "env"] }
+flate2 = "1"
 fontdb = "0.23"
 getrandom = "0.3"
 libc = "0.2"
@@ -33,6 +34,7 @@ vt100 = "0.16.2"
 reqwest-websocket = "0.6.0"
 futures-util = { version = "0.3.32", default-features = false, features = ["sink", "std"] }
 tungstenite = { version = "0.29", default-features = false }
+png = "0.18.1"
 
 [profile.release]
 strip = true
