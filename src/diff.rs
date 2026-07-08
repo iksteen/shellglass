@@ -818,6 +818,7 @@ enum WireMsgIn {
         // The row count is implied by `d`; the wire's `h` is for the viewer.
         cur: Option<(u16, u16)>,
         rows: Vec<CellBlockIn>,
+        images: Vec<ImagePlacement>,
     },
     Diff {
         cur: Option<Option<(u16, u16)>>,
@@ -893,6 +894,10 @@ impl<'de> Deserialize<'de> for WireMsgIn {
                 w: from_val(w)?,
                 cur,
                 rows: from_val(rows)?,
+                images: match obj.get("i") {
+                    Some(i) => from_val(i)?,
+                    None => Vec::new(),
+                },
             });
         }
         if let Some(b) = obj.get("b") {
@@ -1175,16 +1180,17 @@ fn decode_block(block: CellBlockIn) -> Vec<StyledCell> {
 fn apply_wire(prev: &Frame, msg: WireMsgIn) -> Option<Frame> {
     // Normalize the three diff shapes into (cursor, row patches).
     let (cur, rows) = match msg {
-        WireMsgIn::Full { w, cur, rows } => {
+        WireMsgIn::Full {
+            w,
+            cur,
+            rows,
+            images,
+        } => {
             return Some(Frame::Screen(Grid {
                 cols: w,
                 rows: rows.into_iter().map(decode_block).collect(),
                 cursor: cur,
-                // ponytail: the hub doesn't yet decode the full frame's `i` images,
-                // so a re-served session shows text only. Standalone `serve` renders
-                // images (viewer decodes `i` directly). Parse `i` here to add hub
-                // support — see exp/inline-images.
-                images: Vec::new(),
+                images,
             }));
         }
         WireMsgIn::Banner { html } => return Some(Frame::Banner(html)),
@@ -1642,6 +1648,27 @@ mod tests {
             g
         };
         assert_eq!(trim(a), trim(b));
+    }
+
+    #[test]
+    fn hub_decodes_full_frame_images() {
+        // A full frame carrying `i` must reconstruct the placements on the hub side,
+        // so a late-joining viewer's snapshot shows images (not text only).
+        let mut g = grid(&["hi"]);
+        g.images.push(ImagePlacement {
+            row: 1,
+            col: 2,
+            cols: Some(3),
+            rows: Some(1),
+            mime: "image/png".into(),
+            data: "AAA".into(),
+        });
+        let prev = Frame::Banner("x".into());
+        let full = encode_delta(&prev, &Frame::Screen(g.clone())).expect("banner → screen is full");
+        let Some(Frame::Screen(out)) = apply(&prev, &full) else {
+            panic!("full applies")
+        };
+        assert_eq!(out.images, g.images);
     }
 
     #[test]

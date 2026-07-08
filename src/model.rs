@@ -103,7 +103,7 @@ pub(crate) fn is_false(b: &bool) -> bool {
 /// An inline image (iTerm2/kitty) placed at a terminal cell, forwarded to the
 /// browser as a `data:` URL overlay. Serializes compactly for the full-frame wire
 /// message under the `i` key (see [`crate::diff`]); the browser decodes the base64.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImagePlacement {
     /// Top-left cell of the image.
     #[serde(rename = "r")]
@@ -112,9 +112,9 @@ pub struct ImagePlacement {
     pub col: u16,
     /// Display size in cells, if the app specified one (else the browser uses the
     /// image's natural pixel size).
-    #[serde(rename = "w", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "w", default, skip_serializing_if = "Option::is_none")]
     pub cols: Option<u16>,
-    #[serde(rename = "h", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "h", default, skip_serializing_if = "Option::is_none")]
     pub rows: Option<u16>,
     #[serde(rename = "m")]
     pub mime: String,
