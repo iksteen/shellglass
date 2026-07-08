@@ -103,8 +103,15 @@ pub fn start(command: &[String]) -> Result<(watch::Receiver<Arc<Frame>>, Notifie
 
     // Raw mode now, before the child draws anything.
     let raw = RawMode::acquire();
+    // Ask the terminal which image protocols it renders (before the input bridge
+    // starts, so its replies don't leak to the child). We only intercept protocols
+    // the terminal supports, so the web mirror matches what's on the local screen
+    // rather than eating a sequence into a web image the terminal never showed.
+    let caps = probe_caps();
+    let intercept = (caps.kitty, iterm_supported());
     // Clear the local terminal so the mirrored session starts from a blank screen,
-    // matching the fresh (blank) parser that viewers see.
+    // matching the fresh (blank) parser that viewers see (also wipes any handshake
+    // reply artifacts).
     {
         use std::io::Write;
         let mut out = std::io::stdout();
@@ -192,7 +199,14 @@ pub fn start(command: &[String]) -> Result<(watch::Receiver<Arc<Frame>>, Notifie
         (geom.px_h / geom.rows.max(1)).max(1),
     );
     std::thread::spawn(move || {
-        screen_thread(msg_rx, frame_tx, raw, new_parser(rows, cols), cell);
+        screen_thread(
+            msg_rx,
+            frame_tx,
+            raw,
+            new_parser(rows, cols),
+            cell,
+            intercept,
+        );
     });
 
     // When the command exits, tell the screen thread to restore the terminal + quit.
@@ -213,6 +227,7 @@ fn screen_thread(
     raw: RawMode,
     mut parser: vt100::Parser,
     cell: (u16, u16),
+    intercept: (bool, bool),
 ) {
     let mut out = std::io::stdout();
     let mut connected = true; // teeing shell output to the terminal
@@ -223,7 +238,7 @@ fn screen_thread(
     // private-use sentinel glyph into the parser grid at its top-left. That cell
     // then rides vt100's own scrolling/eviction/reflow, so each frame we just read
     // the sentinel's position back (see `resolve_images`) — no scroll heuristics.
-    let mut interceptor = Interceptor::new();
+    let mut interceptor = Interceptor::with(intercept.0, intercept.1);
     let mut images: Vec<Placed> = Vec::new();
     let mut mark_seq: u32 = 0;
     loop {
@@ -438,6 +453,120 @@ fn term_geom() -> Option<TermGeom> {
     })
 }
 
+/// Graphics-protocol support the controlling terminal advertises, learned from a
+/// capability handshake rather than a `TERM` signature.
+#[derive(Clone, Copy, Default)]
+struct Caps {
+    /// Kitty graphics — the `a=q` query drew an `OK` response.
+    kitty: bool,
+    /// Sixel — Primary DA listed feature `4`.
+    // ponytail: consumed when sixel interception lands; the DA already reports it.
+    #[allow(dead_code)]
+    sixel: bool,
+}
+
+/// Ask the terminal which image protocols it renders. Emits a kitty graphics
+/// support query then Primary DA; DA is the fence (every terminal answers it, so
+/// its reply ends the wait — no fixed timeout to guess). Returns nothing if stdin
+/// isn't a tty or the terminal stays silent. Must run before the stdin→PTY bridge
+/// starts, so the replies are consumed here and not forwarded to the child.
+fn probe_caps() -> Caps {
+    use rustix::termios::{OptionalActions, SpecialCodeIndex, tcgetattr, tcsetattr};
+    use std::os::fd::AsFd;
+    let stdin = std::io::stdin();
+    let fd = stdin.as_fd();
+    let Ok(saved) = tcgetattr(fd) else {
+        return Caps::default(); // not a tty
+    };
+    // Read with a 0.1s-per-read timeout (VMIN=0/VTIME=1) so a silent terminal can't
+    // hang startup; restore the raw settings afterward.
+    let mut probe = saved.clone();
+    probe.special_codes[SpecialCodeIndex::VMIN] = 0;
+    probe.special_codes[SpecialCodeIndex::VTIME] = 1;
+    if tcsetattr(fd, OptionalActions::Now, &probe).is_err() {
+        return Caps::default();
+    }
+    let _ = rustix::io::write(
+        std::io::stdout().as_fd(),
+        b"\x1b_Gi=1,a=q,s=1,v=1,t=d,f=24;AAAA\x1b\\\x1b[c",
+    );
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 256];
+    // A real terminal answers DA in milliseconds and we break the instant it does
+    // (VTIME returns on first byte, it doesn't wait out the tick). This 0.5s cap
+    // (5 × 0.1s) only bounds the pathological "tty that never answers DA" — a bare
+    // pty, not a real terminal — while still covering a slow ssh round-trip.
+    for _ in 0..5 {
+        match rustix::io::read(fd, &mut chunk) {
+            Ok(0) => {} // timeout tick, keep waiting
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(_) => break,
+        }
+        if da_seen(&buf) {
+            break;
+        }
+    }
+    let _ = tcsetattr(fd, OptionalActions::Now, &saved);
+    parse_caps(&buf)
+}
+
+/// Terminals that render the iTerm2 inline-image protocol. Its OSC 1337 has no
+/// capability query (unlike kitty graphics / sixel), so this is the one protocol we
+/// can only detect by a `TERM_PROGRAM` signature — a deliberate, documented
+/// exception to the query-don't-sniff rule.
+// ponytail: extend the list as other terminals adopt the iTerm2 protocol.
+fn iterm_supported() -> bool {
+    matches!(
+        std::env::var("TERM_PROGRAM").as_deref(),
+        Ok("iTerm.app" | "WezTerm" | "vscode" | "mintty" | "Hyper" | "rio")
+    )
+}
+
+/// A Primary DA reply (`ESC [ ? … c`) has arrived — the handshake fence.
+fn da_seen(buf: &[u8]) -> bool {
+    find(buf, b"\x1b[?").is_some_and(|p| find(&buf[p + 3..], b"c").is_some())
+}
+
+/// Interpret the collected handshake replies.
+fn parse_caps(buf: &[u8]) -> Caps {
+    Caps {
+        kitty: kitty_ok(buf),
+        sixel: da_sixel(buf),
+    }
+}
+
+/// A kitty graphics APC reply (`ESC _ G … ; OK … ST`) confirms support.
+fn kitty_ok(buf: &[u8]) -> bool {
+    let mut i = 0;
+    while let Some(p) = find(&buf[i..], b"\x1b_G") {
+        let start = i + p + 3;
+        let end = find(&buf[start..], b"\x1b\\").map_or(buf.len(), |e| start + e);
+        if find(&buf[start..end], b";OK").is_some() {
+            return true;
+        }
+        i = end;
+    }
+    false
+}
+
+/// The Primary DA feature list includes `4` (sixel).
+fn da_sixel(buf: &[u8]) -> bool {
+    let Some(p) = find(buf, b"\x1b[?") else {
+        return false;
+    };
+    let params = &buf[p + 3..];
+    let end = params
+        .iter()
+        .position(|&b| b == b'c')
+        .unwrap_or(params.len());
+    params[..end].split(|&b| b == b';').any(|f| f == b"4")
+}
+
+/// Byte-substring search (needle non-empty).
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
 /// Owns the terminal's raw-mode state: `acquire` enters raw and remembers the
 /// original settings; `leave`/`enter` toggle between them for the hub-outage pause.
 struct RawMode {
@@ -488,6 +617,23 @@ impl RawMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handshake_replies_parse_to_caps() {
+        // kitty OK + a DA that lists sixel (4).
+        let both = b"\x1b_Gi=1;OK\x1b\\\x1b[?62;4;22c";
+        let caps = parse_caps(both);
+        assert!(caps.kitty && caps.sixel);
+        assert!(da_seen(both));
+
+        // DA without 4, and a kitty *error* reply → neither.
+        let neither = b"\x1b_Gi=1;ENOTSUPPORTED:nope\x1b\\\x1b[?62;22c";
+        let caps = parse_caps(neither);
+        assert!(!caps.kitty && !caps.sixel);
+
+        // No DA yet → fence hasn't arrived.
+        assert!(!da_seen(b"\x1b_Gi=1;OK\x1b\\"));
+    }
 
     // A 2-row-tall image; its sentinel marks the *bottom* row.
     fn placed(mark: char) -> Placed {

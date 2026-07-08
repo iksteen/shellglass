@@ -63,8 +63,6 @@ pub enum Segment {
 
 const ITERM: &[u8] = b"\x1b]1337;";
 const KITTY: &[u8] = b"\x1b_G";
-/// Longest start marker, for the split-across-reads carry.
-const MAX_MARKER: usize = ITERM.len();
 
 /// Streaming extractor. Owns only the bytes of an in-flight image sequence plus a
 /// tiny carry for a start marker split across a read boundary.
@@ -77,6 +75,12 @@ pub struct Interceptor {
     kitty: Option<KittyAccum>,
     /// In-flight iTerm2 multipart transfer (`MultipartFile`→`FilePart`*→`FileEnd`).
     iterm: Option<ItermAccum>,
+    /// Intercept kitty / iTerm2 sequences. A protocol the local terminal doesn't
+    /// render is left in the stream (vt100 sees it, matching the terminal) rather
+    /// than consumed into a web image the local terminal wouldn't show — see the
+    /// capability handshake in `pty.rs`.
+    do_kitty: bool,
+    do_iterm: bool,
 }
 
 /// Concatenated iTerm2 `FilePart` base64 across a multipart transfer, with the
@@ -131,8 +135,27 @@ enum KittyMedium {
 }
 
 impl Interceptor {
+    /// Intercept both protocols — for tests and when capabilities are unknown.
+    #[cfg(test)]
     pub fn new() -> Self {
-        Self::default()
+        Self::with(true, true)
+    }
+
+    /// Intercept only the protocols the terminal supports (per the handshake).
+    pub fn with(do_kitty: bool, do_iterm: bool) -> Self {
+        Self {
+            do_kitty,
+            do_iterm,
+            ..Default::default()
+        }
+    }
+
+    /// True if `s` is a nonempty proper prefix of an *enabled* start marker — a
+    /// marker split across the read boundary, carried until the rest arrives.
+    fn split_prefix(&self, s: &[u8]) -> bool {
+        !s.is_empty()
+            && ((self.do_iterm && s.len() < ITERM.len() && ITERM.starts_with(s))
+                || (self.do_kitty && s.len() < KITTY.len() && KITTY.starts_with(s)))
     }
 
     /// Feed one PTY read; returns the segments to apply in order.
@@ -158,11 +181,11 @@ impl Interceptor {
                 continue;
             }
             let rest = &data[i..];
-            let kind = if rest.starts_with(ITERM) {
+            let kind = if self.do_iterm && rest.starts_with(ITERM) {
                 Some(Marker::Iterm)
-            } else if rest.starts_with(KITTY) {
+            } else if self.do_kitty && rest.starts_with(KITTY) {
                 Some(Marker::Kitty)
-            } else if rest.len() < MAX_MARKER && is_marker_prefix(rest) {
+            } else if self.split_prefix(rest) {
                 // Possible marker split across the read boundary — carry the tail.
                 push_pass(&mut out, &data[pass_start..i]);
                 self.seq = rest.to_vec();
@@ -476,12 +499,6 @@ fn strip_terminator(body: &[u8]) -> &[u8] {
     }
 }
 
-/// True if `s` is a nonempty prefix of one of the start markers (for the
-/// split-across-reads carry).
-fn is_marker_prefix(s: &[u8]) -> bool {
-    (!s.is_empty()) && (ITERM.starts_with(s) || KITTY.starts_with(s))
-}
-
 fn push_pass(out: &mut Vec<Segment>, bytes: &[u8]) {
     if !bytes.is_empty() {
         out.push(Segment::Pass(bytes.to_vec()));
@@ -553,6 +570,29 @@ mod tests {
         assert_eq!(imgs[0].mime, "image/png");
         assert_eq!(imgs[0].cells, Some((4, 2)));
         assert_eq!(imgs[0].base64, b64);
+    }
+
+    #[test]
+    fn gated_off_protocol_passes_through() {
+        // Kitty off (terminal doesn't support it): the sequence is not consumed —
+        // it passes through to vt100, matching what the local terminal shows.
+        let mut it = Interceptor::with(false, true);
+        let s = format!("\x1b_Ga=T,f=100,t=d;{}\x1b\\", png_b64());
+        let segs = it.feed(s.as_bytes());
+        assert!(only_images(segs.clone()).is_empty());
+        let passed: Vec<u8> = segs
+            .into_iter()
+            .filter_map(|seg| match seg {
+                Segment::Pass(b) => Some(b),
+                Segment::Image(_) => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(passed, s.as_bytes(), "gated-off bytes reach vt100 verbatim");
+        // iTerm2 is still intercepted (its flag is on).
+        let mut it2 = Interceptor::with(false, true);
+        let s2 = format!("\x1b]1337;File=inline=1:{}\x07", png_b64());
+        assert_eq!(only_images(it2.feed(s2.as_bytes())).len(), 1);
     }
 
     #[test]
