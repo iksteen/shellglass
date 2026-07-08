@@ -69,7 +69,12 @@ body[data-offline] .dot { background:#ef4444; animation:pulse-off 1s infinite; }
    symmetrically between the two bars and centering in the stage IS centering
    in the window. */
 footer { max-width:1140px; width:100%; margin:0 auto; padding:14px clamp(16px,5vw,40px);
-  color:var(--text-mute); font-size:13px; border-top:1px solid var(--border); }
+  color:var(--text-mute); font-size:13px; border-top:1px solid var(--border);
+  display:flex; align-items:center; justify-content:space-between; gap:16px; }
+/* Live stream stats, populated by the renderer (empty until it connects). Tabular
+   figures + nowrap so the numbers don't jitter or wrap the footer as they update. */
+.stats { font-family:ui-monospace,Menlo,Consolas,monospace; font-variant-numeric:tabular-nums;
+  white-space:nowrap; color:var(--text-mute); }
 
 /* ── CRT tube ─────────────────────────────────────────────────────────────
    The panel is styled as a curved glass tube (thick bezel, deep corner
@@ -234,7 +239,10 @@ body[data-offline="operator"] .offline .off-op { display:block; }
     </div>
   </div>
 </main>
-<footer>Live over SSE — <a href="https://github.com/iksteen/shellglass">shellglass</a>.</footer>
+<footer>
+  <span>Live over SSE — <a href="https://github.com/iksteen/shellglass">shellglass</a>.</span>
+  <span class="stats" id="sg-stats"></span>
+</footer>
 <script>
 // Fit + zoom + pan. The terminal is scaled with CSS `zoom` (it affects layout —
 // unlike transform — so the panel tightens around the result): the base factor

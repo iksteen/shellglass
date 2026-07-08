@@ -919,6 +919,11 @@ const TARGET_LOAD = 0.7; // spend ≤70% of wall-clock painting
 const MAX_INTERVAL = 250;
 let paintCost = 16; // EWMA of measured frame cost (ms); seeds at one 60fps frame
 
+// Footer stats counters (see startStats): total SSE payload received, and the number
+// of paints actually committed (throttled re-arms don't count).
+let bytesIn = 0;
+let paints = 0;
+
 const raf = (cb: () => void) =>
   (typeof requestAnimationFrame !== "undefined" ? requestAnimationFrame : (f: () => void) => setTimeout(f, 16))(cb);
 const clock = () => (typeof performance !== "undefined" ? performance.now() : 0);
@@ -941,6 +946,7 @@ function flushPaint(): void {
   }
   lastFlush = now;
   paintScheduled = false;
+  paints++;
 
   if (rebuildBanner !== null) {
     screenEl.innerHTML = rebuildBanner;
@@ -1104,7 +1110,10 @@ function connect(events: string): void {
     sseDown = false;
     refreshLive();
   };
-  es.onmessage = (e) => apply(JSON.parse(e.data) as Msg);
+  es.onmessage = (e) => {
+    bytesIn += (e.data as string).length;
+    apply(JSON.parse(e.data) as Msg);
+  };
   es.addEventListener("operator", (e) => {
     operatorDown = (e as MessageEvent).data === "0";
     refreshLive();
@@ -1118,6 +1127,35 @@ function connect(events: string): void {
   };
 }
 
+function fmtRate(bytesPerSec: number): string {
+  if (bytesPerSec >= 1e6) return `${(bytesPerSec / 1e6).toFixed(1)} MB/s`;
+  if (bytesPerSec >= 1e3) return `${(bytesPerSec / 1e3).toFixed(0)} KB/s`;
+  return `${bytesPerSec.toFixed(0)} B/s`;
+}
+
+// Footer stats, refreshed once a second: SSE payload throughput, the frames-per-second
+// the adaptive shaper is currently allowing (its pacing interval), and the fps actually
+// committed. Rates are per-window (deltas ÷ elapsed), so they reflect the last second,
+// not a since-boot average. No-ops if the template has no #sg-stats (custom templates).
+function startStats(): void {
+  const el = document.getElementById("sg-stats");
+  if (!el) return;
+  let lastBytes = 0;
+  let lastPaints = 0;
+  let lastT = clock();
+  setInterval(() => {
+    const t = clock();
+    const dt = (t - lastT) / 1000 || 1;
+    const bps = (bytesIn - lastBytes) / dt;
+    const fps = (paints - lastPaints) / dt;
+    const cap = 1000 / Math.min(paintCost / TARGET_LOAD, MAX_INTERVAL);
+    lastBytes = bytesIn;
+    lastPaints = paints;
+    lastT = t;
+    el.textContent = `${fmtRate(bps)} · ${fps.toFixed(0)} fps (cap ${cap.toFixed(0)})`;
+  }, 1000);
+}
+
 function main(): void {
   const boot = (
     window as unknown as { SHELLGLASS: { events: string; cfg: Cfg; proto?: number; js?: string } }
@@ -1126,6 +1164,7 @@ function main(): void {
   setProto(boot.proto, boot.js);
   screenEl = document.getElementById("screen")!;
   connect(boot.events);
+  startStats();
 }
 
 // Only bootstrap in the browser; importing this module in Node (tests) is inert.

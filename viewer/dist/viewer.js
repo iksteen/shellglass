@@ -646,6 +646,8 @@ let lastFlush = 0;
 const TARGET_LOAD = 0.7;
 const MAX_INTERVAL = 250;
 let paintCost = 16;
+let bytesIn = 0;
+let paints = 0;
 const raf = (cb) => (typeof requestAnimationFrame !== "undefined" ? requestAnimationFrame : (f) => setTimeout(f, 16))(cb);
 const clock = () => (typeof performance !== "undefined" ? performance.now() : 0);
 function schedulePaint() {
@@ -663,6 +665,7 @@ function flushPaint() {
     }
     lastFlush = now;
     paintScheduled = false;
+    paints++;
     if (rebuildBanner !== null) {
         screenEl.innerHTML = rebuildBanner;
         rebuildBanner = null;
@@ -791,7 +794,10 @@ function connect(events) {
         sseDown = false;
         refreshLive();
     };
-    es.onmessage = (e) => apply(JSON.parse(e.data));
+    es.onmessage = (e) => {
+        bytesIn += e.data.length;
+        apply(JSON.parse(e.data));
+    };
     es.addEventListener("operator", (e) => {
         operatorDown = e.data === "0";
         refreshLive();
@@ -804,12 +810,39 @@ function connect(events) {
         }
     };
 }
+function fmtRate(bytesPerSec) {
+    if (bytesPerSec >= 1e6)
+        return `${(bytesPerSec / 1e6).toFixed(1)} MB/s`;
+    if (bytesPerSec >= 1e3)
+        return `${(bytesPerSec / 1e3).toFixed(0)} KB/s`;
+    return `${bytesPerSec.toFixed(0)} B/s`;
+}
+function startStats() {
+    const el = document.getElementById("sg-stats");
+    if (!el)
+        return;
+    let lastBytes = 0;
+    let lastPaints = 0;
+    let lastT = clock();
+    setInterval(() => {
+        const t = clock();
+        const dt = (t - lastT) / 1000 || 1;
+        const bps = (bytesIn - lastBytes) / dt;
+        const fps = (paints - lastPaints) / dt;
+        const cap = 1000 / Math.min(paintCost / TARGET_LOAD, MAX_INTERVAL);
+        lastBytes = bytesIn;
+        lastPaints = paints;
+        lastT = t;
+        el.textContent = `${fmtRate(bps)} · ${fps.toFixed(0)} fps (cap ${cap.toFixed(0)})`;
+    }, 1000);
+}
 function main() {
     const boot = window.SHELLGLASS;
     setConfig(boot.cfg);
     setProto(boot.proto, boot.js);
     screenEl = document.getElementById("screen");
     connect(boot.events);
+    startStats();
 }
 if (typeof document !== "undefined" && window.SHELLGLASS) {
     main();
