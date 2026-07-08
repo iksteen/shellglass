@@ -255,6 +255,16 @@ fn screen_thread(
                                 mime: img.mime,
                                 data: img.base64,
                             });
+                            // Advance the parser's cursor onto the image's *last*
+                            // row, matching how a terminal leaves the cursor after
+                            // displaying one: emitters (chafa, imgcat) then add their
+                            // own trailing newline to land just below it. Feeding the
+                            // full height would leave an extra blank line. `\r` first
+                            // so the column resets like a fresh line.
+                            if let Some(h) = rows {
+                                parser.process(b"\r");
+                                parser.process(&vec![b'\n'; h.saturating_sub(1) as usize]);
+                            }
                         }
                         Segment::ClearImages => images.clear(),
                     }
