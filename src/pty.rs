@@ -108,7 +108,7 @@ pub fn start(command: &[String]) -> Result<(watch::Receiver<Arc<Frame>>, Notifie
     // the terminal supports, so the web mirror matches what's on the local screen
     // rather than eating a sequence into a web image the terminal never showed.
     let caps = probe_caps();
-    let intercept = (caps.kitty, iterm_supported());
+    let intercept = (caps.kitty, iterm_supported(), caps.sixel);
     // Clear the local terminal so the mirrored session starts from a blank screen,
     // matching the fresh (blank) parser that viewers see (also wipes any handshake
     // reply artifacts).
@@ -227,7 +227,7 @@ fn screen_thread(
     raw: RawMode,
     mut parser: vt100::Parser,
     cell: (u16, u16),
-    intercept: (bool, bool),
+    intercept: (bool, bool, bool),
 ) {
     let mut out = std::io::stdout();
     let mut connected = true; // teeing shell output to the terminal
@@ -238,7 +238,7 @@ fn screen_thread(
     // private-use sentinel glyph into the parser grid at its top-left. That cell
     // then rides vt100's own scrolling/eviction/reflow, so each frame we just read
     // the sentinel's position back (see `resolve_images`) — no scroll heuristics.
-    let mut interceptor = Interceptor::with(intercept.0, intercept.1);
+    let mut interceptor = Interceptor::with(intercept.0, intercept.1, intercept.2);
     let mut images: Vec<Placed> = Vec::new();
     let mut mark_seq: u32 = 0;
     loop {
@@ -460,8 +460,6 @@ struct Caps {
     /// Kitty graphics — the `a=q` query drew an `OK` response.
     kitty: bool,
     /// Sixel — Primary DA listed feature `4`.
-    // ponytail: consumed when sixel interception lands; the DA already reports it.
-    #[allow(dead_code)]
     sixel: bool,
 }
 

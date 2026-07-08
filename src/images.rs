@@ -12,9 +12,10 @@
 //! (`MultipartFile`/`FilePart`/`FileEnd`); kitty `_G` in
 //! PNG (`f=100`) or raw RGB/RGBA (`f=24`/`f=32`, re-encoded to PNG) over any of the
 //! direct (`t=d`), file (`t=f`/`t=t`), or shared-memory (`t=s`) transmission
-//! mediums. For the file/shm mediums the payload is a path/name, so we read the
-//! same bytes the real terminal reads — read-only, since the terminal keeps
-//! rendering locally and owns any cleanup, so we never race its delete.
+//! mediums; and sixel DCS (`ESC P … q … ST`, decoded to RGBA and re-encoded to
+//! PNG). For the file/shm mediums the payload is a path/name, so we read the same
+//! bytes the real terminal reads — read-only, since the terminal keeps rendering
+//! locally and owns any cleanup, so we never race its delete.
 
 use base64::Engine;
 use base64::engine::DecodePaddingMode;
@@ -63,6 +64,8 @@ pub enum Segment {
 
 const ITERM: &[u8] = b"\x1b]1337;";
 const KITTY: &[u8] = b"\x1b_G";
+/// DCS introducer. Sixel is `ESC P <params> q …`; other DCS strings pass through.
+const DCS: &[u8] = b"\x1bP";
 
 /// Streaming extractor. Owns only the bytes of an in-flight image sequence plus a
 /// tiny carry for a start marker split across a read boundary.
@@ -75,12 +78,13 @@ pub struct Interceptor {
     kitty: Option<KittyAccum>,
     /// In-flight iTerm2 multipart transfer (`MultipartFile`→`FilePart`*→`FileEnd`).
     iterm: Option<ItermAccum>,
-    /// Intercept kitty / iTerm2 sequences. A protocol the local terminal doesn't
-    /// render is left in the stream (vt100 sees it, matching the terminal) rather
-    /// than consumed into a web image the local terminal wouldn't show — see the
-    /// capability handshake in `pty.rs`.
+    /// Intercept kitty / iTerm2 / sixel sequences. A protocol the local terminal
+    /// doesn't render is left in the stream (vt100 sees it, matching the terminal)
+    /// rather than consumed into a web image the local terminal wouldn't show — see
+    /// the capability handshake in `pty.rs`.
     do_kitty: bool,
     do_iterm: bool,
+    do_sixel: bool,
 }
 
 /// Concatenated iTerm2 `FilePart` base64 across a multipart transfer, with the
@@ -135,17 +139,18 @@ enum KittyMedium {
 }
 
 impl Interceptor {
-    /// Intercept both protocols — for tests and when capabilities are unknown.
+    /// Intercept all protocols — for tests and when capabilities are unknown.
     #[cfg(test)]
     pub fn new() -> Self {
-        Self::with(true, true)
+        Self::with(true, true, true)
     }
 
     /// Intercept only the protocols the terminal supports (per the handshake).
-    pub fn with(do_kitty: bool, do_iterm: bool) -> Self {
+    pub fn with(do_kitty: bool, do_iterm: bool, do_sixel: bool) -> Self {
         Self {
             do_kitty,
             do_iterm,
+            do_sixel,
             ..Default::default()
         }
     }
@@ -155,7 +160,8 @@ impl Interceptor {
     fn split_prefix(&self, s: &[u8]) -> bool {
         !s.is_empty()
             && ((self.do_iterm && s.len() < ITERM.len() && ITERM.starts_with(s))
-                || (self.do_kitty && s.len() < KITTY.len() && KITTY.starts_with(s)))
+                || (self.do_kitty && s.len() < KITTY.len() && KITTY.starts_with(s))
+                || (self.do_sixel && s.len() < DCS.len() && DCS.starts_with(s)))
     }
 
     /// Feed one PTY read; returns the segments to apply in order.
@@ -185,6 +191,20 @@ impl Interceptor {
                 Some(Marker::Iterm)
             } else if self.do_kitty && rest.starts_with(KITTY) {
                 Some(Marker::Kitty)
+            } else if self.do_sixel && rest.starts_with(DCS) {
+                match sixel_dcs(rest) {
+                    Some(true) => Some(Marker::Sixel),
+                    Some(false) => {
+                        i += 1; // a non-sixel DCS — leave it for vt100
+                        continue;
+                    }
+                    None => {
+                        // DCS header split across the read boundary — carry the tail.
+                        push_pass(&mut out, &data[pass_start..i]);
+                        self.seq = rest.to_vec();
+                        return out;
+                    }
+                }
             } else if self.split_prefix(rest) {
                 // Possible marker split across the read boundary — carry the tail.
                 push_pass(&mut out, &data[pass_start..i]);
@@ -225,6 +245,7 @@ impl Interceptor {
         match marker {
             Marker::Iterm => self.parse_iterm(seq),
             Marker::Kitty => self.parse_kitty(seq),
+            Marker::Sixel => parse_sixel(seq),
         }
     }
 
@@ -416,6 +437,40 @@ fn encode_png(width: u32, height: u32, channels: u8, pixels: &[u8]) -> Option<Ve
 enum Marker {
     Iterm,
     Kitty,
+    Sixel,
+}
+
+/// Classify a DCS beginning at `s` (`s` starts with `ESC P`): `Some(true)` = sixel
+/// (`ESC P <numeric params> q …`), `Some(false)` = some other DCS to pass through,
+/// `None` = the header runs past this read and must be carried and retried.
+fn sixel_dcs(s: &[u8]) -> Option<bool> {
+    let mut j = DCS.len();
+    while j < s.len() && (s[j].is_ascii_digit() || s[j] == b';') {
+        j += 1;
+    }
+    match s.get(j) {
+        Some(b'q') => Some(true),
+        Some(_) => Some(false),
+        None => None, // params reach the buffer end — need more bytes
+    }
+}
+
+/// Decode a sixel DCS (`ESC P … q … ST`) to RGBA (via `icy_sixel`), then re-encode
+/// as PNG the browser can render. Sixel carries no cell size, so `pty.rs` derives
+/// one from the pixel dimensions.
+fn parse_sixel(seq: &[u8]) -> Option<Segment> {
+    let img = icy_sixel::SixelImage::decode(seq).ok()?;
+    let (w, h) = (
+        u32::try_from(img.width).ok()?,
+        u32::try_from(img.height).ok()?,
+    );
+    let png = encode_png(w, h, 4, &img.pixels)?;
+    Some(Segment::Image(Image {
+        mime: "image/png".to_string(),
+        base64: B64.encode(&png),
+        cells: None,
+        px: Some((w, h)),
+    }))
 }
 
 /// A single-shot iTerm2 `File=<k=v>;…:<base64>` payload (verb and terminator
@@ -475,12 +530,13 @@ fn cells_from(c: Option<&String>, r: Option<&String>) -> Option<(u16, u16)> {
 }
 
 /// Find the end (one past the terminator) of an image sequence starting at `s[0]`.
-/// iTerm2 ends at BEL or ST; kitty ends at ST (`ESC \`).
+/// iTerm2 ends at BEL or ST; kitty and sixel end at ST (`ESC \`, or 8-bit `0x9c`).
 fn find_terminator(s: &[u8], marker: Marker) -> Option<usize> {
     let mut i = 1; // skip the leading ESC so we don't match it as an ST
     while i < s.len() {
         match s[i] {
             0x07 if matches!(marker, Marker::Iterm) => return Some(i + 1), // BEL
+            0x9c if matches!(marker, Marker::Sixel) => return Some(i + 1), // 8-bit ST
             0x1b if i + 1 < s.len() && s[i + 1] == b'\\' => return Some(i + 2), // ST
             0x1b if i + 1 == s.len() => return None, // ESC at very end — need more
             _ => i += 1,
@@ -574,11 +630,15 @@ mod tests {
 
     #[test]
     fn gated_off_protocol_passes_through() {
-        // Kitty off (terminal doesn't support it): the sequence is not consumed —
-        // it passes through to vt100, matching what the local terminal shows.
-        let mut it = Interceptor::with(false, true);
+        // Kitty + sixel off (terminal doesn't support them): those sequences are not
+        // consumed — they pass through to vt100, matching what the terminal shows.
+        let mut it = Interceptor::with(false, true, false);
         let s = format!("\x1b_Ga=T,f=100,t=d;{}\x1b\\", png_b64());
-        let segs = it.feed(s.as_bytes());
+        let sixel = icy_sixel::SixelImage::from_rgba(vec![255, 0, 0, 255], 1, 1)
+            .encode()
+            .unwrap();
+        let stream = format!("{s}{sixel}");
+        let segs = it.feed(stream.as_bytes());
         assert!(only_images(segs.clone()).is_empty());
         let passed: Vec<u8> = segs
             .into_iter()
@@ -588,11 +648,46 @@ mod tests {
             })
             .flatten()
             .collect();
-        assert_eq!(passed, s.as_bytes(), "gated-off bytes reach vt100 verbatim");
+        assert_eq!(
+            passed,
+            stream.as_bytes(),
+            "gated-off bytes reach vt100 verbatim"
+        );
         // iTerm2 is still intercepted (its flag is on).
-        let mut it2 = Interceptor::with(false, true);
+        let mut it2 = Interceptor::with(false, true, false);
         let s2 = format!("\x1b]1337;File=inline=1:{}\x07", png_b64());
         assert_eq!(only_images(it2.feed(s2.as_bytes())).len(), 1);
+    }
+
+    #[test]
+    fn sixel_dcs_decoded_to_png() {
+        // Round-trip: encode a 2x2 image to a sixel DCS, feed it through, and confirm
+        // it comes back out as a PNG with pixel dims (no cell hint → derived later).
+        let rgba = vec![
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+        ];
+        let sixel = icy_sixel::SixelImage::from_rgba(rgba, 2, 2)
+            .encode()
+            .unwrap();
+        assert!(sixel.as_bytes().starts_with(DCS), "emitter produces a DCS");
+        let mut it = Interceptor::new();
+        let imgs = only_images(it.feed(sixel.as_bytes()));
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].mime, "image/png");
+        // Sixel packs rows into 6px bands, so a round-tripped 2x2 can come back
+        // padded to 2x6 — we don't assert exact dims, just that they're carried.
+        let (w, h) = imgs[0].px.unwrap();
+        assert_eq!(w, 2);
+        assert!(h >= 2);
+        assert_eq!(imgs[0].cells, None);
+    }
+
+    #[test]
+    fn sixel_dcs_classification() {
+        assert_eq!(sixel_dcs(b"\x1bP0;1;0q\"1;1"), Some(true)); // sixel
+        assert_eq!(sixel_dcs(b"\x1bP$qm"), Some(false)); // DECRQSS, not sixel
+        assert_eq!(sixel_dcs(b"\x1bP0;1;0"), None); // header split before the `q`
+        assert_eq!(sixel_dcs(DCS), None);
     }
 
     #[test]
