@@ -281,12 +281,9 @@ fn screen_thread(
                             });
                             let (cols, rows) =
                                 cells.map_or((None, None), |(c, r)| (Some(c), Some(r)));
-                            // Advance the parser's cursor onto the image's *last* row,
-                            // matching how a terminal leaves the cursor after displaying
-                            // one: emitters (chafa, imgcat) then add their own trailing
-                            // newline to land just below it. Feeding the full height
-                            // would leave an extra blank line. `\r` first so the column
-                            // resets like a fresh line.
+                            // Advance the parser's cursor onto the image's *last* row
+                            // (the sentinel goes here); we step one line further below
+                            // after placing it. `\r` first so the column resets.
                             if let Some(h) = rows {
                                 parser.process(b"\r");
                                 parser.process(&vec![b'\n'; h.saturating_sub(1) as usize]);
@@ -302,10 +299,20 @@ fn screen_thread(
                             mark_seq = mark_seq.wrapping_add(1);
                             parser.process(format!("\x1b[{}G", col + 1).as_bytes());
                             parser.process(mark.encode_utf8(&mut [0u8; 4]).as_bytes());
-                            // Reset the column so the emitter's trailing newline lands
-                            // at the start of the next line (not indented past the
-                            // sentinel we just wrote); leaves the cursor on the last row.
+                            // Reset the column, then — when the image has height — step
+                            // onto the line *below* it, where a sixel-scrolling terminal
+                            // leaves the cursor. Landing below (not on the sentinel's row)
+                            // is what keeps the image alive: a raw `cat image.sixel` adds
+                            // no trailing newline, so the shell repaints its prompt
+                            // immediately; if the cursor stayed on the sentinel's row that
+                            // repaint would overwrite the sentinel and `resolve_images`
+                            // would evict the image. An emitter that *does* add a trailing
+                            // newline (chafa) then lands one line further, as in the
+                            // terminal.
                             parser.process(b"\r");
+                            if rows.is_some() {
+                                parser.process(b"\n");
+                            }
                             images.push(Placed {
                                 mark,
                                 img: ImagePlacement {
