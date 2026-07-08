@@ -281,40 +281,56 @@ fn screen_thread(
                             });
                             let (cols, rows) =
                                 cells.map_or((None, None), |(c, r)| (Some(c), Some(r)));
-                            // Advance the parser's cursor onto the image's *last* row
-                            // (the sentinel goes here); we step one line further below
-                            // after placing it. `\r` first so the column resets.
-                            if let Some(h) = rows {
+                            // Track the image with two sentinel glyphs — one at its
+                            // *top*-left, one at its *bottom*-left — written into the
+                            // parser grid so vt100 handles scroll/reflow/eviction for us
+                            // (`resolve_images` reads them back). Two, because each covers
+                            // a case the other can't:
+                            //   • bottom sentinel → lets the image keep *clipping* as it
+                            //     scrolls off the top (evicted only once the last row is
+                            //     gone), but it sits on the row the cursor lands on, so
+                            //     the next output can overwrite it in place;
+                            //   • top sentinel → sits in the static region above the
+                            //     cursor, surviving that in-place overwrite. A raw
+                            //     `cat image.sixel` adds no trailing newline, so the shell
+                            //     repaints its prompt straight over the bottom sentinel's
+                            //     row; the top sentinel is what keeps the image alive then.
+                            // ponytail: a 1-row-tall image (≤ one cell high) collapses the
+                            // two sentinels onto the same cursor row, so a following prompt
+                            // can still evict it — a <16px sliver the terminal half-clobbers
+                            // too, not worth contorting the cursor rule for. Give each image
+                            // a distinct pair of codepoints from Plane-16 PUA (U+100000+),
+                            // which terminal content never carries — unlike U+E000 BMP PUA,
+                            // where Nerd Font / Powerline glyphs would false-match a
+                            // sentinel. `\x1b[{col+1}G` (CHA, 1-based) re-homes to the left.
+                            let mut next_mark = || {
+                                let m = char::from_u32(0x10_0000 + mark_seq % 0xFFFE).unwrap();
+                                mark_seq = mark_seq.wrapping_add(1);
+                                m
+                            };
+                            let top = next_mark();
+                            let cha = format!("\x1b[{}G", col + 1);
+                            parser.process(cha.as_bytes());
+                            parser.process(top.encode_utf8(&mut [0u8; 4]).as_bytes());
+                            // Advance onto the image's last row and drop the bottom
+                            // sentinel; leave the cursor there (col 0), which is where a
+                            // sixel-scrolling terminal leaves it — an emitter's own
+                            // trailing newline (chafa) then lands one line below, matching
+                            // the terminal exactly.
+                            let bottom = if let Some(h) = rows {
                                 parser.process(b"\r");
                                 parser.process(&vec![b'\n'; h.saturating_sub(1) as usize]);
-                            }
-                            // Sentinel glyph at the image's *bottom*-left, so vt100
-                            // tracks the cell as it scrolls/reflows. Anchoring at the
-                            // bottom (not top) lets the image keep clipping as it scrolls
-                            // off the top — it's only evicted once even the last row is
-                            // gone. `\x1b[{col+1}G` puts it back under the image's left
-                            // column (CHA is 1-based). Unique per live image (the
-                            // private-use area is 6400 codepoints; rotate).
-                            let mark = char::from_u32(0xE000 + mark_seq % 6400).unwrap();
-                            mark_seq = mark_seq.wrapping_add(1);
-                            parser.process(format!("\x1b[{}G", col + 1).as_bytes());
-                            parser.process(mark.encode_utf8(&mut [0u8; 4]).as_bytes());
-                            // Reset the column, then — when the image has height — step
-                            // onto the line *below* it, where a sixel-scrolling terminal
-                            // leaves the cursor. Landing below (not on the sentinel's row)
-                            // is what keeps the image alive: a raw `cat image.sixel` adds
-                            // no trailing newline, so the shell repaints its prompt
-                            // immediately; if the cursor stayed on the sentinel's row that
-                            // repaint would overwrite the sentinel and `resolve_images`
-                            // would evict the image. An emitter that *does* add a trailing
-                            // newline (chafa) then lands one line further, as in the
-                            // terminal.
+                                let b = next_mark();
+                                parser.process(cha.as_bytes());
+                                parser.process(b.encode_utf8(&mut [0u8; 4]).as_bytes());
+                                b
+                            } else {
+                                top // no height: the two coincide
+                            };
                             parser.process(b"\r");
-                            if rows.is_some() {
-                                parser.process(b"\n");
-                            }
                             images.push(Placed {
-                                mark,
+                                top,
+                                bottom,
                                 img: ImagePlacement {
                                     row: i16::try_from(row).unwrap_or(0),
                                     col,
@@ -382,11 +398,14 @@ fn new_parser(rows: u16, cols: u16) -> vt100::Parser {
     vt100::Parser::new(rows, cols, 0)
 }
 
-/// An inline image plus its grid sentinel. The sentinel — a private-use glyph
-/// written into the parser at the image's top-left — rides the vt100 grid, so
-/// scrolling, eviction, and reflow are tracked by the parser, not guessed.
+/// An inline image plus its two grid sentinels — Plane-16 private-use glyphs
+/// written into the parser at the image's top-left and bottom-left. They ride the
+/// vt100 grid, so scrolling, eviction, and reflow are tracked by the parser, not
+/// guessed. The bottom sentinel drives clipping as the image scrolls off the top;
+/// the top sentinel survives an in-place overwrite of the bottom row (see placement).
 struct Placed {
-    mark: char,
+    top: char,
+    bottom: char,
     img: ImagePlacement,
 }
 
@@ -399,25 +418,40 @@ fn frame_from(parser: &vt100::Parser, images: &mut Vec<Placed>) -> Arc<Frame> {
     Arc::new(Frame::Screen(grid))
 }
 
-/// For each tracked image, find its sentinel in the grid → that's its *bottom*-left
-/// now; the top row is that minus the image height (negative once it's partially
-/// scrolled off the top, so the viewer clips it). Blank the sentinel cell so it
-/// never renders (the overlay covers it, but a transparent image would otherwise
-/// show it). Drop images with no sentinel left (fully scrolled off, or cleared).
+/// For each tracked image, locate its sentinels in the grid and set its top-left.
+/// Prefer the top sentinel (its row *is* the image top); fall back to the bottom
+/// one (top row = its row minus the image height, going negative once the image is
+/// partially scrolled off the top, so the viewer clips it). Blank both sentinel
+/// cells so they never render (the overlay covers them, but a transparent image
+/// would otherwise show them). Drop images with neither sentinel left — fully
+/// scrolled off, or cleared.
 fn resolve_images(grid: &mut crate::model::Grid, images: &mut Vec<Placed>) {
     images.retain_mut(|p| {
+        let mut top = None;
+        let mut bottom = None;
         for (r, row) in grid.rows.iter_mut().enumerate() {
             for (c, cell) in row.iter_mut().enumerate() {
-                if cell.text.starts_with(p.mark) {
-                    let h = p.img.rows.unwrap_or(1).max(1);
-                    p.img.row = r as i16 - i16::try_from(h - 1).unwrap_or(0);
-                    p.img.col = c as u16;
+                if cell.text.starts_with(p.top) {
+                    top = Some((r, c));
                     *cell = crate::model::StyledCell::default(); // scrub
-                    return true;
+                } else if cell.text.starts_with(p.bottom) {
+                    bottom = Some((r, c));
+                    *cell = crate::model::StyledCell::default(); // scrub
                 }
             }
         }
-        false // sentinel gone → evict
+        if let Some((r, c)) = top {
+            p.img.row = r as i16;
+            p.img.col = c as u16;
+            true
+        } else if let Some((r, c)) = bottom {
+            let h = p.img.rows.unwrap_or(1).max(1);
+            p.img.row = r as i16 - i16::try_from(h - 1).unwrap_or(0);
+            p.img.col = c as u16;
+            true
+        } else {
+            false // both sentinels gone → evict
+        }
     });
     grid.images = images.iter().map(|p| p.img.clone()).collect();
 }
@@ -640,10 +674,13 @@ mod tests {
         assert!(!da_seen(b"\x1b_Gi=1;OK\x1b\\"));
     }
 
-    // A 2-row-tall image; its sentinel marks the *bottom* row.
+    // A 2-row-tall image whose bottom sentinel is `mark`. The top sentinel is a
+    // distinct glyph the caller doesn't place, so resolution falls back to the
+    // bottom one — exercising the clip-as-it-scrolls path.
     fn placed(mark: char) -> Placed {
         Placed {
-            mark,
+            top: '\u{E7FF}', // never written to the grid in these tests
+            bottom: mark,
             img: ImagePlacement {
                 row: 0,
                 col: 0,
@@ -693,5 +730,41 @@ mod tests {
             panic!("screen")
         };
         assert!(g.images.is_empty());
+    }
+
+    // The top sentinel keeps the image alive when the bottom one is overwritten in
+    // place — e.g. a shell prompt repainted right after a raw `cat image.sixel`,
+    // which adds no trailing newline. The image reports its top row (from the top
+    // sentinel) and is not evicted.
+    #[test]
+    fn top_sentinel_survives_bottom_overwrite() {
+        let (top, bottom) = ('\u{E000}', '\u{E001}');
+        let mut parser = new_parser(4, 10);
+        // top sentinel on row 0, bottom sentinel on row 1 (a 2-row image).
+        parser.process(top.encode_utf8(&mut [0u8; 4]).as_bytes());
+        parser.process(b"\r\n");
+        parser.process(bottom.encode_utf8(&mut [0u8; 4]).as_bytes());
+        parser.process(b"\r"); // cursor at col 0 of the bottom row (as after placement)
+        let mut imgs = vec![Placed {
+            top,
+            bottom,
+            img: ImagePlacement {
+                row: 0,
+                col: 0,
+                cols: Some(2),
+                rows: Some(2),
+                mime: "image/png".into(),
+                data: String::new(),
+            },
+        }];
+
+        // A prompt repaints the bottom sentinel's row, clobbering that sentinel.
+        parser.process(b"user@host$ ");
+        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs) else {
+            panic!("screen")
+        };
+        // Still tracked, via the top sentinel, at its true top row.
+        assert_eq!(g.images.len(), 1);
+        assert_eq!((g.images[0].row, g.images[0].col), (0, 0));
     }
 }
