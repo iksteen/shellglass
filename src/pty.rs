@@ -266,16 +266,35 @@ fn screen_thread(
                             });
                             let (cols, rows) =
                                 cells.map_or((None, None), |(c, r)| (Some(c), Some(r)));
-                            // Sentinel glyph at the top-left, so vt100 tracks the
-                            // image's cell as it scrolls/reflows. Unique per live
-                            // image (private-use area is 6400 codepoints; rotate).
+                            // Advance the parser's cursor onto the image's *last* row,
+                            // matching how a terminal leaves the cursor after displaying
+                            // one: emitters (chafa, imgcat) then add their own trailing
+                            // newline to land just below it. Feeding the full height
+                            // would leave an extra blank line. `\r` first so the column
+                            // resets like a fresh line.
+                            if let Some(h) = rows {
+                                parser.process(b"\r");
+                                parser.process(&vec![b'\n'; h.saturating_sub(1) as usize]);
+                            }
+                            // Sentinel glyph at the image's *bottom*-left, so vt100
+                            // tracks the cell as it scrolls/reflows. Anchoring at the
+                            // bottom (not top) lets the image keep clipping as it scrolls
+                            // off the top — it's only evicted once even the last row is
+                            // gone. `\x1b[{col+1}G` puts it back under the image's left
+                            // column (CHA is 1-based). Unique per live image (the
+                            // private-use area is 6400 codepoints; rotate).
                             let mark = char::from_u32(0xE000 + mark_seq % 6400).unwrap();
                             mark_seq = mark_seq.wrapping_add(1);
+                            parser.process(format!("\x1b[{}G", col + 1).as_bytes());
                             parser.process(mark.encode_utf8(&mut [0u8; 4]).as_bytes());
+                            // Reset the column so the emitter's trailing newline lands
+                            // at the start of the next line (not indented past the
+                            // sentinel we just wrote); leaves the cursor on the last row.
+                            parser.process(b"\r");
                             images.push(Placed {
                                 mark,
                                 img: ImagePlacement {
-                                    row,
+                                    row: i16::try_from(row).unwrap_or(0),
                                     col,
                                     cols,
                                     rows,
@@ -283,17 +302,6 @@ fn screen_thread(
                                     data: img.base64,
                                 },
                             });
-                            // Advance the parser's cursor onto the image's *last*
-                            // row, matching how a terminal leaves the cursor after
-                            // displaying one: emitters (chafa, imgcat) then add their
-                            // own trailing newline to land just below it. Feeding the
-                            // full height would leave an extra blank line. `\r` first
-                            // so the column resets (and cancels the sentinel's pending
-                            // wrap) like a fresh line.
-                            if let Some(h) = rows {
-                                parser.process(b"\r");
-                                parser.process(&vec![b'\n'; h.saturating_sub(1) as usize]);
-                            }
                         }
                     }
                 }
@@ -369,15 +377,18 @@ fn frame_from(parser: &vt100::Parser, images: &mut Vec<Placed>) -> Arc<Frame> {
     Arc::new(Frame::Screen(grid))
 }
 
-/// For each tracked image, find its sentinel in the grid → that's its top-left now;
-/// blank the sentinel cell so it never renders (the overlay covers it, but a
-/// transparent image would otherwise show it). Drop images with no sentinel left.
+/// For each tracked image, find its sentinel in the grid → that's its *bottom*-left
+/// now; the top row is that minus the image height (negative once it's partially
+/// scrolled off the top, so the viewer clips it). Blank the sentinel cell so it
+/// never renders (the overlay covers it, but a transparent image would otherwise
+/// show it). Drop images with no sentinel left (fully scrolled off, or cleared).
 fn resolve_images(grid: &mut crate::model::Grid, images: &mut Vec<Placed>) {
     images.retain_mut(|p| {
         for (r, row) in grid.rows.iter_mut().enumerate() {
             for (c, cell) in row.iter_mut().enumerate() {
                 if cell.text.starts_with(p.mark) {
-                    p.img.row = r as u16;
+                    let h = p.img.rows.unwrap_or(1).max(1);
+                    p.img.row = r as i16 - i16::try_from(h - 1).unwrap_or(0);
                     p.img.col = c as u16;
                     *cell = crate::model::StyledCell::default(); // scrub
                     return true;
@@ -478,6 +489,7 @@ impl RawMode {
 mod tests {
     use super::*;
 
+    // A 2-row-tall image; its sentinel marks the *bottom* row.
     fn placed(mark: char) -> Placed {
         Placed {
             mark,
@@ -485,39 +497,47 @@ mod tests {
                 row: 0,
                 col: 0,
                 cols: Some(2),
-                rows: Some(1),
+                rows: Some(2),
                 mime: "image/png".into(),
                 data: String::new(),
             },
         }
     }
 
-    /// The grid sentinel rides vt100's own scrolling: it moves up as the screen
-    /// scrolls and disappears (evicting the image) once it passes the top.
+    /// The bottom sentinel rides vt100's own scrolling: the reported top row falls
+    /// as the screen scrolls, goes negative while the image clips against the top
+    /// edge, and the image is only evicted once even its bottom row is gone.
     #[test]
-    fn sentinel_tracks_scroll_and_evicts() {
+    fn sentinel_tracks_scroll_clips_then_evicts() {
         let mut parser = new_parser(3, 10); // 3 rows
         let mark = '\u{E000}';
         parser.process(b"\r\n\r\n"); // cursor to the last row
         parser.process(mark.encode_utf8(&mut [0u8; 4]).as_bytes());
         let mut imgs = vec![placed(mark)];
 
-        // Placed on the last row; the sentinel cell is scrubbed out of the wire grid.
+        // Bottom sentinel at row 2, height 2 → top row 1. Sentinel cell is scrubbed.
         let Frame::Screen(g) = &*frame_from(&parser, &mut imgs) else {
             panic!("screen")
         };
-        assert_eq!((g.images[0].row, g.images[0].col), (2, 0));
+        assert_eq!((g.images[0].row, g.images[0].col), (1, 0));
         assert!(g.rows[2].first().is_none_or(|c| c.text.is_empty()));
 
-        // One scroll (newline on the last row) lifts the sentinel to row 1.
+        // One scroll lifts the sentinel to row 1 → top row 0.
         parser.process(b"\r\nx");
         let Frame::Screen(g) = &*frame_from(&parser, &mut imgs) else {
             panic!("screen")
         };
-        assert_eq!(g.images[0].row, 1);
+        assert_eq!(g.images[0].row, 0);
 
-        // Two more scrolls push it off the top → the image is evicted.
-        parser.process(b"\r\n\r\n");
+        // Another scroll: sentinel at row 0 → top row -1, image still shown (clipped).
+        parser.process(b"\r\ny");
+        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs) else {
+            panic!("screen")
+        };
+        assert_eq!(g.images[0].row, -1);
+
+        // One more: the bottom row is gone too → the image is evicted.
+        parser.process(b"\r\nz");
         let Frame::Screen(g) = &*frame_from(&parser, &mut imgs) else {
             panic!("screen")
         };

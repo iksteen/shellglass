@@ -71,7 +71,7 @@ interface FullMsg {
 // One inline image (iTerm2/kitty) placed at a cell. `m`/`d` build a data: URL;
 // `w`/`h` (cols/rows) size it, else it renders at natural pixel size.
 export interface ImageRef {
-  r: number; // top row
+  r: number; // top row (may be negative: the image is clipped above the top edge)
   c: number; // left col
   w?: number; // width in cells
   h?: number; // height in cells (rows)

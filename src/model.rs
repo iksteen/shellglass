@@ -105,9 +105,10 @@ pub(crate) fn is_false(b: &bool) -> bool {
 /// message under the `i` key (see [`crate::diff`]); the browser decodes the base64.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImagePlacement {
-    /// Top-left cell of the image.
+    /// Top-left cell of the image. May be negative when the image has partially
+    /// scrolled off the top: the viewer clips it above the screen edge.
     #[serde(rename = "r")]
-    pub row: u16,
+    pub row: i16,
     #[serde(rename = "c")]
     pub col: u16,
     /// Display size in cells, if the app specified one (else the browser uses the
