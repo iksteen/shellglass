@@ -8,7 +8,8 @@
 //! escape sequences across calls on its own. So the only thing this scanner has to
 //! reassemble across PTY read boundaries is an image sequence itself.
 //!
-//! Handled: iTerm2 OSC 1337 (always a direct base64 image file); kitty `_G` in
+//! Handled: iTerm2 OSC 1337 `File` — single-shot or multipart
+//! (`MultipartFile`/`FilePart`/`FileEnd`); kitty `_G` in
 //! PNG (`f=100`) or raw RGB/RGBA (`f=24`/`f=32`, re-encoded to PNG) over any of the
 //! direct (`t=d`), file (`t=f`/`t=t`), or shared-memory (`t=s`) transmission
 //! mediums. For the file/shm mediums the payload is a path/name, so we read the
@@ -74,6 +75,15 @@ pub struct Interceptor {
     /// Concatenated kitty base64 payload across `m=1` chunks, with the display-cell
     /// hint from the first chunk.
     kitty: Option<KittyAccum>,
+    /// In-flight iTerm2 multipart transfer (`MultipartFile`→`FilePart`*→`FileEnd`).
+    iterm: Option<ItermAccum>,
+}
+
+/// Concatenated iTerm2 `FilePart` base64 across a multipart transfer, with the
+/// display-cell hint from the opening `MultipartFile`.
+struct ItermAccum {
+    payload: String,
+    cells: Option<(u16, u16)>,
 }
 
 struct KittyAccum {
@@ -190,9 +200,39 @@ impl Interceptor {
     /// Parse a complete image sequence (marker .. terminator inclusive).
     fn parse_sequence(&mut self, marker: Marker, seq: &[u8]) -> Option<Segment> {
         match marker {
-            Marker::Iterm => parse_iterm(seq).map(Segment::Image),
+            Marker::Iterm => self.parse_iterm(seq),
             Marker::Kitty => self.parse_kitty(seq),
         }
+    }
+
+    /// Handle one iTerm2 `\x1b]1337;` sequence: a single-shot `File=` image, or one
+    /// verb of a multipart transfer (`MultipartFile=` opens, `FilePart=` appends,
+    /// `FileEnd` flushes).
+    fn parse_iterm(&mut self, seq: &[u8]) -> Option<Segment> {
+        let body = strip_terminator(&seq[ITERM.len()..]);
+        if let Some(args) = body.strip_prefix(b"File=") {
+            return iterm_single(args).map(Segment::Image);
+        }
+        if let Some(args) = body.strip_prefix(b"MultipartFile=") {
+            let kv = parse_kv(args, b';');
+            self.iterm = Some(ItermAccum {
+                payload: String::new(),
+                cells: cells_from(kv.get("width"), kv.get("height")),
+            });
+            return None;
+        }
+        if let Some(part) = body.strip_prefix(b"FilePart=") {
+            if let Some(acc) = self.iterm.as_mut() {
+                acc.payload
+                    .push_str(std::str::from_utf8(part).unwrap_or("").trim());
+            }
+            return None;
+        }
+        if body.starts_with(b"FileEnd") {
+            let acc = self.iterm.take()?;
+            return image_from_b64(acc.payload, acc.cells).map(Segment::Image);
+        }
+        None
     }
 
     /// Handle one kitty `_G` sequence, accumulating `m=1` chunks.
@@ -355,15 +395,13 @@ enum Marker {
     Kitty,
 }
 
-/// iTerm2 `\x1b]1337;File=<k=v>;…:<base64><term>`.
-fn parse_iterm(seq: &[u8]) -> Option<Image> {
-    // Body between the marker and the terminator (BEL or ST).
-    let body = strip_terminator(&seq[ITERM.len()..]);
+/// A single-shot iTerm2 `File=<k=v>;…:<base64>` payload (verb and terminator
+/// already stripped): `args` is `name=…;width=…;height=…;inline=1:<base64>`.
+fn iterm_single(args: &[u8]) -> Option<Image> {
     // Split params from base64 at the first ':'.
-    let colon = body.iter().position(|&b| b == b':')?;
-    let params = &body[..colon];
-    let b64 = std::str::from_utf8(&body[colon + 1..]).ok()?.trim();
-    // Params look like `File=name=…;width=…;height=…;inline=1`.
+    let colon = args.iter().position(|&b| b == b':')?;
+    let params = &args[..colon];
+    let b64 = std::str::from_utf8(&args[colon + 1..]).ok()?.trim();
     let kv = parse_kv(params, b';');
     let cells = cells_from(kv.get("width"), kv.get("height"));
     image_from_b64(b64.to_string(), cells)
@@ -496,6 +534,34 @@ mod tests {
         assert_eq!(imgs[0].mime, "image/png");
         assert_eq!(imgs[0].cells, Some((4, 2)));
         assert_eq!(imgs[0].base64, b64);
+    }
+
+    #[test]
+    fn iterm_multipart_image_reassembled() {
+        // MultipartFile (metadata, no data) → FilePart* (base64 chunks) → FileEnd.
+        // Only FileEnd yields the image; the cell hint comes from the opener.
+        let mut it = Interceptor::new();
+        let b64 = png_b64();
+        let (p1, p2) = b64.split_at(9);
+        let mut segs = it.feed(b"\x1b]1337;MultipartFile=inline=1;width=4;height=2\x07");
+        segs.extend(it.feed(format!("\x1b]1337;FilePart={p1}\x07").as_bytes()));
+        segs.extend(it.feed(format!("\x1b]1337;FilePart={p2}\x07").as_bytes()));
+        assert!(only_images(segs).is_empty(), "no image until FileEnd");
+        let end = it.feed(b"\x1b]1337;FileEnd\x07");
+        let imgs = only_images(end);
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].mime, "image/png");
+        assert_eq!(imgs[0].cells, Some((4, 2)));
+        assert_eq!(imgs[0].base64, b64);
+    }
+
+    #[test]
+    fn iterm_orphan_filepart_ignored() {
+        // A FilePart/FileEnd with no opening MultipartFile must not panic or emit.
+        let mut it = Interceptor::new();
+        let mut segs = it.feed(b"\x1b]1337;FilePart=AAAA\x07");
+        segs.extend(it.feed(b"\x1b]1337;FileEnd\x07"));
+        assert!(only_images(segs).is_empty());
     }
 
     #[test]
