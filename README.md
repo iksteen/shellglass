@@ -5,7 +5,8 @@ You run an interactive command in a pseudo-terminal (the `script(1)` model) — 
 your terminal, the browser watches. Rendering is always **live** — terminal state is kept
 in a long-lived vt100 parser and pushed to the browser over SSE, with no polling and no
 per-tick subprocess — and carries Kitty-style `symbol_map` font overrides (map Unicode
-codepoint ranges to specific fonts, e.g. Nerd Font glyph ranges).
+codepoint ranges to specific fonts, e.g. Nerd Font glyph ranges) and **inline images**
+(kitty graphics, iTerm2, sixel — mirrored when your terminal renders them).
 
 Two ways to serve it:
 
@@ -150,6 +151,32 @@ drops (hub restart, network blip) the client re-registers and reconnects automat
 and the local session pauses cleanly, showing the outage in your terminal until it's
 back.
 
+## Inline images
+
+Terminal graphics are mirrored to the browser. When the session shows an image via any
+of the three inline-image protocols, viewers see it too — positioned at its terminal
+cell, scrolling with the content:
+
+| Protocol | Emitted by (e.g.) | Coverage |
+|----------|-------------------|----------|
+| **kitty graphics** (`ESC _G`) | `kitten icat`, `timg`, `chafa -f kitty` | PNG and raw RGB/RGBA (re-encoded to PNG), chunked transfers, zlib compression, and the direct / file / temp-file / shared-memory transmission mediums |
+| **iTerm2** (`OSC 1337 File`) | `imgcat`, `wezterm imgcat`, `chafa -f iterm` | single-shot and multipart transfers; browser-native image formats (PNG, JPEG, GIF, WebP) |
+| **sixel** (`ESC P … q`) | `img2sixel`, `chafa -f sixel` | decoded and re-encoded to PNG (browsers don't render sixel) |
+
+**The mirror only shows what your terminal shows.** At startup shellglass asks the
+terminal which protocols it actually renders — kitty graphics via its query escape,
+sixel via the Primary DA feature list, iTerm2 (which has no query) by a small
+`TERM_PROGRAM` allowlist — and intercepts only those. A protocol your terminal doesn't
+render passes through untouched, so the browser stays faithful to the local screen in
+both directions: no image appears on the web that didn't appear in the terminal, and
+none is lost that did.
+
+Images behave like they do in a cell-based terminal: they scroll with the text, clip
+against the top edge on the way out, and disappear when the screen region they occupy is
+cleared or fully overwritten. Everything works in hub mode too — images ride the same
+frame stream, and late-joining viewers get any image currently on screen. The read-only
+SSH view is cells-only and does not show images.
+
 ## Read-only SSH view
 
 Add `--ssh-bind <addr>` to `serve` or `hub` to also expose the session as a **read-only
@@ -293,7 +320,8 @@ custom pages work off-box too.
 ## Status
 
 Mirror an interactive command in a PTY (the `script(1)` model, one screen) with live
-rendering, standalone + client/hub push, an optional read-only SSH view (`--ssh-bind`),
+rendering, inline images (kitty graphics / iTerm2 / sixel, gated on what the terminal
+renders), standalone + client/hub push, an optional read-only SSH view (`--ssh-bind`),
 viewer templating (built-in page with a CRT toggle, or a custom template), and optional
 hub TLS (own cert or ACME/Let's Encrypt). Not yet: scrollback, multiple sessions/panes in
 one view.
