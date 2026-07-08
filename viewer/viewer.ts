@@ -725,19 +725,26 @@ function redrawCanvasAll(): void {
 // When most of the screen changes every frame (cmatrix, `yes`, fast scroll), the DOM
 // is the wrong medium: thousands of positioned spans rebuilt per frame cost tens of
 // ms of style+layout+paint, and no amount of pacing makes that fast. So under
-// sustained near-full-screen change we stop touching row DOM entirely and paint the
-// cells — backgrounds, text, canvas glyphs — straight onto the (already cell-exact,
-// dpr-aware) canvas overlay: no style recalc, no layout, single composited surface,
-// a few ms per full frame. The adaptive shaper then sees cheap frames and raises the
-// rate on its own — the two mechanisms compose. DOM rows are hidden (not removed)
-// while the storm lasts; when the input calms or goes quiet we repaint the rows from
-// state and return to DOM, so text selection and CRT text-shadow are only suspended
-// during animation, when nobody is selecting text anyway.
+// sustained near-full-screen change the visible picture moves to the (already
+// cell-exact, dpr-aware) canvas overlay — backgrounds, text, crisp glyph geometry —
+// no style recalc, near-zero layout, single composited surface, a few ms per full
+// frame. The adaptive shaper then sees cheap frames and raises the rate on its own —
+// the two mechanisms compose.
+//
+// The DOM rows stay, as GHOST TEXT: each row is one unstyled text node
+// (textContent, no spans, transparent color) kept in sync with the grid. That is
+// the degenerate case DOM layout is fast at, and it keeps select/copy working
+// through the canvas (which is pointer-events:none): the browser's selection
+// highlight paints in the DOM layer and shows through — the canvas clears to
+// transparent instead of filling the default bg, so it never occludes it. The CRT
+// text-shadow is forced off on ghost rows (shadows have explicit colors and would
+// render even for transparent text). On calm the rows repaint fully styled.
 //
 // Fidelity: same cells, same color math (cellFg / storm bg mirror cellStyle), same
 // canvas geometry for box glyphs. Deliberate storm-only approximations, ponytail:
-// symbol_map/SVG fill glyphs render with the base font, and text baseline is the
-// em-box middle — pixel-nudge differences during full-screen animation only.
+// symbol_map/SVG fill glyphs render with the base font, text baseline is the
+// em-box middle, and selection highlight sits under the canvas ink — pixel-nudge
+// differences during full-screen animation only.
 let storm = false;
 let stormHot = 0; // consecutive high-change flushes (enter counter)
 let lastStormy = 0; // last time a flush looked stormy (exit-on-calm/idle timestamp)
@@ -752,21 +759,22 @@ function cellBgRgb(cell: Cell, isCursor: boolean): RGB | null {
   return resolveRgb(cell.g);
 }
 
-// Paint one row band entirely on the canvas: opaque default-bg fill (covers the
-// hidden DOM), per-cell backgrounds, then ink — crisp geometry for canvas glyphs,
+// Paint one row band entirely on the canvas: clear to transparent (the ghost text
+// below is invisible, #screen supplies the backdrop, and a selection highlight must
+// show through), per-cell backgrounds, then ink — crisp geometry for canvas glyphs,
 // fillText for everything else. maxWidth pins a glyph into its cell box like the
 // DOM's .run overflow:hidden does.
 function drawRowStorm(r: number): void {
   if (!ctx || !canvasEl) return;
   const y0 = Math.round(r * cellH * dpr);
   const y1 = Math.round((r + 1) * cellH * dpr);
-  ctx.fillStyle = cfg.defBg;
-  ctx.fillRect(0, y0, canvasEl.width, y1 - y0);
+  ctx.clearRect(0, y0, canvasEl.width, y1 - y0);
   const row = screen.cells[r];
   if (!row) return;
   ctx.textBaseline = "middle";
   const midY = Math.round((r + 0.5) * cellH * dpr);
   const ul = Math.max(1, Math.round(dpr));
+  const defBg = cfg.defBg.toLowerCase();
   let curFont = "";
   let c = 0;
   for (const cell of row) {
@@ -775,7 +783,10 @@ function drawRowStorm(r: number): void {
     const x0 = Math.round(c * cellW * dpr);
     const x1 = Math.round((c + w) * cellW * dpr);
     const bg = cellBgRgb(cell, isCursor);
-    if (bg) {
+    // Skip fills that match the default bg (apps often set it explicitly — ncurses
+    // color pairs): #screen already shows that color, and an opaque fill here would
+    // blanket the selection highlight painting in the ghost layer below.
+    if (bg && hex(bg) !== defBg) {
       ctx.fillStyle = hex(bg);
       ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
     }
@@ -796,15 +807,57 @@ function drawRowStorm(r: number): void {
   }
 }
 
-// Switch media. Entering: hide the rows and paint the whole grid on canvas (must be
-// complete — the canvas is now the only truth on screen). Leaving: repaint every row's
-// DOM from state (it went stale while hidden) and give the canvas back to the
+// The ghost backing for one row: the grid's plain characters as a single text node.
+// textContent (not innerHTML) — no parsing, no spans, no styles; wide cells emit
+// their grapheme once and monospace CJK advances 2ch, matching the styled path's
+// column math, so a selection maps to the picture the canvas paints on top.
+function ghostRow(r: number): void {
+  const el = screen.rowEls[r];
+  if (!el) return;
+  let text = "";
+  for (const cell of screen.cells[r] ?? []) text += cell.t && cell.t.length ? cell.t : " ";
+  el.textContent = text;
+}
+
+// Replacing a row's text node destroys any selection Range anchored in it — at storm
+// rates a drag-selection would die within one flush. So while a selection is live the
+// ghost layer FREEZES (the canvas on top keeps painting the true screen); the user
+// copies what was on screen when they selected — the only coherent semantics for
+// copying out of a running animation. When the selection clears, the next flush
+// resyncs every row.
+let ghostStale = false;
+function selectionActive(): boolean {
+  if (typeof getSelection === "undefined") return false;
+  const s = getSelection();
+  return s !== null && !s.isCollapsed;
+}
+
+// Ghost styling lives in a viewer-injected rule (not the served CSS) so it can never
+// skew against this file through the hub, which mixes the pusher's CSS with its own
+// viewer.js. The explicit ::selection background is the visible highlight — the UA
+// default is unreliable over transparent text.
+let ghostCss = false;
+function ensureGhostCss(): void {
+  if (ghostCss || typeof document === "undefined") return;
+  ghostCss = true;
+  const st = document.createElement("style");
+  st.textContent =
+    ".row.ghost{color:transparent;text-shadow:none}" +
+    ".row.ghost::selection{background:rgba(110,170,255,.4)}";
+  document.head.appendChild(st);
+}
+
+// Switch media. Entering: ghost every row (uncolorized selectable text) and paint the
+// whole grid on canvas (must be complete — the canvas is now the whole picture).
+// Leaving: repaint every row's DOM fully styled and give the canvas back to the
 // glyph-only pass.
 function setStorm(on: boolean): void {
   if (storm === on) return;
   storm = on;
-  for (const el of screen.rowEls) el.style.visibility = on ? "hidden" : "";
+  ensureGhostCss();
+  for (const el of screen.rowEls) el.classList.toggle("ghost", on);
   if (on) {
+    for (let r = 0; r < screen.cells.length; r++) ghostRow(r);
     redrawCanvasAll();
     // Exit is time-based, not flush-based: when the animation stops, messages stop,
     // flushes stop — a counter would strand us on canvas forever. A watchdog sees
@@ -1112,9 +1165,17 @@ function flushPaint(): void {
     } else if (!storm) {
       stormHot = 0;
     }
+    const frozen = storm && selectionActive();
+    if (storm && !frozen && ghostStale) {
+      // Selection just cleared — the ghost layer froze while it was live; resync all.
+      for (let r = 0; r < screen.cells.length; r++) ghostRow(r);
+      ghostStale = false;
+    }
     for (const r of dirtyRows) {
       if (storm) {
         drawRowStorm(r);
+        if (frozen) ghostStale = true;
+        else ghostRow(r); // keep the selectable backing text in sync with the picture
       } else {
         const el = screen.rowEls[r];
         if (!el) continue;

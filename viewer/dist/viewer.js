@@ -546,14 +546,14 @@ function drawRowStorm(r) {
         return;
     const y0 = Math.round(r * cellH * dpr);
     const y1 = Math.round((r + 1) * cellH * dpr);
-    ctx.fillStyle = cfg.defBg;
-    ctx.fillRect(0, y0, canvasEl.width, y1 - y0);
+    ctx.clearRect(0, y0, canvasEl.width, y1 - y0);
     const row = screen.cells[r];
     if (!row)
         return;
     ctx.textBaseline = "middle";
     const midY = Math.round((r + 0.5) * cellH * dpr);
     const ul = Math.max(1, Math.round(dpr));
+    const defBg = cfg.defBg.toLowerCase();
     let curFont = "";
     let c = 0;
     for (const cell of row) {
@@ -562,7 +562,7 @@ function drawRowStorm(r) {
         const x0 = Math.round(c * cellW * dpr);
         const x1 = Math.round((c + w) * cellW * dpr);
         const bg = cellBgRgb(cell, isCursor);
-        if (bg) {
+        if (bg && hex(bg) !== defBg) {
             ctx.fillStyle = hex(bg);
             ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
         }
@@ -584,13 +584,43 @@ function drawRowStorm(r) {
         c += w;
     }
 }
+function ghostRow(r) {
+    const el = screen.rowEls[r];
+    if (!el)
+        return;
+    let text = "";
+    for (const cell of screen.cells[r] ?? [])
+        text += cell.t && cell.t.length ? cell.t : " ";
+    el.textContent = text;
+}
+let ghostStale = false;
+function selectionActive() {
+    if (typeof getSelection === "undefined")
+        return false;
+    const s = getSelection();
+    return s !== null && !s.isCollapsed;
+}
+let ghostCss = false;
+function ensureGhostCss() {
+    if (ghostCss || typeof document === "undefined")
+        return;
+    ghostCss = true;
+    const st = document.createElement("style");
+    st.textContent =
+        ".row.ghost{color:transparent;text-shadow:none}" +
+            ".row.ghost::selection{background:rgba(110,170,255,.4)}";
+    document.head.appendChild(st);
+}
 function setStorm(on) {
     if (storm === on)
         return;
     storm = on;
+    ensureGhostCss();
     for (const el of screen.rowEls)
-        el.style.visibility = on ? "hidden" : "";
+        el.classList.toggle("ghost", on);
     if (on) {
+        for (let r = 0; r < screen.cells.length; r++)
+            ghostRow(r);
         redrawCanvasAll();
         lastStormy = clock();
         stormTimer = setInterval(() => {
@@ -797,9 +827,19 @@ function flushPaint() {
         else if (!storm) {
             stormHot = 0;
         }
+        const frozen = storm && selectionActive();
+        if (storm && !frozen && ghostStale) {
+            for (let r = 0; r < screen.cells.length; r++)
+                ghostRow(r);
+            ghostStale = false;
+        }
         for (const r of dirtyRows) {
             if (storm) {
                 drawRowStorm(r);
+                if (frozen)
+                    ghostStale = true;
+                else
+                    ghostRow(r);
             }
             else {
                 const el = screen.rowEls[r];
