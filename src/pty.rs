@@ -16,7 +16,6 @@ use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
@@ -143,16 +142,20 @@ pub fn start(command: &[String]) -> Result<(watch::Receiver<Arc<Frame>>, Notifie
         }
     });
 
-    // Size watcher: reflect terminal resizes into the PTY + parser — immediately on
-    // SIGWINCH, with a 1s poll as a fallback. `master` isn't `Sync`, so it stays in
-    // this one thread rather than being shared with a separate signal thread.
+    // Size watcher: reflect terminal resizes into the PTY + parser on SIGWINCH.
+    // `master` isn't `Sync`, so it stays in this one thread rather than being shared
+    // with a separate signal thread. If signal registration fails (rare), resize
+    // tracking is skipped — the initial size still applies.
     {
         let msg_tx = msg_tx.clone();
-        let winch = Sigwinch::install();
         std::thread::spawn(move || {
+            let Ok(mut signals) =
+                signal_hook::iterator::Signals::new([signal_hook::consts::SIGWINCH])
+            else {
+                return;
+            };
             let mut last = (cols, rows);
-            loop {
-                winch.wait(Duration::from_secs(1)); // wakes on SIGWINCH or timeout
+            for _ in &mut signals {
                 match term_size() {
                     Some(size) if size != last => {
                         last = size;
@@ -284,131 +287,55 @@ fn frame_from(parser: &vt100::Parser) -> Arc<Frame> {
     )))
 }
 
-/// Write end of the SIGWINCH self-pipe, read by the async-signal-safe handler.
-static SIGWINCH_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
-
-extern "C" fn on_sigwinch(_: libc::c_int) {
-    let fd = SIGWINCH_WRITE_FD.load(Ordering::Relaxed);
-    if fd >= 0 {
-        // `write` is async-signal-safe; one byte, best-effort (ignore EAGAIN/etc.).
-        let byte = [0u8; 1];
-        unsafe {
-            libc::write(fd, byte.as_ptr().cast::<libc::c_void>(), 1);
-        }
-    }
-}
-
-/// A self-pipe woken by SIGWINCH: the handler writes a byte and [`Sigwinch::wait`]
-/// blocks on the read end (with a fallback timeout) so terminal resizes are picked
-/// up instantly instead of only on the next poll tick.
-struct Sigwinch {
-    read_fd: i32,
-}
-
-impl Sigwinch {
-    fn install() -> Sigwinch {
-        // SAFETY: create a non-blocking pipe and register a SIGWINCH handler that
-        // only writes to its write end. SA_RESTART so the signal doesn't turn the
-        // other threads' blocking reads into EINTR errors (which would kill them).
-        unsafe {
-            let mut fds = [0i32; 2];
-            if libc::pipe(fds.as_mut_ptr()) != 0 {
-                return Sigwinch { read_fd: -1 }; // fall back to pure polling
-            }
-            let (read_fd, write_fd) = (fds[0], fds[1]);
-            libc::fcntl(read_fd, libc::F_SETFL, libc::O_NONBLOCK);
-            libc::fcntl(write_fd, libc::F_SETFL, libc::O_NONBLOCK);
-            SIGWINCH_WRITE_FD.store(write_fd, Ordering::Relaxed);
-
-            let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = on_sigwinch as extern "C" fn(libc::c_int) as usize;
-            sa.sa_flags = libc::SA_RESTART;
-            libc::sigemptyset(&raw mut sa.sa_mask);
-            libc::sigaction(libc::SIGWINCH, &raw const sa, std::ptr::null_mut());
-            Sigwinch { read_fd }
-        }
-    }
-
-    /// Block until SIGWINCH fires or `timeout` elapses, then drain the pipe.
-    fn wait(&self, timeout: Duration) {
-        if self.read_fd < 0 {
-            std::thread::sleep(timeout);
-            return;
-        }
-        // SAFETY: poll then drain our own non-blocking pipe fd.
-        unsafe {
-            let mut pfd = libc::pollfd {
-                fd: self.read_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
-            libc::poll(&raw mut pfd, 1, ms);
-            let mut buf = [0u8; 64];
-            while libc::read(
-                self.read_fd,
-                buf.as_mut_ptr().cast::<libc::c_void>(),
-                buf.len(),
-            ) > 0
-            {}
-        }
-    }
-}
-
 /// Our controlling terminal's size as (cols, rows), if stdin is a tty.
 fn term_size() -> Option<(u16, u16)> {
-    // SAFETY: ioctl into a zeroed winsize; we only read the result on success.
-    unsafe {
-        let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
-            Some((ws.ws_col, ws.ws_row))
-        } else {
-            None
-        }
-    }
+    let ws = rustix::termios::tcgetwinsize(std::io::stdin()).ok()?;
+    (ws.ws_col > 0).then_some((ws.ws_col, ws.ws_row))
 }
 
 /// Owns the terminal's raw-mode state: `acquire` enters raw and remembers the
 /// original settings; `leave`/`enter` toggle between them for the hub-outage pause.
 struct RawMode {
-    orig: Option<libc::termios>,
+    orig: Option<rustix::termios::Termios>,
 }
 
 impl RawMode {
     fn acquire() -> RawMode {
-        // SAFETY: standard termios raw-mode dance on the real stdin fd.
-        unsafe {
-            let mut t: libc::termios = std::mem::zeroed();
-            if libc::tcgetattr(libc::STDIN_FILENO, &raw mut t) != 0 {
-                return RawMode { orig: None }; // not a tty (e.g. piped) — leave as-is
-            }
-            let orig = t;
-            let mut rawt = t;
-            libc::cfmakeraw(&raw mut rawt);
-            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const rawt);
-            RawMode { orig: Some(orig) }
-        }
+        // tcgetattr fails on a non-tty (e.g. piped) — leave the fd as-is.
+        let Ok(orig) = rustix::termios::tcgetattr(std::io::stdin()) else {
+            return RawMode { orig: None };
+        };
+        let mut rawt = orig.clone();
+        rawt.make_raw();
+        let _ = rustix::termios::tcsetattr(
+            std::io::stdin(),
+            rustix::termios::OptionalActions::Now,
+            &rawt,
+        );
+        RawMode { orig: Some(orig) }
     }
 
     /// Restore the terminal's original (cooked) settings.
     fn leave(&self) {
-        if let Some(orig) = self.orig {
-            // SAFETY: restoring the saved termios on the same fd.
-            unsafe {
-                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const orig);
-            }
+        if let Some(orig) = &self.orig {
+            let _ = rustix::termios::tcsetattr(
+                std::io::stdin(),
+                rustix::termios::OptionalActions::Now,
+                orig,
+            );
         }
     }
 
     /// Re-enter raw mode (from the saved original settings).
     fn enter(&self) {
-        if let Some(orig) = self.orig {
-            // SAFETY: applying a raw variant of the saved termios on the same fd.
-            unsafe {
-                let mut rawt = orig;
-                libc::cfmakeraw(&raw mut rawt);
-                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const rawt);
-            }
+        if let Some(orig) = &self.orig {
+            let mut rawt = orig.clone();
+            rawt.make_raw();
+            let _ = rustix::termios::tcsetattr(
+                std::io::stdin(),
+                rustix::termios::OptionalActions::Now,
+                &rawt,
+            );
         }
     }
 }

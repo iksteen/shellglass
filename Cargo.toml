@@ -19,9 +19,11 @@ getrandom = "0.3"
 libc = "0.2"
 portable-pty = "0.9"
 reqwest = { version = "0.13", default-features = false, features = ["stream", "rustls"] }
+rustix = { version = "1", features = ["termios"] }
 russh = "0.62"
 rustls-acme = { version = "0.15", features = ["axum", "tokio"] }
 serde = { version = "1.0.228", features = ["derive"] }
+signal-hook = { version = "0.4", default-features = false, features = ["iterator"] }
 serde_json = "1"
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
