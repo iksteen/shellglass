@@ -199,14 +199,11 @@ pub fn start(command: &[String]) -> Result<(watch::Receiver<Arc<Frame>>, Notifie
         (geom.px_h / geom.rows.max(1)).max(1),
     );
     std::thread::spawn(move || {
-        screen_thread(
-            msg_rx,
-            frame_tx,
-            raw,
-            new_parser(rows, cols),
-            cell,
-            intercept,
-        );
+        // The real session parser records its blind spots for the exit report
+        // (`new_parser`'s throwaway SeqLog handles the tests/initial frame).
+        let (seqlog, seq_seen) = SeqLog::new();
+        let parser = vt100::Parser::new_with_callbacks(rows, cols, 0, seqlog);
+        screen_thread(msg_rx, frame_tx, raw, parser, seq_seen, cell, intercept);
     });
 
     // When the command exits, tell the screen thread to restore the terminal + quit.
@@ -225,7 +222,8 @@ fn screen_thread(
     msg_rx: mpsc::Receiver<Msg>,
     frame_tx: watch::Sender<Arc<Frame>>,
     raw: RawMode,
-    mut parser: vt100::Parser,
+    mut parser: vt100::Parser<SeqLog>,
+    seq_seen: SeqSeen,
     cell: (u16, u16),
     intercept: (bool, bool, bool),
 ) {
@@ -402,6 +400,8 @@ fn screen_thread(
             Some(Msg::Shutdown) => {
                 raw.leave();
                 let _ = out.flush();
+                // The terminal is cooked again — the one moment printing is safe.
+                report_unmirrored(&seq_seen);
                 std::process::exit(0);
             }
             Some(_) => {} // redundant HubDown/HubUp — ignore
@@ -415,8 +415,136 @@ fn screen_thread(
     }
 }
 
-fn new_parser(rows: u16, cols: u16) -> vt100::Parser {
-    vt100::Parser::new(rows, cols, 0)
+fn new_parser(rows: u16, cols: u16) -> vt100::Parser<SeqLog> {
+    vt100::Parser::new_with_callbacks(rows, cols, 0, SeqLog::new().0)
+}
+
+/// The parser's blind spots, recorded for the exit report. vt100 silently drops
+/// escape sequences it doesn't implement, and each dropped kind is a potential
+/// mirror-fidelity gap — the local terminal may render what the browser doesn't
+/// (the SCOSC/SCORC bug class). In serve/push mode we OWN the terminal (raw
+/// mode and tee), so nothing may be printed while the session runs: kinds are
+/// deduplicated in memory (bounded by [`SeqLog::MAX_KINDS`]) and reported to
+/// stderr once at shutdown, after raw mode is restored. Set
+/// `SHELLGLASS_SEQ_LOG=<path>` to also append each kind as it is first seen —
+/// a file, never the tty — when debugging a long-lived session.
+pub struct SeqLog {
+    seen: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
+    file: Option<std::fs::File>,
+}
+
+/// Shared view of the recorded kinds, for the shutdown report.
+type SeqSeen = Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>;
+
+impl SeqLog {
+    /// Cap on distinct recorded kinds: binary garbage `cat`ed to the terminal
+    /// must not grow memory; whatever real gaps exist will land well before it.
+    const MAX_KINDS: usize = 64;
+
+    fn new() -> (SeqLog, SeqSeen) {
+        let seen: SeqSeen = Arc::default();
+        let file = std::env::var_os("SHELLGLASS_SEQ_LOG").and_then(|p| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .ok()
+        });
+        (
+            SeqLog {
+                seen: seen.clone(),
+                file,
+            },
+            seen,
+        )
+    }
+
+    fn record(&mut self, kind: String) {
+        let mut seen = self.seen.lock().unwrap();
+        if seen.len() >= Self::MAX_KINDS || !seen.insert(kind.clone()) {
+            return;
+        }
+        drop(seen);
+        if let Some(f) = &mut self.file {
+            let _ = writeln!(f, "{kind}");
+        }
+    }
+}
+
+/// One short descriptor per CSI shape. Mode set/reset (`h`/`l`) and SGR (`m`)
+/// gaps are per-parameter, so their params join the key; for everything else
+/// the intermediates + final byte are the kind.
+fn csi_kind(i1: Option<u8>, i2: Option<u8>, params: &[&[u16]], c: char) -> String {
+    let mut s = String::from("CSI");
+    for i in [i1, i2].into_iter().flatten() {
+        s.push(' ');
+        s.push(char::from(i));
+    }
+    if matches!(c, 'h' | 'l' | 'm') {
+        for p in params {
+            s.push(' ');
+            let sub: Vec<String> = p.iter().map(u16::to_string).collect();
+            s.push_str(&sub.join(":"));
+        }
+    }
+    s.push(' ');
+    s.push(c);
+    s
+}
+
+impl vt100::Callbacks for SeqLog {
+    fn unhandled_char(&mut self, _: &mut vt100::Screen, c: char) {
+        // U+FFFD is decode noise from binary output, not a sequence gap.
+        if c != '\u{fffd}' {
+            self.record(format!("CHAR U+{:04X}", u32::from(c)));
+        }
+    }
+    fn unhandled_control(&mut self, _: &mut vt100::Screen, b: u8) {
+        self.record(format!("CTRL 0x{b:02x}"));
+    }
+    fn unhandled_escape(&mut self, _: &mut vt100::Screen, i1: Option<u8>, i2: Option<u8>, b: u8) {
+        let mut s = String::from("ESC");
+        for i in [i1, i2].into_iter().flatten() {
+            s.push(' ');
+            s.push(char::from(i));
+        }
+        s.push(' ');
+        s.push(char::from(b));
+        self.record(s);
+    }
+    fn unhandled_csi(
+        &mut self,
+        _: &mut vt100::Screen,
+        i1: Option<u8>,
+        i2: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        self.record(csi_kind(i1, i2, params, c));
+    }
+    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        let selector = params
+            .first()
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .unwrap_or_default();
+        self.record(format!("OSC {selector}"));
+    }
+}
+
+/// After raw mode is restored (and ONLY then — never mid-session, we own the
+/// screen), tell the operator which escape sequences the mirror couldn't render.
+fn report_unmirrored(seen: &SeqSeen) {
+    let seen = seen.lock().unwrap();
+    if seen.is_empty() {
+        return;
+    }
+    let kinds: Vec<&str> = seen.iter().map(String::as_str).collect();
+    eprintln!(
+        "shellglass: {} escape sequence kind(s) were not mirrored (the local \
+         terminal may have rendered more than the browser): {} — please report",
+        seen.len(),
+        kinds.join(", ")
+    );
 }
 
 /// An inline image plus its corner sentinels — Plane-16 private-use glyphs written
@@ -433,7 +561,7 @@ struct Placed {
 
 /// Write one sentinel glyph at `at_col` on the parser's current row (CHA is
 /// 1-based) and return it. Sentinels rotate through Plane-16 PUA.
-fn drop_mark(parser: &mut vt100::Parser, mark_seq: &mut u32, at_col: u16) -> char {
+fn drop_mark(parser: &mut vt100::Parser<SeqLog>, mark_seq: &mut u32, at_col: u16) -> char {
     let m = char::from_u32(0x10_0000 + *mark_seq % 0xFFFE).unwrap();
     *mark_seq = mark_seq.wrapping_add(1);
     parser.process(format!("\x1b[{}G", at_col + 1).as_bytes());
@@ -444,7 +572,7 @@ fn drop_mark(parser: &mut vt100::Parser, mark_seq: &mut u32, at_col: u16) -> cha
 /// Snapshot the PTY screen as a [`Frame`], resolving each image's sentinel to its
 /// current cell and dropping images whose sentinel is gone (scrolled off the top,
 /// cleared, or overwritten).
-fn frame_from(parser: &vt100::Parser, images: &mut Vec<Placed>) -> Arc<Frame> {
+fn frame_from(parser: &vt100::Parser<SeqLog>, images: &mut Vec<Placed>) -> Arc<Frame> {
     let mut grid = crate::parse::grid_from_screen(parser.screen());
     resolve_images(&mut grid, images);
     Arc::new(Frame::Screen(grid))
@@ -729,6 +857,34 @@ mod tests {
 
         // No DA yet → fence hasn't arrived.
         assert!(!da_seen(b"\x1b_Gi=1;OK\x1b\\"));
+    }
+
+    // Feed sequences vt100 doesn't implement; the parser's SeqLog must record
+    // each kind once, and only the kinds actually seen.
+    #[test]
+    fn seqlog_records_unhandled_kinds_once() {
+        let (seqlog, seen) = SeqLog::new();
+        let mut parser = vt100::Parser::new_with_callbacks(24, 80, 0, seqlog);
+        // DECSTR (CSI ! p), synchronized-output mode (CSI ? 2026 h), and a
+        // handled sequence (CUP) that must NOT be recorded — twice over to
+        // check dedup.
+        for _ in 0..2 {
+            parser.process(b"\x1b[!p\x1b[?2026h\x1b[5;5H");
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.iter().cloned().collect::<Vec<_>>(),
+            vec!["CSI ! p".to_string(), "CSI ? 2026 h".to_string()]
+        );
+    }
+
+    #[test]
+    fn seqlog_kind_cap_bounds_memory() {
+        let (mut seqlog, seen) = SeqLog::new();
+        for i in 0..(SeqLog::MAX_KINDS + 50) {
+            seqlog.record(format!("OSC {i}"));
+        }
+        assert_eq!(seen.lock().unwrap().len(), SeqLog::MAX_KINDS);
     }
 
     // Pins the vendored vt100's SCOSC/SCORC patch from the consumer side: a
