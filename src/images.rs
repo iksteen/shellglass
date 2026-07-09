@@ -77,6 +77,17 @@ const DCS: &[u8] = b"\x1bP";
 /// mode) so a runaway or never-terminated transfer can't grow memory unboundedly.
 const MAX_SEQ_BYTES: usize = 64 << 20;
 
+/// Ceiling on one decoded image, on *every* transmission path. Inline images ride
+/// the full wire frame (diff.rs `i` key), so one image must never inflate a full
+/// frame past `proto::MAX_WS_MESSAGE` (64 MiB): the hub closes an oversized
+/// message, the client reconnects and re-sends a full frame still containing the
+/// same image — a permanent reconnect loop that blinds every viewer until the
+/// image scrolls off locally. 16 MiB decoded (≈21.4 MiB as base64) leaves ample
+/// headroom for the grid riding alongside.
+const MAX_IMAGE_BYTES: u64 = 16 << 20;
+/// [`MAX_IMAGE_BYTES`] before base64 decode (4/3 expansion, rounded up).
+const MAX_B64_BYTES: usize = (MAX_IMAGE_BYTES as usize).div_ceil(3) * 4;
+
 /// Streaming extractor. Owns only the bytes of an in-flight image sequence plus a
 /// tiny carry for a start marker split across a read boundary.
 #[derive(Default)]
@@ -113,6 +124,11 @@ pub struct Interceptor {
 struct ItermAccum {
     payload: String,
     cells: Option<(u16, u16)>,
+    /// The accumulated payload outgrew [`MAX_B64_BYTES`]: the transfer is
+    /// condemned — parts are discarded as they stream and the flush yields
+    /// nothing, so an oversized transfer can neither grow memory nor reach the
+    /// wire.
+    over: bool,
 }
 
 struct KittyAccum {
@@ -127,6 +143,8 @@ struct KittyAccum {
     // `a=d` could evict placements, but corner-sentinel erase already covers the
     // common clears.
     display: bool,
+    /// Payload outgrew [`MAX_B64_BYTES`] — condemned, same as `ItermAccum::over`.
+    over: bool,
     cells: Option<(u16, u16)>,
     fmt: KittyFmt,
     /// Source pixel dimensions (kitty `s`×`v`), needed to encode raw formats.
@@ -387,18 +405,29 @@ impl Interceptor {
             self.iterm = Some(ItermAccum {
                 payload: String::new(),
                 cells: cells_from(kv.get("width"), kv.get("height")),
+                over: false,
             });
             return None;
         }
         if let Some(part) = body.strip_prefix(b"FilePart=") {
             if let Some(acc) = self.iterm.as_mut() {
-                acc.payload
-                    .push_str(std::str::from_utf8(part).unwrap_or("").trim());
+                let part = std::str::from_utf8(part).unwrap_or("").trim();
+                // Condemn an over-cap transfer as it streams — don't buffer what
+                // the wire could never carry.
+                if acc.over || acc.payload.len() + part.len() > MAX_B64_BYTES {
+                    acc.over = true;
+                    acc.payload = String::new();
+                } else {
+                    acc.payload.push_str(part);
+                }
             }
             return None;
         }
         if body.starts_with(b"FileEnd") {
             let acc = self.iterm.take()?;
+            if acc.over {
+                return None;
+            }
             return image_from_b64(acc.payload, acc.cells).map(Segment::Image);
         }
         None
@@ -435,6 +464,7 @@ impl Interceptor {
                 payload: String::new(),
                 // kitty's default action is `t` (transmit-only) — absent ⇒ no display.
                 display: ctrl.get("a").map(String::as_str) == Some("T"),
+                over: false,
                 cells: cells_from(ctrl.get("c"), ctrl.get("r")),
                 fmt,
                 px: cells_from(ctrl.get("s"), ctrl.get("v"))
@@ -446,8 +476,14 @@ impl Interceptor {
             });
         }
         if let Some(acc) = self.kitty.as_mut() {
-            acc.payload
-                .push_str(std::str::from_utf8(payload).unwrap_or(""));
+            let payload = std::str::from_utf8(payload).unwrap_or("");
+            // Condemn an over-cap transfer as it streams (see ItermAccum::over).
+            if acc.over || acc.payload.len() + payload.len() > MAX_B64_BYTES {
+                acc.over = true;
+                acc.payload = String::new();
+            } else {
+                acc.payload.push_str(payload);
+            }
         }
         if more {
             return None; // wait for the rest
@@ -458,6 +494,7 @@ impl Interceptor {
         // nothing for it either.
         let acc = self.kitty.take()?;
         if !acc.display
+            || acc.over
             || matches!(acc.fmt, KittyFmt::Unsupported)
             || matches!(acc.medium, KittyMedium::Unsupported)
         {
@@ -478,6 +515,11 @@ impl Interceptor {
         }
         if acc.zlib {
             bytes = zlib_inflate(&bytes)?;
+        }
+        // Re-check after the S/O window and inflate: a zlib bomb (or any payload
+        // the wire could never carry) stops here, whatever medium it rode in on.
+        if bytes.len() as u64 > MAX_IMAGE_BYTES {
+            return None;
         }
         let image = match acc.fmt {
             KittyFmt::Png => Image {
@@ -517,7 +559,6 @@ impl Interceptor {
 fn read_capped(path: &str) -> Option<Vec<u8>> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
-    const MAX_IMAGE_BYTES: u64 = 16 << 20;
     // O_NONBLOCK: opening a FIFO for reading otherwise blocks until a writer
     // appears — wedging the screen thread and freezing the whole mirror. Regular
     // files ignore the flag entirely.
@@ -648,6 +689,9 @@ fn iterm_single(args: &[u8]) -> Option<Image> {
 /// Decode base64, sniff the format, and package it — or `None` if it isn't a
 /// browser-native image.
 fn image_from_b64(base64: String, cells: Option<(u16, u16)>) -> Option<Image> {
+    if base64.trim().len() > MAX_B64_BYTES {
+        return None; // could never fit the wire — don't even decode it
+    }
     let bytes = B64.decode(base64.trim()).ok()?;
     let mime = sniff_mime(&bytes)?;
     Some(Image {
@@ -681,11 +725,13 @@ fn parse_kv(s: &[u8], sep: u8) -> std::collections::HashMap<String, String> {
         .collect()
 }
 
-/// A cols/rows display hint, only when both are plain integers (cells) — iTerm2's
-/// `Npx`/`N%`/`auto` and kitty pixel sizing fall back to natural size.
+/// A cols/rows display hint, only when both are plain *nonzero* integers (cells) —
+/// iTerm2's `Npx`/`N%`/`auto`, kitty pixel sizing, and a zero fall back to natural
+/// size. Zero matters: a `width=0` reaching the corner math in pty.rs would
+/// underflow `col + w - 1` at column 0.
 fn cells_from(c: Option<&String>, r: Option<&String>) -> Option<(u16, u16)> {
-    let c = c?.parse::<u16>().ok()?;
-    let r = r?.parse::<u16>().ok()?;
+    let c = c?.parse::<u16>().ok().filter(|&v| v > 0)?;
+    let r = r?.parse::<u16>().ok().filter(|&v| v > 0)?;
     Some((c, r))
 }
 
@@ -1170,6 +1216,79 @@ mod tests {
         let got = read_capped(path.to_str().unwrap());
         let _ = std::fs::remove_file(&path);
         assert_eq!(got, None, "over-cap file must be rejected");
+    }
+
+    #[test]
+    fn oversized_direct_payload_dropped_on_every_path() {
+        // An image the wire could never carry (full frame > MAX_WS_MESSAGE would
+        // wedge push mode in a reconnect loop) must be dropped, not forwarded —
+        // for kitty direct, single-shot iTerm2, and multipart iTerm2 alike.
+        let big = "A".repeat(MAX_B64_BYTES + 4);
+        for seq in [
+            format!("\x1b_Ga=T,f=100,t=d;{big}\x1b\\"),
+            format!("\x1b]1337;File=inline=1:{big}\x07"),
+        ] {
+            let mut it = Interceptor::new();
+            let mut segs = Vec::new();
+            for chunk in seq.as_bytes().chunks(1 << 20) {
+                segs.extend(it.feed(chunk));
+            }
+            assert!(only_images(segs).is_empty(), "oversized image forwarded");
+        }
+        let mut it = Interceptor::new();
+        let mut segs = it.feed(b"\x1b]1337;MultipartFile=inline=1\x07");
+        for part in big.as_bytes().chunks(1 << 20) {
+            let seq = format!(
+                "\x1b]1337;FilePart={}\x07",
+                std::str::from_utf8(part).unwrap()
+            );
+            segs.extend(it.feed(seq.as_bytes()));
+        }
+        segs.extend(it.feed(b"\x1b]1337;FileEnd\x07"));
+        assert!(
+            only_images(segs).is_empty(),
+            "oversized multipart forwarded"
+        );
+    }
+
+    #[test]
+    fn zlib_bomb_dropped_after_inflate() {
+        // o=z: a tiny payload inflating past MAX_IMAGE_BYTES must die at the
+        // post-inflate check, before PNG encoding buffers it for the wire.
+        use std::io::Write;
+        let raw = vec![0u8; (2100 * 2100 * 4) as usize]; // ~17.6 MB of zeros
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&raw).unwrap();
+        let bomb = B64.encode(enc.finish().unwrap());
+        assert!(
+            bomb.len() < MAX_B64_BYTES,
+            "the *transmitted* payload is small"
+        );
+        let mut it = Interceptor::new();
+        let s = format!("\x1b_Ga=T,f=32,o=z,t=d,s=2100,v=2100;{bomb}\x1b\\");
+        let mut segs = Vec::new();
+        for chunk in s.as_bytes().chunks(1 << 20) {
+            segs.extend(it.feed(chunk));
+        }
+        assert!(only_images(segs).is_empty());
+    }
+
+    #[test]
+    fn zero_cell_hints_fall_back_to_natural_size() {
+        // width=0 / c=0 must read as "unspecified", not a zero-width image — a
+        // zero reaching pty.rs's right-corner math (col + w - 1) underflows at
+        // column 0.
+        let b64 = png_b64();
+        let mut it = Interceptor::new();
+        let s = format!("\x1b]1337;File=inline=1;width=0;height=0:{b64}\x07");
+        let imgs = only_images(it.feed(s.as_bytes()));
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].cells, None, "zero hint ⇒ natural size");
+        let mut it = Interceptor::new();
+        let s = format!("\x1b_Ga=T,f=100,t=d,c=0,r=0;{b64}\x1b\\");
+        let imgs = only_images(it.feed(s.as_bytes()));
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].cells, None);
     }
 
     #[test]
