@@ -54,7 +54,7 @@ movement + tab stops `4c4e809`.
    position is the bug class of the powerline incident; this batch is cheap
    insurance against the rest of the family. One commit.
 
-## Phase 1.5 — direct phase-1 fallout
+## Phase 1.5 — direct phase-1 fallout ✅ (landed 2026-07-09: DECSTR `fbbe4a1`, sync output in the following commit)
 
 The very first telemetry runs (item 1) surfaced both of these in trivial test
 sessions, so real workloads hit them constantly. Quick-win sized; do before

@@ -237,6 +237,7 @@ fn screen_thread(
     // then ride vt100's own scrolling/eviction/reflow, so each frame we just read
     // the sentinels' positions back (see `resolve_images`) — no scroll heuristics.
     let mut interceptor = Interceptor::with(intercept.0, intercept.1, intercept.2);
+    let mut sync = SyncGate::new();
     let mut images: Vec<Placed> = Vec::new();
     let mut mark_seq: u32 = 0;
     loop {
@@ -407,7 +408,7 @@ fn screen_thread(
             Some(_) => {} // redundant HubDown/HubUp — ignore
             None => {}    // frame due
         }
-        if dirty && last_frame.elapsed() >= MIN_FRAME {
+        if dirty && last_frame.elapsed() >= MIN_FRAME && !sync.hold(parser.screen()) {
             let _ = frame_tx.send(frame_from(&parser, &mut images));
             dirty = false;
             last_frame = Instant::now();
@@ -528,6 +529,60 @@ impl vt100::Callbacks for SeqLog {
             .map(|p| String::from_utf8_lossy(p).into_owned())
             .unwrap_or_default();
         self.record(format!("OSC {selector}"));
+    }
+}
+
+/// Frame gating for synchronized updates (DEC private mode 2026). While an
+/// application is between BSU (`CSI ? 2026 h`) and ESU (`CSI ? 2026 l`) the
+/// pending frame is held, so viewers never see a torn mid-redraw snapshot —
+/// the same atomic presentation kitty gives the local screen (keeping the
+/// previous frame up IS the spec's presentation semantics). neovim and modern
+/// tmux wrap every redraw in these.
+///
+/// Two hazards are designed around:
+/// - Every BSU restarts a hard deadline ([`SyncGate::MAX_HOLD`]): an app
+///   killed between BSU and ESU must degrade to plain unsynchronized
+///   mirroring, never freeze the mirror (the unterminated-image failure
+///   class). Real terminals cap the same way.
+/// - Animation loops batch `ESU BSU` into one PTY read, so the mode bit alone
+///   reads "always in progress". The screen's BSU/ESU *counters* expose the
+///   completed update: an ESU seen since the last decision publishes this
+///   round (at read-boundary granularity) while the freshly-opened update
+///   holds the next.
+struct SyncGate {
+    starts: u32,
+    ends: u32,
+    since: Instant,
+}
+
+impl SyncGate {
+    /// Deadline for one synchronized update; beyond it the mirror publishes
+    /// anyway.
+    const MAX_HOLD: Duration = Duration::from_secs(1);
+
+    fn new() -> SyncGate {
+        SyncGate {
+            starts: 0,
+            ends: 0,
+            since: Instant::now(),
+        }
+    }
+
+    /// Should the pending publish be held? Call only when a publish is
+    /// otherwise due — the call consumes the ESU-seen edge.
+    fn hold(&mut self, screen: &vt100::Screen) -> bool {
+        self.hold_within(screen, Self::MAX_HOLD)
+    }
+
+    fn hold_within(&mut self, screen: &vt100::Screen, max_hold: Duration) -> bool {
+        let starts = screen.synchronized_update_starts();
+        if starts != self.starts {
+            self.starts = starts;
+            self.since = Instant::now();
+        }
+        let presented = screen.synchronized_update_ends() != self.ends;
+        self.ends = screen.synchronized_update_ends();
+        screen.synchronized_update() && !presented && self.since.elapsed() < max_hold
     }
 }
 
@@ -886,6 +941,47 @@ mod tests {
             seqlog.record(format!("OSC {i}"));
         }
         assert_eq!(seen.lock().unwrap().len(), SeqLog::MAX_KINDS);
+    }
+
+    // Synchronized-update gating: hold between BSU and ESU, publish on ESU
+    // even when the next BSU arrives in the same read, and never hold past
+    // the deadline.
+    #[test]
+    fn sync_gate_holds_between_bsu_and_esu() {
+        let mut parser = new_parser(24, 80);
+        let mut gate = SyncGate::new();
+        assert!(!gate.hold(parser.screen()), "no sync in sight: publish");
+        parser.process(b"\x1b[?2026hpartial redraw");
+        assert!(gate.hold(parser.screen()), "mid-update: hold");
+        parser.process(b"rest of redraw\x1b[?2026l");
+        assert!(!gate.hold(parser.screen()), "update completed: publish");
+        assert!(!gate.hold(parser.screen()), "still idle: publish");
+
+        // An animation loop batches `ESU BSU` into one read: the completed
+        // update publishes this round, the freshly-opened one holds the next.
+        parser.process(b"\x1b[?2026hframe\x1b[?2026l\x1b[?2026hpartial");
+        assert!(
+            !gate.hold(parser.screen()),
+            "a full update completed: publish"
+        );
+        assert!(gate.hold(parser.screen()), "the new update holds again");
+    }
+
+    #[test]
+    fn sync_gate_deadline_never_freezes_the_mirror() {
+        let mut parser = new_parser(24, 80);
+        let mut gate = SyncGate::new();
+        // An app killed between BSU and ESU: past the deadline the gate opens.
+        parser.process(b"\x1b[?2026hstuck");
+        assert!(!gate.hold_within(parser.screen(), Duration::ZERO));
+        // A later, well-behaved update still gets a fresh hold budget: the
+        // batched ESU publishes once, then the new update holds.
+        parser.process(b"\x1b[?2026l\x1b[?2026hnext");
+        assert!(
+            !gate.hold(parser.screen()),
+            "the stuck update's ESU publishes"
+        );
+        assert!(gate.hold(parser.screen()), "the fresh update holds");
     }
 
     // Pins the vendored vt100's SCOSC/SCORC patch from the consumer side: a

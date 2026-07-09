@@ -18,6 +18,10 @@
 #     DECSC data, margins, origin mode, cursor visibility, cursor keys and
 #     keypad; content/cursor/alt-screen/tab-stops untouched, like xterm.
 #     Tests in tests/csi.rs (decstr).
+#   - screen.rs: synchronized update (DEC private mode 2026) — mode bit plus
+#     wrapping BSU/ESU counters (synchronized_update{,_starts,_ends}) so a
+#     sampling consumer can see edges that open and close within one read.
+#     Tests in tests/mode.rs (synchronized_update).
 [package]
 name = "vt100"
 version = "0.16.2"

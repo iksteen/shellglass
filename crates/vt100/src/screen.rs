@@ -6,6 +6,8 @@ const MODE_APPLICATION_CURSOR: u8 = 0b0000_0010;
 const MODE_HIDE_CURSOR: u8 = 0b0000_0100;
 const MODE_ALTERNATE_SCREEN: u8 = 0b0000_1000;
 const MODE_BRACKETED_PASTE: u8 = 0b0001_0000;
+// shellglass: DEC private mode 2026 — synchronized update in progress.
+const MODE_SYNCHRONIZED_UPDATE: u8 = 0b0010_0000;
 
 /// The xterm mouse handling mode currently in use.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
@@ -70,6 +72,14 @@ pub struct Screen {
     // CHT/CBT navigate; RIS resets via Screen::new.
     tab_stops: std::collections::BTreeSet<u16>,
 
+    // shellglass: wrapping counters of BSU (`CSI ? 2026 h`) and ESU
+    // (`CSI ? 2026 l`) events, so a consumer sampling the screen between
+    // reads can detect edges that opened AND closed inside one read — the
+    // mode bit alone can't distinguish "still the same update" from "a new
+    // one started after the last presented".
+    sync_starts: u32,
+    sync_ends: u32,
+
     modes: u8,
     mouse_protocol_mode: MouseProtocolMode,
     mouse_protocol_encoding: MouseProtocolEncoding,
@@ -92,6 +102,9 @@ impl Screen {
             last_graphic_char: None,
 
             tab_stops: default_tab_stops(size.cols),
+
+            sync_starts: 0,
+            sync_ends: 0,
 
             modes: 0,
             mouse_protocol_mode: MouseProtocolMode::default(),
@@ -587,6 +600,26 @@ impl Screen {
     #[must_use]
     pub fn hide_cursor(&self) -> bool {
         self.mode(MODE_HIDE_CURSOR)
+    }
+
+    /// shellglass: whether a synchronized update (DEC private mode 2026) is
+    /// in progress — the application asked for output between BSU and ESU to
+    /// be presented atomically.
+    #[must_use]
+    pub fn synchronized_update(&self) -> bool {
+        self.mode(MODE_SYNCHRONIZED_UPDATE)
+    }
+
+    /// shellglass: how many synchronized updates have begun (wrapping).
+    #[must_use]
+    pub fn synchronized_update_starts(&self) -> u32 {
+        self.sync_starts
+    }
+
+    /// shellglass: how many synchronized updates have ended (wrapping).
+    #[must_use]
+    pub fn synchronized_update_ends(&self) -> u32 {
+        self.sync_ends
     }
 
     /// Returns whether the terminal should be in bracketed paste mode.
@@ -1271,6 +1304,11 @@ impl Screen {
                     self.enter_alternate_grid();
                 }
                 [2004] => self.set_mode(MODE_BRACKETED_PASTE),
+                // shellglass: BSU
+                [2026] => {
+                    self.set_mode(MODE_SYNCHRONIZED_UPDATE);
+                    self.sync_starts = self.sync_starts.wrapping_add(1);
+                }
                 _ => unhandled(self),
             }
         }
@@ -1311,6 +1349,11 @@ impl Screen {
                     self.decrc();
                 }
                 [2004] => self.clear_mode(MODE_BRACKETED_PASTE),
+                // shellglass: ESU
+                [2026] => {
+                    self.clear_mode(MODE_SYNCHRONIZED_UPDATE);
+                    self.sync_ends = self.sync_ends.wrapping_add(1);
+                }
                 _ => unhandled(self),
             }
         }
