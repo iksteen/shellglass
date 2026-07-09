@@ -16,11 +16,12 @@ Ground rules that apply throughout:
 - **Wire changes**: purely additive optional keys need no salt bump; anything an
   old decoder would *misread* does (see the `SALT` comment in `proto.rs`).
 
-## Phase 1 — quick wins
+## Phase 1 — quick wins ✅ (all landed 2026-07-09)
 
 Small, self-contained, each in the established SCOSC/SCORC pattern
 (`screen.rs`/`perform.rs` + tests in the vendored suite + a consumer-side pin
-where it matters).
+where it matters). Landed as: telemetry `b6a0a6a`, REP `4c0df56`,
+movement + tab stops `4c4e809`.
 
 1. **Unhandled-sequence telemetry.** The parser is constructed with default
    callbacks, so unhandled CSI/escape/OSC vanish silently — which is exactly why
