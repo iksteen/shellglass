@@ -129,6 +129,16 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                     params,
                     self.screen.grid().size(),
                 )),
+                // shellglass: SCOSC/SCORC, only in their bare parameterless
+                // forms (vte hands a bare CSI a single default-0 param) —
+                // `CSI <n> s` would be DECSLRM (unsupported, and its
+                // left/right-margin semantics must not save the cursor).
+                's' if canonicalize_params_1(params, 0) == 0 => {
+                    self.screen.scosc();
+                }
+                'u' if canonicalize_params_1(params, 0) == 0 => {
+                    self.screen.scorc();
+                }
                 't' => {
                     let mut params_iter = params.iter();
                     let op =

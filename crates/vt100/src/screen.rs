@@ -1342,6 +1342,21 @@ impl Screen {
     pub(crate) fn decstbm(&mut self, (top, bottom): (u16, u16)) {
         self.grid_mut().set_scroll_region(top - 1, bottom - 1);
     }
+
+    // shellglass: SCOSC/SCORC (ANSI.SYS/xterm save/restore cursor). Unlike
+    // DECSC/DECRC (ESC 7/ESC 8) these save only the cursor state, not the
+    // attributes; the save slot is shared with DECSC, as in xterm. Powerline
+    // prompts use them to draw right-aligned segments.
+
+    // CSI s
+    pub(crate) fn scosc(&mut self) {
+        self.grid_mut().save_cursor();
+    }
+
+    // CSI u
+    pub(crate) fn scorc(&mut self) {
+        self.grid_mut().restore_cursor();
+    }
 }
 
 fn u16_to_u8(i: u16) -> Option<u8> {

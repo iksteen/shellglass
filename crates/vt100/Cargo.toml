@@ -4,6 +4,9 @@
 # against upstream stays reviewable. Local patches (keep this list current):
 #   - lib.rs: dropped `#![warn(clippy::cargo)]` (host-workspace metadata lints
 #     don't apply to a vendored, unpublished crate).
+#   - screen.rs/perform.rs: SCOSC/SCORC (bare `CSI s` / `CSI u`) save/restore
+#     cursor — position + origin mode only, not attributes; save slot shared
+#     with DECSC like xterm. Tests in tests/csi.rs (scosc_scorc).
 [package]
 name = "vt100"
 version = "0.16.2"

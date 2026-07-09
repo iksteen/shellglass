@@ -731,6 +731,19 @@ mod tests {
         assert!(!da_seen(b"\x1b_Gi=1;OK\x1b\\"));
     }
 
+    // Pins the vendored vt100's SCOSC/SCORC patch from the consumer side: a
+    // powerline-style prompt draws its right-aligned git segment as save →
+    // jump right → draw → restore, and the mirrored cursor must land back
+    // after the left prompt (kitty restores it; the stock 0.16.2 parser
+    // ignored CSI s/u and left it at the right edge, corrupting the layout on
+    // every keystroke).
+    #[test]
+    fn right_aligned_prompt_restores_cursor() {
+        let mut parser = new_parser(24, 80);
+        parser.process(b"$ ls\x1b[s\x1b[80C\x1b[11D\x1b[7m  master \x1b[0m\x1b[u");
+        assert_eq!(parser.screen().cursor_position(), (0, 4));
+    }
+
     fn img_2x2() -> ImagePlacement {
         ImagePlacement {
             row: 0,
