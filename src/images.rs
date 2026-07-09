@@ -6,7 +6,11 @@
 //! We only *extract* image sequences; every other byte passes straight through as
 //! [`Segment::Pass`] to vt100, which is a streaming parser and reassembles partial
 //! escape sequences across calls on its own. So the only thing this scanner has to
-//! reassemble across PTY read boundaries is an image sequence itself.
+//! reassemble across PTY read boundaries is an image sequence itself. Like vte and
+//! real terminals, an in-flight sequence is *cancelled* by CAN/SUB or an ESC that
+//! doesn't form ST (a Ctrl-C'd transfer recovers at the next prompt repaint rather
+//! than swallowing the session), and one that outgrows [`MAX_SEQ_BYTES`] is
+//! discarded as it streams so it can't grow memory unboundedly.
 //!
 //! Handled: iTerm2 OSC 1337 `File` — single-shot or multipart
 //! (`MultipartFile`/`FilePart`/`FileEnd`); kitty `_G` in
@@ -67,12 +71,29 @@ const KITTY: &[u8] = b"\x1b_G";
 /// DCS introducer. Sixel is `ESC P <params> q …`; other DCS strings pass through.
 const DCS: &[u8] = b"\x1bP";
 
+/// Ceiling on one in-flight image sequence. Generous: the largest legitimate
+/// payload (a base64'd image) plus sixel headroom fits well under it. Beyond it
+/// the sequence is condemned — its bytes are discarded as they arrive (drain
+/// mode) so a runaway or never-terminated transfer can't grow memory unboundedly.
+const MAX_SEQ_BYTES: usize = 64 << 20;
+
 /// Streaming extractor. Owns only the bytes of an in-flight image sequence plus a
 /// tiny carry for a start marker split across a read boundary.
 #[derive(Default)]
 pub struct Interceptor {
     /// Bytes of a sequence still awaiting its terminator (spans reads).
     seq: Vec<u8>,
+    /// `seq` holds an in-flight image sequence for this marker (as opposed to a
+    /// split start-marker prefix, which rescans from the top).
+    inflight: Option<Marker>,
+    /// How far `scan_string` has already searched `seq` for its end — scanning
+    /// resumes here on the next read, keeping reassembly linear in the sequence
+    /// size instead of rescanning from byte 0 every read.
+    scan_from: usize,
+    /// The in-flight sequence outgrew [`MAX_SEQ_BYTES`]: its bytes are being
+    /// discarded (only a ≤1-byte tail is kept for split-ST detection) and it will
+    /// not be parsed on completion.
+    overflow: bool,
     /// Concatenated kitty base64 payload across `m=1` chunks, with the display-cell
     /// hint from the first chunk.
     kitty: Option<KittyAccum>,
@@ -166,17 +187,58 @@ impl Interceptor {
 
     /// Feed one PTY read; returns the segments to apply in order.
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<Segment> {
-        // Prepend any carried partial (either an in-flight sequence or a split
-        // marker prefix). `seq` empty ⇒ we're scanning plain bytes.
-        let data: Vec<u8> = if self.seq.is_empty() {
-            chunk.to_vec()
-        } else {
-            let mut v = std::mem::take(&mut self.seq);
-            v.extend_from_slice(chunk);
-            v
-        };
-
         let mut out = Vec::new();
+        if let Some(marker) = self.inflight {
+            // Continue an in-flight sequence: append and resume the end-scan where
+            // it left off — never rescanning seen bytes, so reassembly stays
+            // linear in the sequence size.
+            self.seq.extend_from_slice(chunk);
+            match scan_string(&self.seq, marker, self.scan_from) {
+                StringEnd::More(m) => {
+                    self.scan_from = m;
+                    self.enforce_cap(marker);
+                }
+                StringEnd::End(end) => {
+                    let overflowed = std::mem::take(&mut self.overflow);
+                    let buf = self.finish_inflight();
+                    if overflowed {
+                        self.cancel_accum(marker);
+                    } else if let Some(seg) = self.parse_sequence(marker, &buf[..end]) {
+                        out.push(seg);
+                    }
+                    self.scan(&buf[end..], &mut out);
+                }
+                StringEnd::Abort(resume) => {
+                    // The string was cancelled (CAN/SUB, or an ESC that doesn't
+                    // form ST). The real terminal consumed and discarded it — and
+                    // vt100's own vte state machine would have done the same had
+                    // we not intercepted — so drop it and resume at the cancel
+                    // point: the bytes that cancelled it (e.g. the prompt repaint
+                    // after a Ctrl-C'd transfer) must reach vt100.
+                    self.overflow = false;
+                    let buf = self.finish_inflight();
+                    self.cancel_accum(marker);
+                    self.scan(&buf[resume..], &mut out);
+                }
+            }
+            return out;
+        }
+        if self.seq.is_empty() {
+            self.scan(chunk, &mut out);
+        } else {
+            // A start marker split across the read boundary — prepend the carried
+            // prefix (a handful of bytes) and rescan from the top.
+            let mut data = std::mem::take(&mut self.seq);
+            data.extend_from_slice(chunk);
+            self.scan(&data, &mut out);
+        }
+        out
+    }
+
+    /// Scan plain bytes for image-sequence markers; non-image bytes become
+    /// [`Segment::Pass`] runs. An unterminated sequence or split marker is carried
+    /// in `self.seq` for the next read.
+    fn scan(&mut self, data: &[u8], out: &mut Vec<Segment>) {
         let mut pass_start = 0usize;
         let mut i = 0usize;
 
@@ -187,57 +249,104 @@ impl Interceptor {
                 continue;
             }
             let rest = &data[i..];
-            let kind = if self.do_iterm && rest.starts_with(ITERM) {
-                Some(Marker::Iterm)
+            let marker = if self.do_iterm && rest.starts_with(ITERM) {
+                Marker::Iterm
             } else if self.do_kitty && rest.starts_with(KITTY) {
-                Some(Marker::Kitty)
+                Marker::Kitty
             } else if self.do_sixel && rest.starts_with(DCS) {
                 match sixel_dcs(rest) {
-                    Some(true) => Some(Marker::Sixel),
+                    Some(true) => Marker::Sixel,
                     Some(false) => {
                         i += 1; // a non-sixel DCS — leave it for vt100
                         continue;
                     }
                     None => {
                         // DCS header split across the read boundary — carry the tail.
-                        push_pass(&mut out, &data[pass_start..i]);
+                        push_pass(out, &data[pass_start..i]);
                         self.seq = rest.to_vec();
-                        return out;
+                        return;
                     }
                 }
             } else if self.split_prefix(rest) {
                 // Possible marker split across the read boundary — carry the tail.
-                push_pass(&mut out, &data[pass_start..i]);
+                push_pass(out, &data[pass_start..i]);
                 self.seq = rest.to_vec();
-                return out;
+                return;
             } else {
                 i += 1;
                 continue;
             };
 
-            let marker = kind.unwrap();
-            // Find the sequence terminator (BEL or ST) after the marker.
-            match find_terminator(&data[i..], marker) {
-                Some(end) => {
-                    // Whole sequence is `data[i .. i+end]`.
-                    push_pass(&mut out, &data[pass_start..i]);
-                    let seq = &data[i..i + end];
-                    if let Some(seg) = self.parse_sequence(marker, seq) {
+            // Find the sequence's end (terminator or cancellation) after the marker.
+            match scan_string(rest, marker, 1) {
+                StringEnd::End(end) => {
+                    // Whole sequence is `rest[..end]`.
+                    push_pass(out, &data[pass_start..i]);
+                    if let Some(seg) = self.parse_sequence(marker, &rest[..end]) {
                         out.push(seg);
                     }
                     i += end;
                     pass_start = i;
                 }
-                None => {
-                    // Terminator not in this read — carry the whole partial sequence.
-                    push_pass(&mut out, &data[pass_start..i]);
-                    self.seq = data[i..].to_vec();
-                    return out;
+                StringEnd::Abort(resume) => {
+                    // Cancelled string — discard it (see `feed`'s Abort arm) and
+                    // resume at the cancel point.
+                    push_pass(out, &data[pass_start..i]);
+                    self.cancel_accum(marker);
+                    i += resume;
+                    pass_start = i;
+                }
+                StringEnd::More(m) => {
+                    // End not in this read — carry the partial sequence.
+                    push_pass(out, &data[pass_start..i]);
+                    self.seq = rest.to_vec();
+                    self.inflight = Some(marker);
+                    self.scan_from = m;
+                    self.enforce_cap(marker);
+                    return;
                 }
             }
         }
-        push_pass(&mut out, &data[pass_start..]);
-        out
+        push_pass(out, &data[pass_start..]);
+    }
+
+    /// Condemn an in-flight sequence that outgrew [`MAX_SEQ_BYTES`]: drop the
+    /// already-scanned bytes (keeping only the unscanned tail — at most a trailing
+    /// ESC awaiting its `\`) and flag it so completion parses nothing. Repeated
+    /// every read, this bounds memory to roughly one PTY read regardless of how
+    /// long the sequence runs.
+    fn enforce_cap(&mut self, marker: Marker) {
+        if self.overflow || self.seq.len() > MAX_SEQ_BYTES {
+            self.seq.drain(..self.scan_from);
+            self.scan_from = 0;
+            self.overflow = true;
+            self.cancel_accum(marker);
+        }
+    }
+
+    /// Leave the in-flight state, taking the buffered sequence.
+    fn finish_inflight(&mut self) -> Vec<u8> {
+        self.inflight = None;
+        self.scan_from = 0;
+        std::mem::take(&mut self.seq)
+    }
+
+    /// A cancelled/condemned sequence breaks any multi-sequence transfer it was
+    /// part of — drop the matching accumulator so a later transfer can't inherit
+    /// half a payload.
+    fn cancel_accum(&mut self, marker: Marker) {
+        match marker {
+            Marker::Kitty => self.kitty = None,
+            Marker::Iterm => self.iterm = None,
+            Marker::Sixel => {}
+        }
+    }
+
+    /// Bytes currently buffered for a carried sequence — tests assert drain mode
+    /// keeps this bounded.
+    #[cfg(test)]
+    fn carried_len(&self) -> usize {
+        self.seq.len()
     }
 
     /// Parse a complete image sequence (marker .. terminator inclusive).
@@ -529,20 +638,39 @@ fn cells_from(c: Option<&String>, r: Option<&String>) -> Option<(u16, u16)> {
     Some((c, r))
 }
 
-/// Find the end (one past the terminator) of an image sequence starting at `s[0]`.
-/// iTerm2 ends at BEL or ST; kitty and sixel end at ST (`ESC \`, or 8-bit `0x9c`).
-fn find_terminator(s: &[u8], marker: Marker) -> Option<usize> {
-    let mut i = 1; // skip the leading ESC so we don't match it as an ST
+/// How the scan for an image sequence's end came out.
+enum StringEnd {
+    /// Terminated normally; offset one past the terminator.
+    End(usize),
+    /// Cancelled mid-string — CAN/SUB, or an ESC that doesn't form ST — the way
+    /// vte and real terminals give up on a string that never terminates. Offset
+    /// to resume scanning at: the cancelling ESC itself (it starts whatever comes
+    /// next), or one past a CAN/SUB.
+    Abort(usize),
+    /// Runs past the buffer; scanning may resume at this offset next read (it
+    /// points at a trailing ESC that could still become ST, else buffer end).
+    More(usize),
+}
+
+/// Scan `s[from..]` for the end of an image sequence. iTerm2 (OSC) ends at BEL or
+/// ST; kitty (APC) at ST (`ESC \`); sixel (DCS) at ST or 8-bit `0x9c`. All three
+/// payloads are base64/sixel data, which never contains ESC/CAN/SUB — so any of
+/// those mid-string is unambiguously a cancellation, not data. `from` must skip a
+/// leading marker ESC (pass 1 when `s` starts at the marker).
+fn scan_string(s: &[u8], marker: Marker, from: usize) -> StringEnd {
+    let mut i = from;
     while i < s.len() {
         match s[i] {
-            0x07 if matches!(marker, Marker::Iterm) => return Some(i + 1), // BEL
-            0x9c if matches!(marker, Marker::Sixel) => return Some(i + 1), // 8-bit ST
-            0x1b if i + 1 < s.len() && s[i + 1] == b'\\' => return Some(i + 2), // ST
-            0x1b if i + 1 == s.len() => return None, // ESC at very end — need more
+            0x07 if matches!(marker, Marker::Iterm) => return StringEnd::End(i + 1), // BEL
+            0x9c if matches!(marker, Marker::Sixel) => return StringEnd::End(i + 1), // 8-bit ST
+            0x18 | 0x1a => return StringEnd::Abort(i + 1), // CAN/SUB cancel the string
+            0x1b if i + 1 < s.len() && s[i + 1] == b'\\' => return StringEnd::End(i + 2), // ST
+            0x1b if i + 1 == s.len() => return StringEnd::More(i), // ESC at edge: ST or cancel?
+            0x1b => return StringEnd::Abort(i),            // any other ESC cancels the string
             _ => i += 1,
         }
     }
-    None
+    StringEnd::More(s.len())
 }
 
 fn strip_terminator(body: &[u8]) -> &[u8] {
@@ -795,6 +923,111 @@ mod tests {
         // An unknown transmission medium is dropped.
         let s = format!("\x1b_Ga=T,f=100,t=x;{}\x1b\\", png_b64());
         assert!(only_images(it.feed(s.as_bytes())).is_empty());
+    }
+
+    fn only_pass(segs: &[Segment]) -> Vec<u8> {
+        segs.iter()
+            .filter_map(|s| match s {
+                Segment::Pass(b) => Some(b.clone()),
+                Segment::Image(_) => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[test]
+    fn unterminated_sequence_cancelled_by_next_escape() {
+        // Ctrl-C mid-transfer: the app dies before sending ST. The next escape
+        // sequence (the prompt repaint) cancels the string — exactly what the
+        // real terminal and vt100's vte do — so the mirror keeps flowing instead
+        // of buffering the rest of the session forever.
+        let mut it = Interceptor::new();
+        assert!(it.feed(b"\x1b_Gf=100,t=d;AAAA").is_empty());
+        let segs = it.feed(b"\x1b[2K$ ls");
+        assert!(only_images(segs.clone()).is_empty());
+        assert_eq!(
+            only_pass(&segs),
+            b"\x1b[2K$ ls",
+            "the cancelling bytes reach vt100"
+        );
+        // The interceptor is fully recovered: a complete image still comes out.
+        let s = format!("\x1b]1337;File=inline=1:{}\x07", png_b64());
+        assert_eq!(only_images(it.feed(s.as_bytes())).len(), 1);
+    }
+
+    #[test]
+    fn can_cancels_sequence_within_one_read() {
+        let mut it = Interceptor::new();
+        let segs = it.feed(b"before\x1b_Gf=100,t=d;AAAA\x18after");
+        assert!(only_images(segs.clone()).is_empty());
+        assert_eq!(only_pass(&segs), b"beforeafter");
+    }
+
+    #[test]
+    fn cancellation_clears_multipart_accumulator() {
+        let mut it = Interceptor::new();
+        let mut segs = it.feed(b"\x1b]1337;MultipartFile=inline=1;width=4;height=2\x07");
+        // A FilePart cancelled mid-payload breaks the whole transfer…
+        segs.extend(it.feed(b"\x1b]1337;FilePart=AAAA\x18"));
+        // …so FileEnd must not emit a half-baked image.
+        segs.extend(it.feed(b"\x1b]1337;FileEnd\x07"));
+        assert!(only_images(segs).is_empty());
+    }
+
+    #[test]
+    fn runaway_sequence_memory_bounded_and_dropped() {
+        // A sequence that never terminates is condemned once it outgrows the cap:
+        // its bytes are discarded as they stream (memory stays ~one PTY read) and
+        // its eventual terminator yields nothing.
+        let mut it = Interceptor::new();
+        assert!(it.feed(b"\x1b_Gf=100,t=d;").is_empty());
+        let chunk = [b'A'; 4096];
+        for _ in 0..(MAX_SEQ_BYTES / chunk.len() + 4) {
+            assert!(it.feed(&chunk).is_empty());
+        }
+        assert!(
+            it.carried_len() <= chunk.len() + 1,
+            "drain mode keeps only a tail, not {} bytes",
+            it.carried_len()
+        );
+        // The terminator finally arrives: the condemned sequence is dropped and
+        // the stream flows again.
+        let segs = it.feed(b"\x1b\\after");
+        assert!(only_images(segs.clone()).is_empty());
+        assert_eq!(only_pass(&segs), b"after");
+        let s = format!("\x1b]1337;File=inline=1:{}\x07", png_b64());
+        assert_eq!(only_images(it.feed(s.as_bytes())).len(), 1);
+    }
+
+    #[test]
+    fn st_split_between_reads() {
+        // The two-byte ST split exactly at the read boundary — the resumed scan
+        // must recheck the trailing ESC, not skip past it.
+        let mut it = Interceptor::new();
+        let s = format!("\x1b_Ga=T,f=100,t=d;{}", png_b64());
+        let mut segs = it.feed(s.as_bytes());
+        segs.extend(it.feed(b"\x1b"));
+        assert!(only_images(segs.clone()).is_empty());
+        segs.extend(it.feed(b"\\"));
+        assert_eq!(only_images(segs).len(), 1);
+    }
+
+    #[test]
+    fn large_sequence_reassembled_across_many_small_reads() {
+        // A multi-hundred-KB kitty transfer arriving in 4 KB PTY reads (the real
+        // shape of an `imgcat`-sized image) comes out intact — the resumed scan
+        // handles arbitrary boundaries, including inside the payload.
+        let mut it = Interceptor::new();
+        let (w, h) = (300u32, 300u32);
+        let raw = vec![0x7fu8; (w * h * 4) as usize];
+        let seq = format!("\x1b_Ga=T,f=32,t=d,s={w},v={h};{}\x1b\\", B64.encode(&raw));
+        let mut imgs = Vec::new();
+        for chunk in seq.as_bytes().chunks(4096) {
+            imgs.extend(only_images(it.feed(chunk)));
+        }
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].mime, "image/png");
+        assert_eq!(imgs[0].px, Some((w, h)));
     }
 
     #[test]
