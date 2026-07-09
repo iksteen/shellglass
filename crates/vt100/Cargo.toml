@@ -7,6 +7,8 @@
 #   - screen.rs/perform.rs: SCOSC/SCORC (bare `CSI s` / `CSI u`) save/restore
 #     cursor — position + origin mode only, not attributes; save slot shared
 #     with DECSC like xterm. Tests in tests/csi.rs (scosc_scorc).
+#   - screen.rs/perform.rs: REP (`CSI b`) — repeat the last graphic character
+#     through the print path. Tests in tests/csi.rs (rep).
 [package]
 name = "vt100"
 version = "0.16.2"

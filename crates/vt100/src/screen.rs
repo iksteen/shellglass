@@ -59,6 +59,11 @@ pub struct Screen {
     attrs: crate::attrs::Attrs,
     saved_attrs: crate::attrs::Attrs,
 
+    // shellglass: the last graphic character drawn, so REP (CSI b) can repeat
+    // it. Never cleared by cursor movement — ECMA-48 speaks of the preceding
+    // character in the *data stream*, and kitty/xterm behave the same way.
+    last_graphic_char: Option<char>,
+
     modes: u8,
     mouse_protocol_mode: MouseProtocolMode,
     mouse_protocol_encoding: MouseProtocolEncoding,
@@ -77,6 +82,8 @@ impl Screen {
 
             attrs: crate::attrs::Attrs::default(),
             saved_attrs: crate::attrs::Attrs::default(),
+
+            last_graphic_char: None,
 
             modes: 0,
             mouse_protocol_mode: MouseProtocolMode::default(),
@@ -718,6 +725,8 @@ impl Screen {
             // width() can only return 0, 1, or 2
             .unwrap();
 
+        self.last_graphic_char = Some(c);
+
         // it doesn't make any sense to wrap if the last column in a row
         // didn't already have contents. don't try to handle the case where a
         // character wraps because there was only one column left in the
@@ -1128,6 +1137,19 @@ impl Screen {
     pub(crate) fn ech(&mut self, count: u16) {
         let attrs = self.attrs;
         self.grid_mut().erase_cells(count, attrs);
+    }
+
+    // shellglass: CSI b (REP) — repeat the preceding graphic character. Going
+    // back through the full print path buys wrapping and wide-character
+    // handling for free. ncurses ≥ 6 emits this whenever terminfo advertises
+    // `rep` (xterm-256color and xterm-kitty both do), so dropping it loses
+    // real screen content.
+    pub(crate) fn rep(&mut self, count: u16) {
+        if let Some(c) = self.last_graphic_char {
+            for _ in 0..count {
+                self.text(c);
+            }
+        }
     }
 
     // CSI d

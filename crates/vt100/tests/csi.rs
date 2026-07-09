@@ -134,3 +134,43 @@ fn scosc_scorc() {
     vt.process(b"$ ls\x1b[s\x1b[80C\x1b[11D\x1b[7m  master \x1b[0m\x1b[u");
     assert_eq!(vt.screen().cursor_position(), (0, 4));
 }
+
+// shellglass: REP (CSI b) — repeat the preceding graphic character.
+#[test]
+fn rep() {
+    let mut vt = vt100::Parser::default();
+    vt.process(b"ab\x1b[3b");
+    assert_eq!(vt.screen().rows(0, 80).next().unwrap(), "abbbb");
+
+    // Default count is 1.
+    let mut vt = vt100::Parser::default();
+    vt.process(b"x\x1b[b");
+    assert_eq!(vt.screen().rows(0, 80).next().unwrap(), "xx");
+
+    // No preceding graphic character: nothing to repeat, no panic.
+    let mut vt = vt100::Parser::default();
+    vt.process(b"\x1b[5b");
+    assert_eq!(vt.screen().rows(0, 80).next().unwrap(), "");
+
+    // Repeats go through the print path: they wrap like typed characters.
+    let mut vt = vt100::Parser::new(24, 10, 0);
+    vt.process(b"aaaaaaaaa\x1b[3b");
+    assert_eq!(vt.screen().rows(0, 10).next().unwrap(), "aaaaaaaaaa");
+    assert_eq!(vt.screen().rows(0, 10).nth(1).unwrap(), "aa");
+
+    // Wide characters repeat as wide characters.
+    let mut vt = vt100::Parser::default();
+    vt.process("日\x1b[2b".as_bytes());
+    assert_eq!(vt.screen().rows(0, 80).next().unwrap(), "日日日");
+    assert_eq!(vt.screen().cursor_position(), (0, 6));
+
+    // The repeated char survives cursor movement (data-stream semantics, as
+    // in kitty/xterm) and carries the CURRENT attributes, not the original's.
+    let mut vt = vt100::Parser::default();
+    vt.process(b"q\x1b[5;5H\x1b[31m\x1b[2b");
+    assert_eq!(vt.screen().rows(0, 80).nth(4).unwrap(), "    qq");
+    assert_eq!(
+        vt.screen().cell(4, 4).unwrap().fgcolor(),
+        vt100::Color::Idx(1)
+    );
+}
