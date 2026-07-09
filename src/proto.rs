@@ -57,8 +57,11 @@ pub const KEY_HEADER: &str = "x-shellglass-key";
 /// stale side fails loudly at the `/push` upgrade (403, "register its session id")
 /// instead of streaming frames the other side silently drops. (A change that adds or
 /// renames an *endpoint* needs no bump: an old client hits a route that's gone — a
-/// loud 404, not a silent misread.) The cost of a bump is that operators re-run
-/// `print-id` and update `--allow` + view URLs; keys stay valid.
+/// loud 404, not a silent misread. Likewise a purely *additive* optional key — e.g.
+/// the full frame's `i` inline-image list — needs no bump: an old decoder ignores
+/// it and the text mirror stays correct, just without the new overlay; bump only
+/// when an existing message would be *misread*.) The cost of a bump is that
+/// operators re-run `print-id` and update `--allow` + view URLs; keys stay valid.
 const SALT: &[u8] = b"shellglass/session-id/v4";
 
 /// Underivable session id for a secret key: Argon2id (memory- and compute-hard)
