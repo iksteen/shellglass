@@ -515,11 +515,34 @@ impl Interceptor {
 // terminal we mirror; the size cap + mime sniff are the backstop. Revisit if
 // broadcasting to a hub makes arbitrary-file reads a concern worth restricting.
 fn read_capped(path: &str) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
     const MAX_IMAGE_BYTES: u64 = 16 << 20;
-    if std::fs::metadata(path).ok()?.len() > MAX_IMAGE_BYTES {
+    // O_NONBLOCK: opening a FIFO for reading otherwise blocks until a writer
+    // appears — wedging the screen thread and freezing the whole mirror. Regular
+    // files ignore the flag entirely.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    // fstat the open handle (not the path — no swap race) and require a regular
+    // file: rejects FIFOs, devices, and kernel pseudo-files outright.
+    if !file.metadata().ok()?.is_file() {
         return None;
     }
-    std::fs::read(path).ok()
+    // Cap the read itself rather than trusting a pre-read size check — a file
+    // that grows after the check would otherwise pull an unbounded blob into
+    // memory and onto the wire. One extra byte distinguishes exactly-at-cap
+    // from over.
+    let mut bytes = Vec::new();
+    file.take(MAX_IMAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return None;
+    }
+    Some(bytes)
 }
 
 /// Map a POSIX shared-memory object name (kitty `t=s`) to its Linux `/dev/shm`
@@ -1120,6 +1143,33 @@ mod tests {
         segs.extend(it.feed(format!("\x1b]1337;FilePart={b64}\x07").as_bytes()));
         segs.extend(it.feed(b"\x1b]1337;FileEnd\x07"));
         assert!(only_images(segs).is_empty());
+    }
+
+    #[test]
+    fn read_capped_rejects_non_regular_files_without_blocking() {
+        // A kitty t=f reference to a FIFO used to block std::fs::read forever
+        // (screen thread wedged, mirror frozen). The O_NONBLOCK open + is_file
+        // check must reject it immediately.
+        let path = std::env::temp_dir().join("sg_read_capped_fifo_test");
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        let got = read_capped(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(got, None, "FIFO must be rejected, not read");
+        // Device files are equally not images.
+        assert_eq!(read_capped("/dev/null"), None);
+    }
+
+    #[test]
+    fn read_capped_caps_the_read_itself() {
+        // The cap must hold even if the file grows between any check and the
+        // read — so it's enforced on the bytes actually read.
+        let path = std::env::temp_dir().join("sg_read_capped_size_test");
+        std::fs::write(&path, vec![0u8; (16 << 20) + 1]).unwrap();
+        let got = read_capped(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(got, None, "over-cap file must be rejected");
     }
 
     #[test]
