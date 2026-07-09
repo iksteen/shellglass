@@ -864,7 +864,12 @@ function setStorm(on: boolean): void {
     // "nothing stormy lately" even in total silence.
     lastStormy = clock();
     stormTimer = setInterval(() => {
-      if (clock() - lastStormy > STORM_EXIT_MS) setStorm(false);
+      // Never exit while a selection is live: the exit path rewrites every row's
+      // innerHTML, destroying the very Ranges the frozen ghost layer protects —
+      // and the calm-down fires ~1.2s after the animation ends, exactly when the
+      // user reaches for Ctrl-C. Storm stays on (the canvas keeps painting); the
+      // first tick after the selection clears drops back to DOM.
+      if (clock() - lastStormy > STORM_EXIT_MS && !selectionActive()) setStorm(false);
     }, 300);
   } else {
     if (stormTimer !== null) clearInterval(stormTimer);

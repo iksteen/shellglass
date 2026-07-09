@@ -624,7 +624,7 @@ function setStorm(on) {
         redrawCanvasAll();
         lastStormy = clock();
         stormTimer = setInterval(() => {
-            if (clock() - lastStormy > STORM_EXIT_MS)
+            if (clock() - lastStormy > STORM_EXIT_MS && !selectionActive())
                 setStorm(false);
         }, 300);
     }
