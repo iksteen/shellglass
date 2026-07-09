@@ -241,3 +241,64 @@ fn tab_stops() {
     vt.process(b"\x1b[3g\x1bc\t");
     assert_eq!(vt.screen().cursor_position(), (0, 8));
 }
+
+// shellglass: DECSTR (CSI ! p) — soft terminal reset.
+#[test]
+fn decstr() {
+    let mut vt = vt100::Parser::default();
+    // Build up state: content, SGR, DECSC at a colored position, margins +
+    // origin mode, hidden cursor, application cursor keys and keypad, a
+    // custom tab stop, and a cursor position.
+    vt.process(b"hello\x1b[31m\x1b7\x1b[5;10r\x1b[?6h\x1b[?25l\x1b[?1h\x1b=");
+    vt.process(b"\x1b[1;4H\x1bH"); // custom tab stop at column 3 (origin row 5)
+    vt.process(b"\x1b[2;7H"); // cursor somewhere non-default (origin-relative)
+    let pos_before = vt.screen().cursor_position();
+
+    vt.process(b"\x1b[!p");
+
+    // Reset: modes, SGR, margins, origin mode, saved cursor.
+    assert!(!vt.screen().hide_cursor(), "cursor visible again");
+    assert!(!vt.screen().application_cursor(), "cursor keys normal");
+    assert!(!vt.screen().application_keypad(), "keypad numeric");
+    // Content and cursor position are untouched.
+    assert_eq!(vt.screen().rows(0, 80).next().unwrap(), "hello");
+    assert_eq!(vt.screen().cursor_position(), pos_before);
+    // SGR is back to normal: new text renders with default attributes.
+    vt.process(b"x");
+    let cell = vt.screen().cell(pos_before.0, pos_before.1).unwrap();
+    assert_eq!(cell.fgcolor(), vt100::Color::Default);
+    // Origin mode and margins are gone: CUP 1;1 reaches the true home (with
+    // origin mode + top margin 5 it would land on row 4).
+    vt.process(b"\x1b[1;1HY");
+    assert_eq!(vt.screen().cell(0, 0).unwrap().contents(), "Y");
+    // DECSC data is cleared: DECRC goes to home with default attributes, not
+    // back to the red save-point.
+    vt.process(b"\x1b[32m\x1b8z");
+    assert_eq!(vt.screen().cell(0, 0).unwrap().contents(), "z");
+    assert_eq!(
+        vt.screen().cell(0, 0).unwrap().fgcolor(),
+        vt100::Color::Default
+    );
+    // Tab stops survive (only RIS resets them).
+    vt.process(b"\r\t");
+    assert_eq!(vt.screen().cursor_position(), (0, 3));
+
+    // The alternate screen is NOT exited by a soft reset.
+    let mut vt = vt100::Parser::default();
+    vt.process(b"\x1b[?1049h\x1b[!p");
+    assert!(vt.screen().alternate_screen(), "alt screen survives DECSTR");
+}
+
+// shellglass: CHT/HT with the cursor in the wrap-pending state (col == cols
+// after filling a row) must clamp, not panic — found by the quickcheck suite.
+#[test]
+fn tab_at_wrap_pending_column() {
+    let mut vt = vt100::Parser::default();
+    vt.process(&[b'x'; 80]);
+    vt.process(b"\x1b[I");
+    assert_eq!(vt.screen().cursor_position(), (0, 79));
+    let mut vt = vt100::Parser::default();
+    vt.process(&[b'x'; 80]);
+    vt.process(b"\t");
+    assert_eq!(vt.screen().cursor_position(), (0, 79));
+}

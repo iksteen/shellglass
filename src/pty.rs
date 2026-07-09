@@ -865,16 +865,17 @@ mod tests {
     fn seqlog_records_unhandled_kinds_once() {
         let (seqlog, seen) = SeqLog::new();
         let mut parser = vt100::Parser::new_with_callbacks(24, 80, 0, seqlog);
-        // DECSTR (CSI ! p), synchronized-output mode (CSI ? 2026 h), and a
-        // handled sequence (CUP) that must NOT be recorded — twice over to
-        // check dedup.
+        // DECSCA (CSI " q), a made-up DEC private mode, and a handled sequence
+        // (CUP) that must NOT be recorded — twice over to check dedup. (The
+        // original specimens here, DECSTR and mode 2026, got implemented off
+        // the back of this very telemetry — pick obscure ones.)
         for _ in 0..2 {
-            parser.process(b"\x1b[!p\x1b[?2026h\x1b[5;5H");
+            parser.process(b"\x1b[\"q\x1b[?1234h\x1b[5;5H");
         }
         let seen = seen.lock().unwrap();
         assert_eq!(
             seen.iter().cloned().collect::<Vec<_>>(),
-            vec!["CSI ! p".to_string(), "CSI ? 2026 h".to_string()]
+            vec!["CSI \" q".to_string(), "CSI ? 1234 h".to_string()]
         );
     }
 

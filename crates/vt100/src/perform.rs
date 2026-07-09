@@ -214,6 +214,20 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                     );
                 }
             },
+            // shellglass: intermediate `!`
+            Some(b'!') => match c {
+                // DECSTR, soft terminal reset
+                'p' => self.screen.decstr(),
+                _ => {
+                    self.callbacks.unhandled_csi(
+                        &mut self.screen,
+                        Some(b'!'),
+                        intermediates.get(1).copied(),
+                        &params.iter().collect::<Vec<_>>(),
+                        c,
+                    );
+                }
+            },
             Some(i) => {
                 self.callbacks.unhandled_csi(
                     &mut self.screen,

@@ -973,9 +973,11 @@ impl Screen {
 
     pub(crate) fn tab(&mut self) {
         // shellglass: next tab stop after the cursor, else the last column
-        // (the right margin), consulting the HTS/TBC-managed table.
-        let col = self.grid().pos().col;
+        // (the right margin), consulting the HTS/TBC-managed table. The
+        // cursor column can sit at `cols` (wrap pending) — clamp before
+        // building the range or it inverts and BTreeSet::range panics.
         let cols = self.grid().size().cols;
+        let col = self.grid().pos().col.min(cols - 1);
         let next = self
             .tab_stops
             .range((col + 1)..cols)
@@ -1037,6 +1039,22 @@ impl Screen {
     // ESC c
     pub(crate) fn ris(&mut self) {
         *self = Self::new(self.grid.size(), self.grid.scrollback_len());
+    }
+
+    // shellglass: CSI ! p (DECSTR, soft terminal reset) — restore the defined
+    // subset of state without touching screen content or the cursor position:
+    // SGR to normal, saved-cursor (DECSC) data cleared, scroll margins to the
+    // full screen, origin mode off, cursor visible, cursor keys and keypad to
+    // normal. Deliberately untouched, matching xterm: content, cursor
+    // position, the alternate screen, tab stops (only RIS resets those), and
+    // mouse tracking. (Insert mode and autowrap aren't modeled by this crate.)
+    pub(crate) fn decstr(&mut self) {
+        self.attrs = crate::attrs::Attrs::default();
+        self.saved_attrs = crate::attrs::Attrs::default();
+        self.clear_mode(MODE_HIDE_CURSOR);
+        self.clear_mode(MODE_APPLICATION_CURSOR);
+        self.clear_mode(MODE_APPLICATION_KEYPAD);
+        self.grid_mut().soft_reset();
     }
 
     // csi codes
