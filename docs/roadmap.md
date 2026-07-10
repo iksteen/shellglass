@@ -388,6 +388,65 @@ at 0 in `Parser::new`.)
     win (faster but fidelity gaps) keeps it as a third mode, which is
     probably not worth carrying.
 
+## Canvas fidelity track
+
+Context: item-14 experiments — DOM is optimization-exhausted, canvas is ~5×
+faster under fragmented churn. Goal: canvas at DOM fidelity, then canvas as
+the only renderer.
+
+### A. Storm-mode fidelity (needed while canvas is the escape hatch)
+
+1. ✅ **symbol_map fonts** (landed 2026-07-10): `drawRowStorm` uses
+   `svgFont(cell)` for `ctx.font`.
+2. **Fill-glyph stretch.** In `drawRowStorm`, when `isFillGlyph(cp)`:
+   `measureText` the glyph, `ctx.save/translate/scale` to the exact cell rect,
+   `fillText`, restore. Cache the measure per (glyph, font).
+3. **Baseline parity.** Replace `textBaseline = "middle"` + `midY` with an
+   alphabetic baseline computed once per font from
+   `TextMetrics.fontBoundingBoxAscent/Descent`, matching the DOM line box.
+   Verify: no vertical shift toggling storm on `showcase.sh`.
+
+### B. Replacing the DOM renderer (each blocks the switch)
+
+1. **Underline styles + color.** In `drawRowStorm`, branch on `cell.u`:
+   2 = two bars, 4/5 = fillRect segments on a fixed period, 3 = two-arc wave
+   (cache a per-color offscreen pattern), color = `resolveRgb(cell.k) ?? fg`.
+2. **DECSCUSR shapes.** When `screen.sty >= 3`, skip the reverse-video block;
+   draw a bottom bar (3/4) or left bar (5/6) fillRect in the cell's fg.
+3. **OSC 8 interaction layer.** `click`/`mousemove` handlers on `#screen`:
+   map event x/y ÷ cellW/H to a cell, look up `cell.a` → `linkHref`; hover =
+   `cursor:pointer` + drawn underline on that link's cells; click =
+   `window.open(uri, "_blank", "noopener,noreferrer")`.
+4. **Ghost layer hardening.** Make the transparent text layer the permanent
+   copy/find/a11y surface: pin wide-char and trailing-space copy fidelity
+   with tests; keep the selection-freeze; add `::selection` rule coverage for
+   custom templates.
+5. **Font + DPR lifecycle.** `document.fonts` `loadingdone` → re-measure +
+   `redrawCanvasAll()`; listen for `devicePixelRatio` changes (matchMedia
+   `resolution`) → resize canvas + full redraw.
+6. **Over-wide fallback glyphs.** Drop the `fillText` maxWidth clamp for
+   `glyphOverflowsCell` cells (DOM lets ❯ overflow; canvas must too).
+7. **CRT toggle decision.** Text-shadow CRT does nothing to canvas text:
+   either implement C.3 first or document the divergence.
+8. **The switch.** Storm thresholds become dead weight: delete `renderRow`
+   consumers in the flush path, render every dirty row on canvas, keep the
+   DOM only for ghost text + images; re-run `bench.py` and update
+   CLAUDE.md/README.
+
+### C. Canvas-only improvements (after B)
+
+1. **Text over inline images.** Draw image cells behind glyphs on the canvas
+   (decode the `i` list to `ImageBitmap`s, draw before text) so text placed
+   over an image wins, like a real cell terminal; drop the `<img>` overlay.
+2. **Device-pixel backgrounds.** Snap bg fills to the same rounded device-
+   pixel cell edges as `drawGlyph` — kills hairline seams between cells at
+   fractional zoom.
+3. **Picture-level CRT.** Replace the CSS text-shadow toggle with a canvas
+   post-pass (scanlines + bloom on the composed frame), keeping the same
+   localStorage switch.
+4. **Smooth cursor travel** (opt-in): animate the cursor rect between cells
+   over ~80ms instead of teleporting; off by default.
+
 ## Sequencing note
 
 Items 4 and 7 both hang per-cell metadata off the vendored grid, and both are
