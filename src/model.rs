@@ -163,6 +163,11 @@ pub struct Grid {
     /// default. Ride the wire as the optional full-frame `e` key (a change
     /// forces a full frame, like images).
     pub default_colors: (Color, Color),
+    /// Window title (OSC 0/2), empty if never set. Rides the wire as the
+    /// optional `t` key — full frames and the Diff shape only, NEVER the
+    /// flattened `c` form: an old viewer spreads unknown `c`-envelope keys
+    /// into every cell, where `t` would overwrite cell *text*.
+    pub title: String,
     /// Inline images currently placed on the screen (empty for the common case).
     pub images: Vec<ImagePlacement>,
 }

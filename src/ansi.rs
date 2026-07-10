@@ -62,6 +62,11 @@ fn paint_screen(prev: Option<&Grid>, g: &Grid, view: (u16, u16)) -> String {
     if g.cursor_style != prev.map_or(0, |p| p.cursor_style) {
         let _ = write!(out, "\x1b[{} q", g.cursor_style);
     }
+    // The session title passes through (OSC 2); a cleared title emits the
+    // empty string, which resets it.
+    if g.title != prev.map_or("", |p| p.title.as_str()) {
+        let _ = write!(out, "\x1b]2;{}\x1b\\", g.title);
+    }
     // OSC 10/11 default-color overrides pass through too (reset: 110/111).
     let prev_defaults = prev.map_or((Color::Default, Color::Default), |p| p.default_colors);
     for (i, (now, before)) in [

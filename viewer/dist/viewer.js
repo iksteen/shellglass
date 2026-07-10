@@ -930,12 +930,21 @@ function flushPaint() {
 function applyFull(m) {
     screen = { cells: m.d.map(decodeBlock), cur: m.p ?? null, sty: m.q ?? 0, rowEls: [] };
     defaultsCss = applyDefaults(m.e);
+    setTitle(m.t ?? "");
     rebuildDims = { w: m.w, h: m.h, i: m.i };
     rebuildBanner = null;
     dirtyRows.clear();
     schedulePaint();
 }
 let defaultsCss = { fg: "", bg: "" };
+let bootTitle = null;
+function setTitle(t) {
+    if (typeof document === "undefined")
+        return;
+    if (bootTitle === null)
+        bootTitle = document.title;
+    document.title = t || bootTitle;
+}
 function paintFull(dims) {
     screenEl.style.color = defaultsCss.fg;
     screenEl.style.backgroundColor = defaultsCss.bg;
@@ -978,6 +987,8 @@ function applyPatches(cur, sty, rows) {
     schedulePaint();
 }
 function applyDiff(m) {
+    if (m.t !== undefined)
+        setTitle(m.t);
     applyPatches(m.p, m.q, (m.r ?? []).map(decodeRow));
 }
 function applyCell(m) {

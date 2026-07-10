@@ -70,6 +70,7 @@ interface FullMsg {
   p?: Cur; // cursor [row, col]; absent = hidden
   q?: number; // DECSCUSR cursor style 0-6; absent = 0 (default block)
   e?: [Color, Color]; // OSC 10/11 default fg/bg overrides; absent = none
+  t?: string; // window title (OSC 0/2); absent = none set
   i?: ImageRef[]; // inline images placed on the screen; absent = none
 }
 // One inline image (iTerm2/kitty) placed at a cell. `m`/`d` build a data: URL;
@@ -90,6 +91,7 @@ interface DiffMsg {
   r?: WireRow[];
   p?: Cur;
   q?: number;
+  t?: string; // window title, two-state: absent = unchanged ("" = cleared)
 }
 // A uniform span: c is the bare [row, left, "…"] tuple — ONE CELL PER CODEPOINT
 // — and the style flattened into the message applies to every cell.
@@ -1332,8 +1334,10 @@ function applyFull(m: FullMsg): void {
   // the DOM rebuild is deferred to the flush (which reads screen.cells).
   screen = { cells: m.d.map(decodeBlock), cur: m.p ?? null, sty: m.q ?? 0, rowEls: [] };
   // Default-color overrides apply now (cfg feeds every style computation);
-  // the element CSS lands with the rebuild below.
+  // the element CSS lands with the rebuild below. Fulls carry the title
+  // absolutely: absent = none set.
   defaultsCss = applyDefaults(m.e);
+  setTitle(m.t ?? "");
   rebuildDims = { w: m.w, h: m.h, i: m.i };
   rebuildBanner = null;
   dirtyRows.clear(); // a full frame supersedes any pending per-row dirt
@@ -1342,6 +1346,15 @@ function applyFull(m: FullMsg): void {
 
 // The screen element's inline color/background override ("" = the head CSS).
 let defaultsCss = { fg: "", bg: "" };
+
+// The page title the document booted with; the session's OSC 0/2 title
+// replaces it while set and it comes back when the title is cleared.
+let bootTitle: string | null = null;
+function setTitle(t: string): void {
+  if (typeof document === "undefined") return; // unit tests run DOM-free
+  if (bootTitle === null) bootTitle = document.title;
+  document.title = t || bootTitle;
+}
 
 function paintFull(dims: { w: number; h: number; i?: ImageRef[] }): void {
   // OSC 10/11 overrides: inline style beats the config-derived head CSS;
@@ -1407,6 +1420,7 @@ function applyPatches(
 }
 
 function applyDiff(m: DiffMsg): void {
+  if (m.t !== undefined) setTitle(m.t); // two-state: absent = unchanged
   applyPatches(m.p, m.q, (m.r ?? []).map(decodeRow));
 }
 
