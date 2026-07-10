@@ -384,15 +384,19 @@ function strutMetrics(font: string): { asc: number; desc: number; iAsc: number; 
     const tm = ctx.measureText("Mg");
     // fontBoundingBox* is in device px here (the font is sized in device px).
     // Fallback ratios approximate common monospace metrics. iAsc/iDesc are
-    // the REAL ink extremes of a deep/tall probe (actualBoundingBox*):
-    // fontBoundingBox includes headroom no glyph uses, so placement decisions
-    // (rowBaseline's lift) measure actual ink instead.
-    const probe = ctx.measureText("ÀÉ|Mgjpqy_()[]");
+    // REAL ink extremes (actualBoundingBox*) — fontBoundingBox includes
+    // headroom no glyph uses, so placement decisions measure actual ink.
+    // Two probes, deliberately unequal: iDesc covers the ubiquitous
+    // descenders; iAsc deliberately EXCLUDES accented capitals — when the
+    // box is tight, rare over-tall ink (À É) clips at the top rather than
+    // costing every g/j/p/q/y its tail (kitty makes the same trade).
+    const tall = ctx.measureText("M|l[](){}");
+    const deep = ctx.measureText("gjpqy_()");
     m = {
       asc: tm.fontBoundingBoxAscent ?? fontPx * 0.8,
       desc: tm.fontBoundingBoxDescent ?? fontPx * 0.25,
-      iAsc: probe.actualBoundingBoxAscent ?? fontPx * 0.8,
-      iDesc: probe.actualBoundingBoxDescent ?? fontPx * 0.25,
+      iAsc: tall.actualBoundingBoxAscent ?? fontPx * 0.8,
+      iDesc: deep.actualBoundingBoxDescent ?? fontPx * 0.25,
     };
     ctx.font = prev;
     fontMetricsCache.set(font, m);
@@ -409,16 +413,17 @@ function rowBaseline(r: number): number {
   // Firefox line-box parity: half-leading above the content box, then ascent.
   let base = (bandH - (m.asc + m.desc)) / 2 + m.asc;
   // The terminal box model: ink lives inside the cell. When the centered
-  // baseline would clip REAL descender ink at the band bottom (a font box
-  // taller than the line height — the DOM clips there, unfixed by choice),
-  // lift the baseline just enough for the tails to fit, floored so real
-  // ascender ink keeps fitting; if even real ink is taller than the band,
-  // anchor at the ink ascent and let the bottom clip — kitty's model
-  // (calc_cell_metrics clamps positions into the cell; it never scales the
-  // font). Sub-device-pixel clipping is an invisible AA sliver: keep DOM
-  // parity there.
-  const over = base + m.iDesc - bandH;
-  if (over > Math.max(1, Math.round(dpr))) base = Math.max(bandH - m.iDesc, m.iAsc);
+  // baseline would clip ANY real descender ink at the band bottom (a font
+  // box taller than the line height — the DOM clips there, unfixed by
+  // choice), lift the baseline just enough for the tails to fit, floored so
+  // real ascender ink keeps fitting; if even real ink is taller than the
+  // band, split the deficit across both edges — half a pixel off a tall
+  // bracket and half off a tail beats a flat-bottomed g. Kitty's model:
+  // reposition and clamp into the cell, never scale (calc_cell_metrics).
+  if (base + m.iDesc > bandH) {
+    base = bandH - m.iDesc;
+    if (base < m.iAsc) base = (bandH - (m.iAsc + m.iDesc)) / 2 + m.iAsc;
+  }
   return Math.round(r * cellH * dpr + base);
 }
 

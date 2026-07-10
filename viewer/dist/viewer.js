@@ -192,12 +192,13 @@ function strutMetrics(font) {
         const prev = ctx.font;
         ctx.font = font;
         const tm = ctx.measureText("Mg");
-        const probe = ctx.measureText("ÀÉ|Mgjpqy_()[]");
+        const tall = ctx.measureText("M|l[](){}");
+        const deep = ctx.measureText("gjpqy_()");
         m = {
             asc: tm.fontBoundingBoxAscent ?? fontPx * 0.8,
             desc: tm.fontBoundingBoxDescent ?? fontPx * 0.25,
-            iAsc: probe.actualBoundingBoxAscent ?? fontPx * 0.8,
-            iDesc: probe.actualBoundingBoxDescent ?? fontPx * 0.25,
+            iAsc: tall.actualBoundingBoxAscent ?? fontPx * 0.8,
+            iDesc: deep.actualBoundingBoxDescent ?? fontPx * 0.25,
         };
         ctx.font = prev;
         fontMetricsCache.set(font, m);
@@ -208,9 +209,11 @@ function rowBaseline(r) {
     const m = strutMetrics(`${fontPx}px ${fontFam}`);
     const bandH = cellH * dpr;
     let base = (bandH - (m.asc + m.desc)) / 2 + m.asc;
-    const over = base + m.iDesc - bandH;
-    if (over > Math.max(1, Math.round(dpr)))
-        base = Math.max(bandH - m.iDesc, m.iAsc);
+    if (base + m.iDesc > bandH) {
+        base = bandH - m.iDesc;
+        if (base < m.iAsc)
+            base = (bandH - (m.iAsc + m.iDesc)) / 2 + m.iAsc;
+    }
     return Math.round(r * cellH * dpr + base);
 }
 const inkBoxCache = new Map();

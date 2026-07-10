@@ -81,7 +81,9 @@ def main():
             worst = max(worst, abs(shift))
         tag = "  (in-box clamp, ungated)" if r in CLAMPED else ""
         print(f"{r:>3} {cd:>7.2f} {cs:>8.2f} {shift:>+6.2f} {id_:>9.0f} {is_:>10.0f}{tag}")
-    print(f"worst vertical shift: {worst:.2f}px")
+    print(f"worst vertical shift: {worst:.2f}px "
+          "(canvas seats ink fully in-box — kitty's model; the DOM clips low "
+          "ink at the .run edge, so a sub-pixel lift vs the DOM is intended)")
     # Same parity under the template's CSS-zoom model (the local zoom): the
     # canvas derives fontPx across the zoomed/local coordinate-space split.
     # Gated on TEXT rows: on decoration rows (5-9) the zoomed DOM clips its
