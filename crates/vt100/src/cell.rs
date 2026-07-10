@@ -1,7 +1,7 @@
 use unicode_width::UnicodeWidthChar as _;
 
-// chosen to make the size of the cell struct 32 bytes (40 with the
-// shellglass image tag)
+// chosen to make the size of the cell struct 32 bytes upstream (44 with the
+// shellglass image tag and underline-color attr)
 const CONTENT_BYTES: usize = 22;
 
 const IS_WIDE: u8 = 0b1000_0000;
@@ -64,7 +64,7 @@ pub struct Cell {
     // which is exactly a cell-based sixel terminal's erase semantics.
     image: Option<ImageCell>,
 }
-const _: () = assert!(std::mem::size_of::<Cell>() == 40);
+const _: () = assert!(std::mem::size_of::<Cell>() == 44);
 
 impl PartialEq<Self> for Cell {
     fn eq(&self, other: &Self) -> bool {
@@ -234,6 +234,27 @@ impl Cell {
     #[must_use]
     pub fn underline(&self) -> bool {
         self.attrs.underline()
+    }
+
+    /// shellglass: the underline style — 0 none, 1 single, 2 double, 3 curly,
+    /// 4 dotted, 5 dashed (SGR `4:n` / `21`, kitty's numbering).
+    #[must_use]
+    pub fn underline_style(&self) -> u8 {
+        self.attrs.underline_style()
+    }
+
+    /// shellglass: whether the cell should be rendered struck through
+    /// (SGR 9/29).
+    #[must_use]
+    pub fn strikethrough(&self) -> bool {
+        self.attrs.strikethrough()
+    }
+
+    /// shellglass: the underline color (SGR 58/59); `Color::Default` means
+    /// the underline follows the text color.
+    #[must_use]
+    pub fn ulcolor(&self) -> crate::Color {
+        self.attrs.ulcolor
     }
 
     /// Returns whether the cell should be rendered with the inverse text

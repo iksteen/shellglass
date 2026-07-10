@@ -1453,11 +1453,22 @@ impl Screen {
                 [2] => self.attrs.set_dim(),
                 [3] => self.attrs.set_italic(true),
                 [4] => self.attrs.set_underline(true),
+                // shellglass: underline style subparam (4:0 none … 4:5
+                // dashed) — helix/neovim emit 4:3 undercurl for diagnostics.
+                [4, n] if *n <= 5 => {
+                    self.attrs.set_underline_style(to_u8!(*n));
+                }
                 [7] => self.attrs.set_inverse(true),
+                // shellglass: strikethrough
+                [9] => self.attrs.set_strikethrough(true),
+                // shellglass: double underline (ECMA-48; kitty renders it)
+                [21] => self.attrs.set_underline_style(2),
                 [22] => self.attrs.set_normal_intensity(),
                 [23] => self.attrs.set_italic(false),
                 [24] => self.attrs.set_underline(false),
                 [27] => self.attrs.set_inverse(false),
+                // shellglass: strikethrough off
+                [29] => self.attrs.set_strikethrough(false),
                 [n] if (30..=37).contains(n) => {
                     self.attrs.fgcolor = crate::Color::Idx(to_u8!(*n) - 30);
                 }
@@ -1515,6 +1526,35 @@ impl Screen {
                 },
                 [49] => {
                     self.attrs.bgcolor = crate::Color::Default;
+                }
+                // shellglass: underline color (SGR 58/59), the same three
+                // shapes as 38/48 plus the colon form with an (ignored)
+                // colorspace id — kitty emits 58:2::r:g:b.
+                [58, 2, r, g, b] | [58, 2, _, r, g, b] => {
+                    self.attrs.ulcolor =
+                        crate::Color::Rgb(to_u8!(*r), to_u8!(*g), to_u8!(*b));
+                }
+                [58, 5, i] => {
+                    self.attrs.ulcolor = crate::Color::Idx(to_u8!(*i));
+                }
+                [58] => match next_param!() {
+                    [2] => {
+                        let r = next_param_u8!();
+                        let g = next_param_u8!();
+                        let b = next_param_u8!();
+                        self.attrs.ulcolor = crate::Color::Rgb(r, g, b);
+                    }
+                    [5] => {
+                        self.attrs.ulcolor =
+                            crate::Color::Idx(next_param_u8!());
+                    }
+                    _ => {
+                        unhandled(self);
+                        return;
+                    }
+                },
+                [59] => {
+                    self.attrs.ulcolor = crate::Color::Default;
                 }
                 [n] if (90..=97).contains(n) => {
                     self.attrs.fgcolor = crate::Color::Idx(to_u8!(*n) - 82);

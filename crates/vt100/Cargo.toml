@@ -26,6 +26,12 @@
 #     (id, row_off, col_off) stamped by Screen::place_image and cleared by the
 #     cell's own set/clear, so image lifetime rides vt100's scroll/erase/reflow
 #     exactly (Cell grows 32→40 bytes). Tests in tests/image.rs.
+#   - attrs.rs/term.rs/screen.rs/cell.rs: modern SGR — underline styles
+#     (4:n subparam, 21 double, kitty numbering 0-5), strikethrough (9/29),
+#     underline color (58/59 incl. the colon/colorspace form). Upstream's
+#     underline bit became a 3-bit style; formatted output emits 4/24 for
+#     single/off (byte-compatible) and 4:n only for fancy styles. Tests in
+#     tests/attr.rs (modern_sgr*).
 #   - perform.rs: deliberate no-ops for non-visual queries/syntax — Primary and
 #     Secondary DA (`CSI c`/`CSI > c`), bare ST (`ESC \`), XTWINOPS reports and
 #     title stack (`CSI 11/13/14/16/18/19/21/22/23 t`), and OSC 10/11 color

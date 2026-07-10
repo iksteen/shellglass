@@ -18,13 +18,21 @@ const TEXT_MODE_INTENSITY: u8 = 0b0000_0011;
 const TEXT_MODE_BOLD: u8 = 0b0000_0001;
 const TEXT_MODE_DIM: u8 = 0b0000_0010;
 const TEXT_MODE_ITALIC: u8 = 0b0000_0100;
-const TEXT_MODE_UNDERLINE: u8 = 0b0000_1000;
+// shellglass: upstream's underline bit became strikethrough; underline moved
+// to the 3-bit style field below (0 = no underline).
+const TEXT_MODE_STRIKETHROUGH: u8 = 0b0000_1000;
 const TEXT_MODE_INVERSE: u8 = 0b0001_0000;
+// shellglass: underline style (SGR 4:n / 21 / 24), kitty's numbering — 0 none,
+// 1 single, 2 double, 3 curly, 4 dotted, 5 dashed.
+const TEXT_MODE_UNDERLINE_SHIFT: u8 = 5;
+const TEXT_MODE_UNDERLINE: u8 = 0b1110_0000;
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Attrs {
     pub fgcolor: Color,
     pub bgcolor: Color,
+    // shellglass: underline color (SGR 58/59); Default = follow the text color.
+    pub ulcolor: Color,
     pub mode: u8,
 }
 
@@ -68,14 +76,35 @@ impl Attrs {
     }
 
     pub fn underline(&self) -> bool {
-        self.mode & TEXT_MODE_UNDERLINE != 0
+        self.underline_style() != 0
     }
 
     pub fn set_underline(&mut self, underline: bool) {
-        if underline {
-            self.mode |= TEXT_MODE_UNDERLINE;
+        self.set_underline_style(u8::from(underline));
+    }
+
+    // shellglass: 0 none, 1 single, 2 double, 3 curly, 4 dotted, 5 dashed.
+    pub fn underline_style(&self) -> u8 {
+        (self.mode & TEXT_MODE_UNDERLINE) >> TEXT_MODE_UNDERLINE_SHIFT
+    }
+
+    pub fn set_underline_style(&mut self, style: u8) {
+        debug_assert!(style <= 5);
+        self.mode &= !TEXT_MODE_UNDERLINE;
+        self.mode |=
+            (style << TEXT_MODE_UNDERLINE_SHIFT) & TEXT_MODE_UNDERLINE;
+    }
+
+    // shellglass: strikethrough (SGR 9/29).
+    pub fn strikethrough(&self) -> bool {
+        self.mode & TEXT_MODE_STRIKETHROUGH != 0
+    }
+
+    pub fn set_strikethrough(&mut self, strikethrough: bool) {
+        if strikethrough {
+            self.mode |= TEXT_MODE_STRIKETHROUGH;
         } else {
-            self.mode &= !TEXT_MODE_UNDERLINE;
+            self.mode &= !TEXT_MODE_STRIKETHROUGH;
         }
     }
 
@@ -128,10 +157,21 @@ impl Attrs {
         } else {
             attrs.italic(self.italic())
         };
-        let attrs = if self.underline() == other.underline() {
+        // shellglass: underline rides its style (upstream's bool is gone).
+        let attrs = if self.underline_style() == other.underline_style() {
             attrs
         } else {
-            attrs.underline(self.underline())
+            attrs.underline_style(self.underline_style())
+        };
+        let attrs = if self.strikethrough() == other.strikethrough() {
+            attrs
+        } else {
+            attrs.strikethrough(self.strikethrough())
+        };
+        let attrs = if self.ulcolor == other.ulcolor {
+            attrs
+        } else {
+            attrs.ulcolor(self.ulcolor)
         };
         let attrs = if self.inverse() == other.inverse() {
             attrs

@@ -116,9 +116,13 @@ pub enum Intensity {
 pub struct Attrs {
     fgcolor: Option<crate::Color>,
     bgcolor: Option<crate::Color>,
+    // shellglass: underline color (SGR 58/59); Default = reset (59).
+    ulcolor: Option<crate::Color>,
     intensity: Option<Intensity>,
     italic: Option<bool>,
-    underline: Option<bool>,
+    // shellglass: upstream's underline bool became the SGR 4:n style value.
+    underline_style: Option<u8>,
+    strikethrough: Option<bool>,
     inverse: Option<bool>,
 }
 
@@ -143,8 +147,21 @@ impl Attrs {
         self
     }
 
-    pub fn underline(mut self, underline: bool) -> Self {
-        self.underline = Some(underline);
+    // shellglass: 0 none, 1 single, 2 double, 3 curly, 4 dotted, 5 dashed.
+    pub fn underline_style(mut self, style: u8) -> Self {
+        self.underline_style = Some(style);
+        self
+    }
+
+    // shellglass
+    pub fn strikethrough(mut self, strikethrough: bool) -> Self {
+        self.strikethrough = Some(strikethrough);
+        self
+    }
+
+    // shellglass
+    pub fn ulcolor(mut self, ulcolor: crate::Color) -> Self {
+        self.ulcolor = Some(ulcolor);
         self
     }
 
@@ -160,9 +177,11 @@ impl BufWrite for Attrs {
     fn write_buf(&self, buf: &mut Vec<u8>) {
         if self.fgcolor.is_none()
             && self.bgcolor.is_none()
+            && self.ulcolor.is_none()
             && self.intensity.is_none()
             && self.italic.is_none()
-            && self.underline.is_none()
+            && self.underline_style.is_none()
+            && self.strikethrough.is_none()
             && self.inverse.is_none()
         {
             return;
@@ -250,11 +269,45 @@ impl BufWrite for Attrs {
             }
         }
 
-        if let Some(underline) = self.underline {
-            if underline {
-                write_param!(4);
+        // shellglass: single underline stays the maximally-compatible `4`;
+        // fancier styles ride the kitty/xterm `4:n` subparam form, off is `24`.
+        if let Some(style) = self.underline_style {
+            match style {
+                0 => write_param!(24),
+                1 => write_param!(4),
+                n => {
+                    write_param!(4);
+                    buf.push(b':');
+                    extend_itoa(buf, n);
+                }
+            }
+        }
+
+        // shellglass
+        if let Some(strikethrough) = self.strikethrough {
+            if strikethrough {
+                write_param!(9);
             } else {
-                write_param!(24);
+                write_param!(29);
+            }
+        }
+
+        // shellglass: underline color has no compact idx-form shorthands.
+        if let Some(ulcolor) = self.ulcolor {
+            match ulcolor {
+                crate::Color::Default => write_param!(59),
+                crate::Color::Idx(i) => {
+                    write_param!(58);
+                    write_param!(5);
+                    write_param!(i);
+                }
+                crate::Color::Rgb(r, g, b) => {
+                    write_param!(58);
+                    write_param!(2);
+                    write_param!(r);
+                    write_param!(g);
+                    write_param!(b);
+                }
             }
         }
 
