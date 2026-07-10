@@ -67,7 +67,10 @@ jobs:
       # cargo set-version updates the manifest and Cargo.lock together, so --locked
       # still holds — and no manual version-bump commit is ever needed.
       - name: Stamp version
-        run: cargo set-version "${GITHUB_REF_NAME#v}"
+        # -p shellglass: the workspace includes the vendored vt100 crate, whose
+        # pinned upstream version (0.16.2) must never be stamped — an unscoped
+        # set-version tries to and aborts ("cannot downgrade").
+        run: cargo set-version -p shellglass "${GITHUB_REF_NAME#v}"
 
       - name: Build
         run: |
