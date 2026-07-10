@@ -399,13 +399,13 @@ own CRT effect.
 
 1. ✅ **symbol_map fonts** (landed 2026-07-10): `drawRowStorm` uses
    `svgFont(cell)` for `ctx.font`.
-2. **Fill-glyph stretch.** In `drawRowStorm`, when `isFillGlyph(cp)`:
-   `measureText` the glyph, `ctx.save/translate/scale` to the exact cell rect,
-   `fillText`, restore. Cache the measure per (glyph, font).
-3. **Baseline parity.** Replace `textBaseline = "middle"` + `midY` with an
-   alphabetic baseline computed once per font from
-   `TextMetrics.fontBoundingBoxAscent/Descent`, matching the DOM line box.
-   Verify: no vertical shift toggling storm on `showcase.sh`.
+2. ✅ **Fill-glyph stretch** (landed 2026-07-10, `canvas-track-a`): ink box
+   (`actualBoundingBox*`) mapped onto the cell rect via save/translate/scale,
+   cached per (font, glyph). Verified: fill-row ink coverage identical to DOM.
+3. ✅ **Baseline parity** (landed 2026-07-10, `canvas-track-a`): strut
+   arithmetic (half-leading + base-font `fontBoundingBoxAscent`), one
+   baseline per row. Verified via `viewer/verify.py` (screenshot ink-centroid
+   compare): worst text shift 1.00px → 0.02px. The rig stays for the B items.
 
 ### B. Canvas as a first-class switchable renderer (each blocks offering it)
 
