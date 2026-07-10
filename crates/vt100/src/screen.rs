@@ -570,6 +570,48 @@ impl Screen {
         self.grid().visible_cell(crate::grid::Pos { row, col })
     }
 
+    /// shellglass: stamp an inline-image placement of `width`×`height` cells
+    /// into the grid at the current cursor position, advancing (and scrolling)
+    /// one row per image row exactly as printing the image would, and leaving
+    /// the cursor at column 0 of the image's last row — where a sixel-scrolling
+    /// terminal leaves it.
+    ///
+    /// Each covered cell is tagged with `id` plus its offset within the image
+    /// (see [`ImageCell`](crate::ImageCell)); the tag rides the cell through
+    /// scrolling, reflow, and line insertion/deletion, and dies when the cell's
+    /// contents are overwritten or erased — mirroring a cell-based sixel
+    /// terminal's own erase semantics. Cell text and attributes are untouched
+    /// (the terminal draws images *over* cells). A too-wide image is clipped at
+    /// the right edge, like the terminal clips it.
+    pub fn place_image(
+        &mut self,
+        id: std::num::NonZeroU32,
+        width: u16,
+        height: u16,
+    ) {
+        let cols = self.grid().size().cols;
+        let left = self.grid().pos().col.min(cols - 1);
+        let width = width.clamp(1, cols - left);
+        for row_off in 0..height.max(1) {
+            if row_off > 0 {
+                self.grid_mut().row_inc_scroll(1);
+            }
+            let row = self.grid().pos().row;
+            for col_off in 0..width {
+                let pos = crate::grid::Pos {
+                    row,
+                    col: left + col_off,
+                };
+                if let Some(cell) = self.grid_mut().drawing_cell_mut(pos) {
+                    cell.set_image(Some(crate::cell::ImageCell::new(
+                        id, row_off, col_off,
+                    )));
+                }
+            }
+        }
+        self.grid_mut().col_set(0);
+    }
+
     /// Returns whether the text in row `row` should wrap to the next line.
     #[must_use]
     pub fn row_wrapped(&self, row: u16) -> bool {

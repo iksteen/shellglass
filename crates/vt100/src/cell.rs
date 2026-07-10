@@ -1,11 +1,58 @@
 use unicode_width::UnicodeWidthChar as _;
 
-// chosen to make the size of the cell struct 32 bytes
+// chosen to make the size of the cell struct 32 bytes (40 with the
+// shellglass image tag)
 const CONTENT_BYTES: usize = 22;
 
 const IS_WIDE: u8 = 0b1000_0000;
 const IS_WIDE_CONTINUATION: u8 = 0b0100_0000;
 const LEN_BITS: u8 = 0b0001_1111;
+
+/// shellglass: one cell's share of an inline-image placement.
+///
+/// See [`Screen::place_image`](crate::Screen::place_image). The offsets locate
+/// this cell within the image, so any surviving cell reconstructs the
+/// placement's top-left exactly — scrolling, line insertion/deletion, and
+/// erasure need no extra tracking.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageCell {
+    id: std::num::NonZeroU32,
+    row_off: u16,
+    col_off: u16,
+}
+
+impl ImageCell {
+    pub(crate) fn new(
+        id: std::num::NonZeroU32,
+        row_off: u16,
+        col_off: u16,
+    ) -> Self {
+        Self {
+            id,
+            row_off,
+            col_off,
+        }
+    }
+
+    /// The placement id passed to
+    /// [`Screen::place_image`](crate::Screen::place_image).
+    #[must_use]
+    pub fn id(self) -> std::num::NonZeroU32 {
+        self.id
+    }
+
+    /// Rows below the image's top edge.
+    #[must_use]
+    pub fn row_off(self) -> u16 {
+        self.row_off
+    }
+
+    /// Columns right of the image's left edge.
+    #[must_use]
+    pub fn col_off(self) -> u16 {
+        self.col_off
+    }
+}
 
 /// Represents a single terminal cell.
 #[derive(Clone, Debug, Eq)]
@@ -13,8 +60,11 @@ pub struct Cell {
     contents: [u8; CONTENT_BYTES],
     len: u8,
     attrs: crate::attrs::Attrs,
+    // shellglass: inline-image tag; dies with the cell's contents (set/clear),
+    // which is exactly a cell-based sixel terminal's erase semantics.
+    image: Option<ImageCell>,
 }
-const _: () = assert!(std::mem::size_of::<Cell>() == 32);
+const _: () = assert!(std::mem::size_of::<Cell>() == 40);
 
 impl PartialEq<Self> for Cell {
     fn eq(&self, other: &Self) -> bool {
@@ -35,6 +85,7 @@ impl Cell {
             contents: Default::default(),
             len: 0,
             attrs: crate::attrs::Attrs::default(),
+            image: None,
         }
     }
 
@@ -44,6 +95,7 @@ impl Cell {
 
     pub(crate) fn set(&mut self, c: char, a: crate::attrs::Attrs) {
         self.len = 0;
+        self.image = None; // shellglass: overwriting text erases the image here
         self.append_char(0, c);
         // strings in this context should always be an arbitrary character
         // followed by zero or more zero-width characters, so we should only
@@ -76,6 +128,20 @@ impl Cell {
     pub(crate) fn clear(&mut self, attrs: crate::attrs::Attrs) {
         self.len = 0;
         self.attrs = attrs;
+        self.image = None; // shellglass: erasing the cell erases the image here
+    }
+
+    /// shellglass: this cell's share of an inline-image placement, if it is
+    /// covered by one (see [`Screen::place_image`](crate::Screen::place_image)).
+    #[must_use]
+    pub fn image_cell(&self) -> Option<ImageCell> {
+        self.image
+    }
+
+    // shellglass: stamp (or clear) the image tag without touching the cell's
+    // text or attributes — the terminal draws images *over* cells.
+    pub(crate) fn set_image(&mut self, image: Option<ImageCell>) {
+        self.image = image;
     }
 
     /// Returns the text contents of the cell.

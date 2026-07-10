@@ -22,6 +22,10 @@
 #     wrapping BSU/ESU counters (synchronized_update{,_starts,_ends}) so a
 #     sampling consumer can see edges that open and close within one read.
 #     Tests in tests/mode.rs (synchronized_update).
+#   - cell.rs/screen.rs: per-cell inline-image tags — Cell carries an optional
+#     (id, row_off, col_off) stamped by Screen::place_image and cleared by the
+#     cell's own set/clear, so image lifetime rides vt100's scroll/erase/reflow
+#     exactly (Cell grows 32→40 bytes). Tests in tests/image.rs.
 [package]
 name = "vt100"
 version = "0.16.2"
