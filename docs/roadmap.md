@@ -262,7 +262,13 @@ split differently from round 2: two real gaps, two noise kinds.
    emit what the viewer renders, and keep the *query* forms in phase 1.6's
    no-op arms — they must not set anything.
 
-13. **Split binaries: the full CLI plus per-mode executables.** Today one
+13. **Split binaries: the full CLI plus per-mode executables.** ✅ Landed
+    2026-07-10 (single commit: lib+cli restructure, features, bins, Docker,
+    CI matrix). Feature-matched sizes: full 16.2MB → hub-only 12.9MB (the
+    remainder is russh/acme/axum, its real dependencies), key utilities
+    0.9MB; the full CLI degrades to the compiled-in subcommands, so the
+    Docker image kept its `shellglass hub` entrypoint with just build flags.
+    Original rationale: today one
     binary carries every mode; a hub deployment ships the PTY backend, image
     interceptor, font machinery and SSH viewer it never runs (and their
     dependency tree), while a push-only dev box ships the hub. Offer slim
