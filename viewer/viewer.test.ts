@@ -489,3 +489,9 @@ test("cellStyle conceal: glyph transparent, bg stays, decorations keep their ink
     "color:transparent;text-decoration:underline #ff0000;",
   );
 });
+
+test("cellStyle blink animates the ink; conceal wins over blink", () => {
+  assert.equal(cellStyle({ x: 1 }, false), "animation:sg-blink 1s step-end infinite;");
+  // blinking a concealed cell is meaningless — conceal's transparent wins
+  assert.equal(cellStyle({ x: 1, o: 1 }, false), "color:transparent;");
+});

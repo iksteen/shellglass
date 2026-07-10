@@ -28,6 +28,7 @@ export interface Cell {
   u?: Flag | number; // underline style: 1 single, 2 double, 3 curly, 4 dotted, 5 dashed
   s?: Flag; // strikethrough
   o?: Flag; // concealed (SGR 8): glyph hidden, text stays in the buffer
+  x?: Flag; // blink (SGR 5/6): animated, like kitty
   k?: Color; // underline color; absent = follow the text color
   n?: Flag; // inverse
   a?: number; // OSC 8 hyperlink id, resolved through the frame's `y` table
@@ -63,7 +64,7 @@ type WireRow =
 
 // There is no "t" tag: each message type owns one payload key (d/r/c/l/b/v), and
 // apply() dispatches on which is present — `c` FIRST, since the single-cell form
-// flattens its style letters (f,g,b,d,i,u,s,o,k,n,w) into the envelope. The cursor
+// flattens its style letters (f,g,b,d,i,u,s,o,x,k,n,w) into the envelope. The cursor
 // is a separate `p` key on every diff-family message.
 interface FullMsg {
   d: Block[];
@@ -272,6 +273,9 @@ export function cellStyle(cell: Cell, isCursor: boolean): string {
   if (bg) s += `background:${hex(bg)};`;
   if (cell.b) s += "font-weight:bold;";
   if (cell.i) s += "font-style:italic;";
+  // Blink (SGR 5): keyframes injected by injectViewerCss — the ink goes
+  // transparent for the second half of each 1s cycle (bg stays), like kitty.
+  if (cell.x && !cell.o) s += "animation:sg-blink 1s step-end infinite;";
   if (cell.u || cell.s) {
     // The text-decoration shorthand: lines, then style (u: 2 double, 3 wavy
     // undercurl, 4 dotted, 5 dashed), then color (absent = currentcolor, which
@@ -866,11 +870,19 @@ function redrawCanvasRow(r: number): void {
   const y1 = Math.round((r + 1) * cellH * dpr);
   ctx.clearRect(0, y0, canvasEl.width, y1 - y0);
   if (!row) return;
+  let hasBlink = false;
   let c = 0;
   for (const cell of row) {
     const w = cell.w ? 2 : 1;
     const cp = cell.o ? 0 : cell.t ? cell.t.codePointAt(0)! : 0; // conceal: no glyph
     if (cp && isCanvasGlyph(cp)) {
+      // a blinking box glyph is timer-repainted here even in DOM mode (the
+      // CSS animation only reaches DOM-drawn text)
+      if (cell.x) hasBlink = true;
+      if (cell.x && blinkPhase) {
+        c += w;
+        continue; // blink-off phase: skip the glyph, keep the registration
+      }
       // Only a block cursor reverses the glyph's ink; underline/bar cursors
       // ride the DOM span's decoration and leave the colors alone.
       const isCursor =
@@ -879,6 +891,7 @@ function redrawCanvasRow(r: number): void {
     }
     c += w;
   }
+  noteBlinkRow(r, hasBlink);
 }
 
 function redrawCanvasAll(): void {
@@ -1058,6 +1071,30 @@ function stormAutoOn(): boolean {
   return stormPref;
 }
 
+// Blink (SGR 5) on the canvas: rows holding blink cells register here while
+// painted; a lazy 500ms timer flips the phase and repaints exactly those rows
+// (the DOM path animates via CSS instead). In the off phase the glyph is
+// skipped like conceal — bg and decorations stay, matching kitty's ink blink.
+let blinkPhase = false;
+const blinkRows = new Set<number>();
+let blinkTimer: ReturnType<typeof setInterval> | null = null;
+function ensureBlinkTimer(): void {
+  if (blinkTimer !== null) return;
+  blinkTimer = setInterval(() => {
+    if (!blinkRows.size) return; // idle: keep the (cheap) timer, skip work
+    blinkPhase = !blinkPhase;
+    for (const r of [...blinkRows]) redrawCanvasRow(r);
+  }, 500);
+}
+function noteBlinkRow(r: number, has: boolean): void {
+  if (has) {
+    blinkRows.add(r);
+    ensureBlinkTimer();
+  } else {
+    blinkRows.delete(r);
+  }
+}
+
 // The template's CRT is mostly blend-mode overlays + a #screen filter, which
 // composite over the canvas for free; only the text-shadow phosphor bloom is
 // text-bound (and forced off on ghost rows). Canvas rows re-create it below in
@@ -1171,6 +1208,7 @@ function drawRowStorm(r: number): void {
   // Block cursors reverse the cell, like a terminal's; underline/bar cursors
   // draw their shape and leave the colors alone.
   const blocky = screen.sty <= 2;
+  let hasBlink = false;
   let c = 0;
   for (const cell of row) {
     const w = cell.w ? 2 : 1;
@@ -1198,10 +1236,12 @@ function drawRowStorm(r: number): void {
       ctx.fillStyle = defBg;
       ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
     }
-    const cp = cell.o ? 0 : cell.t ? cell.t.codePointAt(0)! : 0; // conceal: no glyph
+    if (cell.x) hasBlink = true;
+    const hidden = !!cell.o || (!!cell.x && blinkPhase); // conceal / blink-off phase
+    const cp = hidden ? 0 : cell.t ? cell.t.codePointAt(0)! : 0;
     if (cp && isCanvasGlyph(cp) && !(cp >= 0xe000 && symbolFamily(cp))) {
       drawGlyph(r, c, cp, cell, curBlock);
-    } else if (!cell.o && cell.t && cell.t !== " ") {
+    } else if (!hidden && cell.t && cell.t !== " ") {
       // symbol_map / fill-glyph cells draw with their mapped family — canvas
       // uses the served webfonts once loaded, same faces as the DOM path.
       const fam = svgFont(cell) ?? fontFam;
@@ -1261,6 +1301,7 @@ function drawRowStorm(r: number): void {
     }
     c += w;
   }
+  noteBlinkRow(r, hasBlink);
   if (crtOn()) {
     // Phosphor bloom: blurred lighter self-composite of the row band, glowing
     // in the ink's own color. Per-row, not per-flush over the full canvas —
@@ -2099,7 +2140,9 @@ function injectViewerCss(): void {
   const linkCss = document.createElement("style");
   linkCss.textContent =
     "#screen a.run{color:inherit;text-decoration:none}" +
-    "#screen a.run:hover{text-decoration:underline}";
+    "#screen a.run:hover{text-decoration:underline}" +
+    // SGR 5 blink, DOM path: ink transparent for the cycle's second half
+    "@keyframes sg-blink{50%,100%{color:transparent}}";
   document.head.appendChild(linkCss);
 }
 
@@ -2122,6 +2165,11 @@ export function benchFlush(): void {
 // unreliable pre-load; verify.html busy-waits wall-clock then steps).
 export function benchCursorStep(): void {
   stepCurAnim();
+}
+// Set the canvas blink phase synchronously (same headless-timer caveat).
+export function benchBlinkPhase(on: boolean): void {
+  blinkPhase = on;
+  for (const r of [...blinkRows]) redrawCanvasRow(r);
 }
 
 function main(): void {

@@ -18,7 +18,7 @@
 <input type="checkbox" id="crt" hidden>
 <div id="screen"></div>
 <script type="module">
-import { setConfig, apply, benchInit, benchStorm, benchFlush, benchCursorStep } from "./viewer.js";
+import { setConfig, apply, benchInit, benchStorm, benchFlush, benchCursorStep, benchBlinkPhase } from "./viewer.js";
 
 const PARAMS = new URLSearchParams(location.search);
 const MODE = PARAMS.get("mode") ?? "dom";
@@ -198,6 +198,40 @@ if (MODE === "bleed") {
     ink(g.getImageData(0, Math.round((r + 1) * lh) - 3, canvas.width, 3).data);
   const pass = band(3) === 0 && band(6) === 0 // nothing escapes its box
     && bottom(2) > 0 && bottom(5) > 0; // tails + low bar visible, in-box
+  document.getElementById("screen").style.display = "none";
+  document.body.style.background = pass ? "#00ff00" : "#ff0000";
+}
+
+// ?mode=blink: SGR 5 on the canvas — the off phase hides the glyph ink (bg
+// stays), the on phase restores it, driven synchronously through the
+// benchBlinkPhase hook (headless timers are unreliable). Green/red convention.
+if (MODE === "blink") {
+  const d6 = [];
+  for (let i = 0; i < ROWS; i++) d6.push([[pad("")]]);
+  d6[2] = [[pad("blinking Mgjq")], [[0, 13, { x: 1, g: 4 }]]];
+  apply({ d: d6, w: COLS, h: ROWS });
+  benchFlush();
+  benchStorm(true);
+  const canvas = document.querySelector("#screen canvas");
+  const g = canvas.getContext("2d");
+  const lh = 17 * devicePixelRatio;
+  const band = () => {
+    const px = g.getImageData(0, Math.round(2 * lh), canvas.width, Math.round(lh)).data;
+    let lit = 0, blue = 0;
+    for (let i = 0; i < px.length; i += 4) {
+      if (px[i] > 100 && px[i + 1] > 100) lit++; // glyph ink (light gray)
+      if (px[i + 2] > 100 && px[i] < 60) blue++; // the bg fill
+    }
+    return { lit, blue };
+  };
+  const on = band(); // phase false: ink + bg
+  benchBlinkPhase(true);
+  const off = band(); // off phase: bg only
+  benchBlinkPhase(false);
+  const back = band();
+  const pass = on.lit > 0 && on.blue > 0
+    && off.lit === 0 && off.blue > 0 // ink gone, bg untouched
+    && back.lit > 0; // and it comes back
   document.getElementById("screen").style.display = "none";
   document.body.style.background = pass ? "#00ff00" : "#ff0000";
 }

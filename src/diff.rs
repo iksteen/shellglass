@@ -665,6 +665,13 @@ struct CellStyle {
         serialize_with = "flag"
     )]
     concealed: bool,
+    /// Blink (SGR 5/6): the viewers animate it, like kitty.
+    #[serde(
+        rename = "x",
+        skip_serializing_if = "crate::model::is_false",
+        serialize_with = "flag"
+    )]
+    blink: bool,
     /// Underline color; absent = follow the text color (CSS default).
     #[serde(rename = "k", skip_serializing_if = "crate::model::is_default_color")]
     ulcolor: Color,
@@ -711,6 +718,7 @@ impl CellStyle {
             (self.italic, "i"),
             (self.strike, "s"),
             (self.concealed, "o"),
+            (self.blink, "x"),
             (self.inverse, "n"),
             (self.wide, "w"),
         ] {
@@ -730,7 +738,14 @@ fn is_plain(c: &StyledCell) -> bool {
         && c.ulcolor == Color::Default
         && c.underline == 0
         && c.link.is_none()
-        && !(c.bold || c.dim || c.italic || c.strike || c.concealed || c.inverse || c.wide)
+        && !(c.bold
+            || c.dim
+            || c.italic
+            || c.strike
+            || c.concealed
+            || c.blink
+            || c.inverse
+            || c.wide)
 }
 
 fn cell_style(c: &StyledCell) -> CellStyle {
@@ -743,6 +758,7 @@ fn cell_style(c: &StyledCell) -> CellStyle {
         underline: c.underline,
         strike: c.strike,
         concealed: c.concealed,
+        blink: c.blink,
         ulcolor: c.ulcolor,
         inverse: c.inverse,
         link: c.link,
@@ -1370,6 +1386,8 @@ struct CellStyleIn {
     strike: bool,
     #[serde(rename = "o", default, deserialize_with = "truthy")]
     concealed: bool,
+    #[serde(rename = "x", default, deserialize_with = "truthy")]
+    blink: bool,
     #[serde(rename = "k", default)]
     ulcolor: Color,
     #[serde(rename = "n", default, deserialize_with = "truthy")]
@@ -1408,6 +1426,7 @@ fn decode_block(block: CellBlockIn) -> Vec<StyledCell> {
             c.underline = s.underline;
             c.strike = s.strike;
             c.concealed = s.concealed;
+            c.blink = s.blink;
             c.ulcolor = s.ulcolor;
             c.inverse = s.inverse;
             c.link = s.link;
@@ -2011,6 +2030,23 @@ mod tests {
         };
         assert_grid_equiv(&out, &g);
         assert!(out.rows[0][0].concealed && !out.rows[0][1].concealed);
+    }
+
+    // Blink rides `x` (additive — old viewers show it steady, the pre-blink
+    // behavior) and decodes on the hub side.
+    #[test]
+    fn blink_rides_the_wire_and_decodes() {
+        let mut g = grid(&["bz"]);
+        g.rows[0][0].blink = true;
+        let full = full_message_grid(&g);
+        assert!(full.contains(r#"{"x":1}"#), "{full}");
+
+        let prev = Frame::Banner("x".into());
+        let Some(Frame::Screen(out)) = apply(&prev, &full) else {
+            panic!("full applies")
+        };
+        assert_grid_equiv(&out, &g);
+        assert!(out.rows[0][0].blink && !out.rows[0][1].blink);
     }
 
     // DECSCUSR rides as `q`: absolute on fulls (absent = default), two-state on

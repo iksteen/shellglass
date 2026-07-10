@@ -60,6 +60,8 @@ def main():
         shot(port, "image", f)
         shot(port, "cursor&cursor=smooth", h)
         shot(port, "bleed", j)
+        m = "/tmp/sg-verify-blink.png"
+        shot(port, "blink", m)
         za, zb = "/tmp/sg-verify-zdom.png", "/tmp/sg-verify-zstorm.png"
         shot(port, "dom&zoom=1.5", za)
         shot(port, "storm&zoom=1.5", zb)
@@ -148,7 +150,8 @@ def main():
                         gaps.append((r, x))
         print(f"decoration continuity ({label}): "
               f"{'PASS' if not gaps else f'FAIL ({len(gaps)} empty cols, first {gaps[0]})'}")
-    for name, path in (("links", c), ("crt", e), ("image", f), ("cursor", h), ("bleed", j)):
+    for name, path in (("links", c), ("crt", e), ("image", f), ("cursor", h),
+                       ("bleed", j), ("blink", m)):
         lr, lg, lb = Image.open(path).convert("RGB").load()[20, 20]
         print(f"{name} self-check: {'PASS' if lg > 200 and lr < 60 else 'FAIL'}")
 

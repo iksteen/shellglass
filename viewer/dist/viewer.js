@@ -114,6 +114,8 @@ export function cellStyle(cell, isCursor) {
         s += "font-weight:bold;";
     if (cell.i)
         s += "font-style:italic;";
+    if (cell.x && !cell.o)
+        s += "animation:sg-blink 1s step-end infinite;";
     if (cell.u || cell.s) {
         let d = `${cell.u ? "underline" : ""}${cell.s ? " line-through" : ""}`;
         const us = { 2: "double", 3: "wavy", 4: "dotted", 5: "dashed" }[cell.u];
@@ -603,16 +605,24 @@ function redrawCanvasRow(r) {
     ctx.clearRect(0, y0, canvasEl.width, y1 - y0);
     if (!row)
         return;
+    let hasBlink = false;
     let c = 0;
     for (const cell of row) {
         const w = cell.w ? 2 : 1;
         const cp = cell.o ? 0 : cell.t ? cell.t.codePointAt(0) : 0;
         if (cp && isCanvasGlyph(cp)) {
+            if (cell.x)
+                hasBlink = true;
+            if (cell.x && blinkPhase) {
+                c += w;
+                continue;
+            }
             const isCursor = !!screen.cur && screen.cur[0] === r && screen.cur[1] === c && screen.sty <= 2;
             drawGlyph(r, c, cp, cell, isCursor);
         }
         c += w;
     }
+    noteBlinkRow(r, hasBlink);
 }
 function redrawCanvasAll() {
     if (!ctx || !canvasEl)
@@ -745,6 +755,29 @@ function stormAutoOn() {
     }
     return stormPref;
 }
+let blinkPhase = false;
+const blinkRows = new Set();
+let blinkTimer = null;
+function ensureBlinkTimer() {
+    if (blinkTimer !== null)
+        return;
+    blinkTimer = setInterval(() => {
+        if (!blinkRows.size)
+            return;
+        blinkPhase = !blinkPhase;
+        for (const r of [...blinkRows])
+            redrawCanvasRow(r);
+    }, 500);
+}
+function noteBlinkRow(r, has) {
+    if (has) {
+        blinkRows.add(r);
+        ensureBlinkTimer();
+    }
+    else {
+        blinkRows.delete(r);
+    }
+}
 let crtBox;
 function crtOn() {
     if (crtBox === undefined) {
@@ -841,6 +874,7 @@ function drawRowStorm(r) {
     };
     let curFont = "";
     const blocky = screen.sty <= 2;
+    let hasBlink = false;
     let c = 0;
     for (const cell of row) {
         const w = cell.w ? 2 : 1;
@@ -859,11 +893,14 @@ function drawRowStorm(r) {
             ctx.fillStyle = defBg;
             ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
         }
-        const cp = cell.o ? 0 : cell.t ? cell.t.codePointAt(0) : 0;
+        if (cell.x)
+            hasBlink = true;
+        const hidden = !!cell.o || (!!cell.x && blinkPhase);
+        const cp = hidden ? 0 : cell.t ? cell.t.codePointAt(0) : 0;
         if (cp && isCanvasGlyph(cp) && !(cp >= 0xe000 && symbolFamily(cp))) {
             drawGlyph(r, c, cp, cell, curBlock);
         }
-        else if (!cell.o && cell.t && cell.t !== " ") {
+        else if (!hidden && cell.t && cell.t !== " ") {
             const fam = svgFont(cell) ?? fontFam;
             const font = `${cell.i ? "italic " : ""}${cell.b ? "bold " : ""}${fontPx}px ${fam}`;
             if (font !== curFont) {
@@ -913,6 +950,7 @@ function drawRowStorm(r) {
         }
         c += w;
     }
+    noteBlinkRow(r, hasBlink);
     if (crtOn()) {
         ctx.save();
         ctx.globalCompositeOperation = "lighter";
@@ -1520,7 +1558,8 @@ function injectViewerCss() {
     const linkCss = document.createElement("style");
     linkCss.textContent =
         "#screen a.run{color:inherit;text-decoration:none}" +
-            "#screen a.run:hover{text-decoration:underline}";
+            "#screen a.run:hover{text-decoration:underline}" +
+            "@keyframes sg-blink{50%,100%{color:transparent}}";
     document.head.appendChild(linkCss);
 }
 export function benchInit(el) {
@@ -1539,6 +1578,11 @@ export function benchFlush() {
 }
 export function benchCursorStep() {
     stepCurAnim();
+}
+export function benchBlinkPhase(on) {
+    blinkPhase = on;
+    for (const r of [...blinkRows])
+        redrawCanvasRow(r);
 }
 function main() {
     const boot = window.SHELLGLASS;
