@@ -871,6 +871,36 @@ function cellBgRgb(cell: Cell, isCursor: boolean): RGB | null {
 // show through), per-cell backgrounds, then ink — crisp geometry for canvas glyphs,
 // fillText for everything else. maxWidth pins a glyph into its cell box like the
 // DOM's .run overflow:hidden does.
+// The renderer switch: canvas mode pins storm on — every dirty row paints on
+// the canvas, the DOM stays as ghost text + image overlays. Driven by the
+// template's #render checkbox when present (change flips live), else by the
+// stored choice / ?render=canvas at boot. DOM mode keeps today's behavior:
+// classic renderer with storm escalation under load.
+let renderBox: HTMLInputElement | null | undefined;
+let renderPref: boolean | undefined;
+function canvasModeOn(): boolean {
+  if (renderBox === undefined) {
+    renderBox = document.getElementById("render") as HTMLInputElement | null;
+    renderBox?.addEventListener("change", () => {
+      if (renderBox?.checked) setStorm(true);
+      else if (!selectionActive()) setStorm(false); // else the watchdog exits later
+    });
+  }
+  if (renderBox !== null) return renderBox.checked;
+  if (renderPref === undefined) {
+    let stored: string | null = null;
+    try {
+      stored = localStorage.getItem("shellglass-render");
+    } catch {
+      /* viewer with localStorage disabled */
+    }
+    renderPref = stored
+      ? stored === "on"
+      : new URLSearchParams(location.search).get("render") === "canvas";
+  }
+  return renderPref;
+}
+
 // The template's CRT is mostly blend-mode overlays + a #screen filter, which
 // composite over the canvas for free; only the text-shadow phosphor bloom is
 // text-bound (and forced off on ghost rows). Canvas rows re-create it below in
@@ -1147,7 +1177,8 @@ function setStorm(on: boolean): void {
       // and the calm-down fires ~1.2s after the animation ends, exactly when the
       // user reaches for Ctrl-C. Storm stays on (the canvas keeps painting); the
       // first tick after the selection clears drops back to DOM.
-      if (clock() - lastStormy > STORM_EXIT_MS && !selectionActive()) setStorm(false);
+      if (clock() - lastStormy > STORM_EXIT_MS && !selectionActive() && !canvasModeOn())
+        setStorm(false);
     }, 300);
   } else {
     if (stormTimer !== null) clearInterval(stormTimer);
@@ -1566,13 +1597,14 @@ function flushPaint(): void {
     paintFull(rebuildDims);
     rebuildDims = null;
     dirtyRows.clear();
+    if (canvasModeOn()) setStorm(true); // canvas mode: re-pin after the rebuild
   } else {
     // Storm detection: a flush touching most rows, several times in a row, means
     // full-screen animation — flip to canvas rendering (see storm mode above).
     const stormy = dirtyRows.size >= STORM_RATIO * (screen.cells.length || 1);
     if (stormy) {
       lastStormy = now;
-      if (!storm && ++stormHot >= STORM_ENTER) setStorm(true); // paints all rows
+      if (stormEnabled && !storm && ++stormHot >= STORM_ENTER) setStorm(true); // paints all rows
     } else if (!storm) {
       stormHot = 0;
     }
@@ -1814,7 +1846,7 @@ function startStats(): void {
     lastBytes = bytesIn;
     lastPaints = paints;
     lastT = t;
-    el.textContent = `${fmtRate(bps)} · ${fps.toFixed(0)} fps (cap ${cap.toFixed(0)})${storm ? " · canvas" : ""}`;
+    el.textContent = `${fmtRate(bps)} · ${fps.toFixed(0)} fps (cap ${cap.toFixed(0)})${storm ? (canvasModeOn() ? " · canvas" : " · storm") : ""}`;
   }, 1000);
 }
 
@@ -1827,11 +1859,16 @@ function injectViewerCss(): void {
   document.head.appendChild(linkCss);
 }
 
-// ── canvas-track verification hooks (verify.html; no SSE) ─────────────────────
-export function benchInit(el: HTMLElement): void {
+// ── canvas-track verification hooks (verify.html, bench.html; no SSE) ─────────
+let stormEnabled = true; // bench-only knob: pin the classic path for comparison
+export function benchInit(el: HTMLElement, mode?: string): void {
   screenEl = el;
+  stormEnabled = mode !== "dom-nostorm";
   injectViewerCss();
   attachLinkHandlers();
+}
+export function benchStats(): { paints: number; cost: number; storm: boolean } {
+  return { paints, cost: paintCost, storm };
 }
 export function benchStorm(on: boolean): void {
   setStorm(on);

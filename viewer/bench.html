@@ -1,0 +1,186 @@
+<!doctype html>
+<!-- exp/cell-matrix throughput bench: pumps synthetic cmatrix-class frames
+     through the production apply() path and reports paints/sec + flush cost
+     for the classic renderer (which storm-escalates under this load — the
+     number to beat) vs the matrix renderer. Driven headless by bench.py. -->
+<html><head><meta charset="utf-8"><style>
+  html,body { margin:0; }
+  #screen { font-family:monospace; font-size:14px; --lh:17px; line-height:var(--lh);
+            color:#d0d0d0; background:#000; }
+  .screen { position:relative; white-space:pre; overflow:hidden; }
+  .row { position:relative; height:var(--lh); contain:layout style; }
+  .run { position:absolute; top:0; height:var(--lh); overflow:hidden; }
+</style></head><body>
+<div id="screen"></div>
+<script type="module">
+import { setConfig, apply, benchInit, benchStats } from "./viewer.js";
+
+const q = new URLSearchParams(location.search);
+const MODE = q.get("mode") ?? "dom";              // dom | dom-nostorm | canvas
+const LOAD = q.get("load") ?? "rain";             // rain | typing | editor
+const COLS = Number(q.get("cols") ?? 200);
+const ROWS = Number(q.get("rows") ?? 60);
+const SECONDS = Number(q.get("secs") ?? 5);
+
+setConfig({ defFg: "#d0d0d0", defBg: "#000000", fillFont: "monospace", sym: [] });
+if (MODE === "canvas") {
+  // exercise the real renderer switch: the viewer reads this #render checkbox
+  const c = document.createElement("input");
+  c.type = "checkbox"; c.id = "render"; c.checked = true; c.hidden = true;
+  document.body.appendChild(c);
+}
+benchInit(document.getElementById("screen"), MODE);
+
+// Honest cmatrix simulation: independent falling streams per column. Nearly
+// every ROW changes each frame (storm engages on the classic path, as in
+// real life), but only a few percent of CELLS differ frame-over-frame —
+// the head advances and the tail erases, everything between is stable.
+const GLYPHS = "abcdefghijklmnopqrstuvwxyz0123456789@#$%&*+=<>";
+let seed = 42;
+const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+
+// Per-column stream state + the authoritative character grid. Each written
+// cell keeps a STICKY random shade (like real cmatrix trails: white head,
+// bright green behind it, mixed/dim greens down the tail) — adjacent cells
+// rarely share a style, so rows fragment into near-per-cell runs. That
+// fragmentation is what made classic DOM collapse under real cmatrix; a
+// two-style corpus coalesces into long runs and hides it.
+const heads = [];   // head row (may be past the bottom while the tail drains)
+const lens = [];    // trail length
+const speeds = [];  // advance probability per frame
+const grid = [];    // grid[r][c] = glyph or " "
+const shade = [];   // shade[r][c] = 0 space, 1..3 greens, 4 head
+const SHADES = [null, { f: 2 }, { f: 10 }, { f: 2, d: 1 }, { f: 15, b: 1 }];
+for (let c = 0; c < COLS; c++) {
+  heads.push((rnd() * ROWS * 2) | 0);
+  lens.push(4 + ((rnd() * ROWS * 0.6) | 0));
+  speeds.push(0.3 + rnd() * 0.7);
+}
+for (let r = 0; r < ROWS; r++) {
+  grid.push(new Array(COLS).fill(" "));
+  shade.push(new Array(COLS).fill(0));
+}
+
+function step() {
+  const dirty = new Set();
+  for (let c = 0; c < COLS; c++) {
+    if (rnd() > speeds[c]) continue;
+    heads[c]++;
+    const head = heads[c];
+    const prev = head - 1;
+    const tail = head - lens[c];
+    if (head < ROWS) {
+      grid[head][c] = GLYPHS[(rnd() * GLYPHS.length) | 0];
+      shade[head][c] = 4; // bright white head
+      dirty.add(head);
+    }
+    if (prev >= 0 && prev < ROWS && shade[prev][c] === 4) {
+      shade[prev][c] = 1 + ((rnd() * 3) | 0); // settles into a sticky green
+      dirty.add(prev);
+    }
+    if (tail >= 0 && tail < ROWS) {
+      grid[tail][c] = " ";
+      shade[tail][c] = 0;
+      dirty.add(tail);
+    }
+    if (tail >= ROWS) { // stream fully drained: respawn at the top
+      heads[c] = 0;
+      lens[c] = 4 + ((rnd() * ROWS * 0.6) | 0);
+    }
+  }
+  return dirty;
+}
+
+// Wire entries for one row: the full row as a text run plus per-cell shades,
+// coalesced into runs like the real encoder (short runs — shades are mixed).
+// Unchanged cells decode to identical values, so per-cell diffing can skip.
+function rowEntries(r) {
+  const text = grid[r].join("");
+  const runs = [];
+  let start = -1, cur = 0;
+  for (let c = 0; c <= COLS; c++) {
+    const k = c < COLS ? shade[r][c] : 0;
+    if (k !== cur) {
+      if (cur !== 0) runs.push([start, c - start, SHADES[cur]]);
+      start = c;
+      cur = k;
+    }
+  }
+  return [[text], runs];
+}
+
+function fullMsg() {
+  for (let i = 0; i < ROWS; i++) step(); // pre-roll so the screen has rain
+  const d = [];
+  for (let r = 0; r < ROWS; r++) d.push(rowEntries(r));
+  return { d, w: COLS, h: ROWS, p: [0, 0] };
+}
+let frameN = 0;
+function diffMsg() {
+  if (LOAD === "typing") {
+    // One echoed keystroke: a single-cell change + cursor move on one row.
+    const r = ROWS - 1;
+    const c = 2 + (frameN % (COLS - 3));
+    grid[r][c] = GLYPHS[(rnd() * GLYPHS.length) | 0];
+    return { c: [r, c, grid[r][c]], p: [r, c + 1] };
+  }
+  if (LOAD === "editor") {
+    // Editor-style partial churn: ~30% of rows get a mid-row rewrite of
+    // syntax-highlighted TOKENS — short (2-8 char) runs cycling ~6 styles,
+    // like real highlighting. Below the per-frame storm trigger (50%).
+    const TOKEN_STYLES = [
+      { f: 4 }, { f: 3 }, { f: 6, b: 1 }, { f: 5 }, { f: 2 }, { f: 7, d: 1 },
+    ];
+    const rows = [];
+    for (let r = frameN % 3; r < ROWS; r += 3) {
+      const lo = 4 + ((rnd() * 8) | 0);
+      const len = Math.min(60, COLS - lo - 1);
+      let text = "";
+      const runs = [];
+      let i = 0;
+      while (i < len) {
+        const tok = Math.min(2 + ((rnd() * 7) | 0), len - i);
+        for (let j = 0; j < tok; j++) text += GLYPHS[(rnd() * GLYPHS.length) | 0];
+        runs.push([i, tok, TOKEN_STYLES[(rnd() * TOKEN_STYLES.length) | 0]]);
+        i += tok;
+        if (i < len) { text += " "; i++; } // token gap
+      }
+      rows.push([r, lo, [text], runs]);
+    }
+    return { r: rows, p: [frameN % ROWS, 0] };
+  }
+  const rows = [];
+  for (const r of [...step()].sort((a, b) => a - b)) {
+    const e = rowEntries(r);
+    rows.push([r, 0, e[0], e[1]]);
+  }
+  return { r: rows, p: [(rnd() * ROWS) | 0, (rnd() * COLS) | 0] };
+}
+
+apply({ v: 4 });        // version hello (proto unset in bench: inert)
+apply(fullMsg());
+
+// Pump one diff per animation frame for the budget, then report.
+const t0 = performance.now();
+const startPaints = benchStats().paints;
+function pump() {
+  if (performance.now() - t0 >= SECONDS * 1000) {
+    const s = benchStats();
+    const dt = (performance.now() - t0) / 1000;
+    fetch("/result", {
+      method: "POST",
+      body: JSON.stringify({
+        mode: MODE, load: LOAD, cols: COLS, rows: ROWS,
+        fps: (s.paints - startPaints) / dt,
+        cost_ms: s.cost,
+        storm: s.storm,
+      }),
+    });
+    return;
+  }
+  frameN++;
+  apply(diffMsg());
+  requestAnimationFrame(pump);
+}
+requestAnimationFrame(pump);
+</script></body></html>

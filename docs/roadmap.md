@@ -443,13 +443,15 @@ own CRT effect.
    per-flush, so undirtied rows aren't re-brightened). Driven by the same
    `#crt` checkbox; the DOM's chromatic fringe stays text-shadow-only.
    Verified: `verify.py` `?mode=crt` self-check.
-8. **The renderer switch.** A user-facing mode setting (`?render=canvas` /
-   `localStorage sg-render`, plus an in-page toggle next to the CRT one):
-   DOM mode = today's classic renderer with storm escalation to canvas;
-   canvas mode = canvas for every dirty row, DOM kept for ghost text +
-   images. Both renderers stay maintained — deletion is out of scope for
-   now. Re-run `bench.py` in both modes; document the switch in README and
-   the mode tag in `#sg-stats`.
+8. ✅ **The renderer switch** (landed 2026-07-10, `canvas-track-a`):
+   `#render` nav toggle (persisted `shellglass-render`, default via
+   `?render=canvas`) + `canvasModeOn()` in the viewer — canvas mode pins
+   storm on (re-pinned after every DOM rebuild; watchdog exit suppressed),
+   DOM mode keeps classic-with-escalation. `#sg-stats` tags pinned mode
+   `canvas` vs load escalation `storm`; documented in README. `bench.py`
+   (adopted from `exp/span-reuse`, modes dom-nostorm/dom/canvas — canvas
+   driven through the real checkbox path) at rain 320x100:
+   6.8 / 22.6 / 25.1 fps.
 
 ### C. Canvas-mode-only improvements (after B; DOM mode keeps its behavior)
 

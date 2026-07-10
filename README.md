@@ -253,9 +253,17 @@ powerline rendering by serving kitty's bundled `Symbols Nerd Font Mono` as a fal
 
 ## Templating
 
-The built-in page is a dark chrome with a **CRT toggle** in the nav — a pure-CSS CRT
-overlay (scanlines, phosphor bloom, flicker, vignette), off by default and remembered
-per browser in localStorage.
+The built-in page is a dark chrome with two nav toggles, each off by default and
+remembered per browser in localStorage:
+
+- **canvas** — the renderer switch (also `?render=canvas`). Off = the classic DOM
+  renderer, which still escalates to the canvas by itself under full-screen animation
+  load (the footer tags it `storm`). On = every update paints on the canvas
+  (footer tag `canvas`); the DOM stays underneath as transparent ghost text, so
+  select/copy/find keep working. Canvas mode is markedly faster under heavy,
+  fragmented output; the DOM mode remains the fidelity reference.
+- **CRT** — a CRT tube effect (scanlines, phosphor bloom, flicker, vignette; also
+  `?crt`). Works in both renderer modes.
 
 For a fully custom page, point `template` at a full HTML document with three tokens
 the renderer fills at serve time:

@@ -603,6 +603,33 @@ function cellBgRgb(cell, isCursor) {
         return resolveRgb(cell.f) ?? parseHex(cfg.defFg);
     return resolveRgb(cell.g);
 }
+let renderBox;
+let renderPref;
+function canvasModeOn() {
+    if (renderBox === undefined) {
+        renderBox = document.getElementById("render");
+        renderBox?.addEventListener("change", () => {
+            if (renderBox?.checked)
+                setStorm(true);
+            else if (!selectionActive())
+                setStorm(false);
+        });
+    }
+    if (renderBox !== null)
+        return renderBox.checked;
+    if (renderPref === undefined) {
+        let stored = null;
+        try {
+            stored = localStorage.getItem("shellglass-render");
+        }
+        catch {
+        }
+        renderPref = stored
+            ? stored === "on"
+            : new URLSearchParams(location.search).get("render") === "canvas";
+    }
+    return renderPref;
+}
 let crtBox;
 function crtOn() {
     if (crtBox === undefined) {
@@ -841,7 +868,7 @@ function setStorm(on) {
         redrawCanvasAll();
         lastStormy = clock();
         stormTimer = setInterval(() => {
-            if (clock() - lastStormy > STORM_EXIT_MS && !selectionActive())
+            if (clock() - lastStormy > STORM_EXIT_MS && !selectionActive() && !canvasModeOn())
                 setStorm(false);
         }, 300);
     }
@@ -1107,12 +1134,14 @@ function flushPaint() {
         paintFull(rebuildDims);
         rebuildDims = null;
         dirtyRows.clear();
+        if (canvasModeOn())
+            setStorm(true);
     }
     else {
         const stormy = dirtyRows.size >= STORM_RATIO * (screen.cells.length || 1);
         if (stormy) {
             lastStormy = now;
-            if (!storm && ++stormHot >= STORM_ENTER)
+            if (stormEnabled && !storm && ++stormHot >= STORM_ENTER)
                 setStorm(true);
         }
         else if (!storm) {
@@ -1309,7 +1338,7 @@ function startStats() {
         lastBytes = bytesIn;
         lastPaints = paints;
         lastT = t;
-        el.textContent = `${fmtRate(bps)} · ${fps.toFixed(0)} fps (cap ${cap.toFixed(0)})${storm ? " · canvas" : ""}`;
+        el.textContent = `${fmtRate(bps)} · ${fps.toFixed(0)} fps (cap ${cap.toFixed(0)})${storm ? (canvasModeOn() ? " · canvas" : " · storm") : ""}`;
     }, 1000);
 }
 function injectViewerCss() {
@@ -1319,10 +1348,15 @@ function injectViewerCss() {
             "#screen a.run:hover{text-decoration:underline}";
     document.head.appendChild(linkCss);
 }
-export function benchInit(el) {
+let stormEnabled = true;
+export function benchInit(el, mode) {
     screenEl = el;
+    stormEnabled = mode !== "dom-nostorm";
     injectViewerCss();
     attachLinkHandlers();
+}
+export function benchStats() {
+    return { paints, cost: paintCost, storm };
 }
 export function benchStorm(on) {
     setStorm(on);

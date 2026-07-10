@@ -198,23 +198,29 @@ body[data-offline="operator"] .offline .off-op { display:block; }
   <span class="brand"><span class="dot"></span><span class="grad">shellglass</span></span>
   <span class="nav-right">
     <span class="meta">live terminal mirror</span>
+    <label class="toggle"><input type="checkbox" id="render">canvas</label>
     <label class="toggle"><input type="checkbox" id="crt">CRT</label>
   </span>
 </nav>
 <script>
-// Persist the CRT toggle across reloads. Runs before <main> so the stored state is
-// applied before the panel paints (no flash of effects). localStorage is wrapped —
-// a viewer with it disabled still gets a working toggle, just not a remembered one.
-// A `?crt` query param flips the default to ON, but only when there is no stored
-// choice — an explicit toggle always wins over the URL.
+// Persist the nav toggles across reloads. Runs before <main> so the stored state
+// is applied before the panel paints (no flash of effects). localStorage is wrapped —
+// a viewer with it disabled still gets working toggles, just not remembered ones.
+// A query param (`?crt`, `?render=canvas`) flips the default to ON, but only when
+// there is no stored choice — an explicit toggle always wins over the URL.
 (() => {
-  const c = document.getElementById('crt');
-  let stored = null;
-  try { stored = localStorage.getItem('shellglass-crt'); } catch (e) {}
-  c.checked = stored ? stored === 'on' : new URLSearchParams(location.search).has('crt');
-  c.addEventListener('change', () => {
-    try { localStorage.setItem('shellglass-crt', c.checked ? 'on' : 'off'); } catch (e) {}
-  });
+  const params = new URLSearchParams(location.search);
+  const wire = (id, key, urlOn) => {
+    const c = document.getElementById(id);
+    let stored = null;
+    try { stored = localStorage.getItem(key); } catch (e) {}
+    c.checked = stored ? stored === 'on' : urlOn;
+    c.addEventListener('change', () => {
+      try { localStorage.setItem(key, c.checked ? 'on' : 'off'); } catch (e) {}
+    });
+  };
+  wire('crt', 'shellglass-crt', params.has('crt'));
+  wire('render', 'shellglass-render', params.get('render') === 'canvas');
 })();
 </script>
 <main class="stage">
