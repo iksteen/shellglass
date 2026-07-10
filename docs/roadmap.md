@@ -391,8 +391,9 @@ at 0 in `Parser::new`.)
 ## Canvas fidelity track
 
 Context: item-14 experiments — DOM is optimization-exhausted, canvas is ~5×
-faster under fragmented churn. Goal: canvas at DOM fidelity, then canvas as
-the only renderer.
+faster under fragmented churn. Goal: canvas at DOM fidelity, offered as a
+first-class renderer switchable with DOM (which stays); each mode carries its
+own CRT effect.
 
 ### A. Storm-mode fidelity (needed while canvas is the escape hatch)
 
@@ -406,7 +407,7 @@ the only renderer.
    `TextMetrics.fontBoundingBoxAscent/Descent`, matching the DOM line box.
    Verify: no vertical shift toggling storm on `showcase.sh`.
 
-### B. Replacing the DOM renderer (each blocks the switch)
+### B. Canvas as a first-class switchable renderer (each blocks offering it)
 
 1. **Underline styles + color.** In `drawRowStorm`, branch on `cell.u`:
    2 = two bars, 4/5 = fillRect segments on a fixed period, 3 = two-arc wave
@@ -426,25 +427,28 @@ the only renderer.
    `resolution`) → resize canvas + full redraw.
 6. **Over-wide fallback glyphs.** Drop the `fillText` maxWidth clamp for
    `glyphOverflowsCell` cells (DOM lets ❯ overflow; canvas must too).
-7. **CRT toggle decision.** Text-shadow CRT does nothing to canvas text:
-   either implement C.3 first or document the divergence.
-8. **The switch.** Storm thresholds become dead weight: delete `renderRow`
-   consumers in the flush path, render every dirty row on canvas, keep the
-   DOM only for ghost text + images; re-run `bench.py` and update
-   CLAUDE.md/README.
+7. **Per-mode CRT.** The one localStorage toggle drives whichever effect
+   matches the active renderer: DOM keeps the text-shadow CRT as-is; canvas
+   gets its own post-pass (scanlines + bloom drawn over the composed frame
+   each flush). Verify both with the toggle on `showcase.sh`.
+8. **The renderer switch.** A user-facing mode setting (`?render=canvas` /
+   `localStorage sg-render`, plus an in-page toggle next to the CRT one):
+   DOM mode = today's classic renderer with storm escalation to canvas;
+   canvas mode = canvas for every dirty row, DOM kept for ghost text +
+   images. Both renderers stay maintained — deletion is out of scope for
+   now. Re-run `bench.py` in both modes; document the switch in README and
+   the mode tag in `#sg-stats`.
 
-### C. Canvas-only improvements (after B)
+### C. Canvas-mode-only improvements (after B; DOM mode keeps its behavior)
 
-1. **Text over inline images.** Draw image cells behind glyphs on the canvas
-   (decode the `i` list to `ImageBitmap`s, draw before text) so text placed
-   over an image wins, like a real cell terminal; drop the `<img>` overlay.
+1. **Text over inline images.** In canvas mode, draw image cells behind
+   glyphs (decode the `i` list to `ImageBitmap`s, draw before text) so text
+   placed over an image wins, like a real cell terminal. DOM mode keeps the
+   `<img>` overlay.
 2. **Device-pixel backgrounds.** Snap bg fills to the same rounded device-
    pixel cell edges as `drawGlyph` — kills hairline seams between cells at
    fractional zoom.
-3. **Picture-level CRT.** Replace the CSS text-shadow toggle with a canvas
-   post-pass (scanlines + bloom on the composed frame), keeping the same
-   localStorage switch.
-4. **Smooth cursor travel** (opt-in): animate the cursor rect between cells
+3. **Smooth cursor travel** (opt-in): animate the cursor rect between cells
    over ~80ms instead of teleporting; off by default.
 
 ## Sequencing note
