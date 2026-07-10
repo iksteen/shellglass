@@ -1,0 +1,44 @@
+<!doctype html>
+<!-- Canvas-track verification page: renders one static representative frame
+     through the production apply() path, in DOM mode (?mode=dom) or with
+     storm forced on (?mode=storm). verify.py screenshots both and measures
+     per-row vertical ink offsets (baseline parity) and fill-glyph coverage. -->
+<html><head><meta charset="utf-8"><style>
+  html,body { margin:0; }
+  #screen { font-family:monospace; font-size:14px; --lh:17px; line-height:var(--lh);
+            color:#d0d0d0; background:#000; }
+  .screen { position:relative; white-space:pre; overflow:hidden; }
+  .row { position:relative; height:var(--lh); contain:layout style; }
+  .run { position:absolute; top:0; height:var(--lh); overflow:hidden; }
+</style></head><body>
+<div id="screen"></div>
+<script type="module">
+import { setConfig, apply, benchInit, benchStorm, benchFlush } from "./viewer.js";
+
+const MODE = new URLSearchParams(location.search).get("mode") ?? "dom";
+setConfig({ defFg: "#d0d0d0", defBg: "#000000", fillFont: "monospace", sym: [] });
+benchInit(document.getElementById("screen"));
+
+// One static frame: text in several styles (baseline check rows) and a row of
+// fill glyphs (stretch/coverage check). 60x12.
+const COLS = 60, ROWS = 12;
+const pad = (s) => s + " ".repeat(Math.max(0, COLS - s.length));
+const d = [];
+d.push([[pad("plain text row Mgjq 0123456789 the quick brown fox")]]);
+d.push([[pad("bold row Mgjq HAMBURGEFONTS")], [[0, COLS, { b: 1 }]]]);
+d.push([[pad("colored row Mgjq xxxxxxxxxxxxxxxx")], [[0, COLS, { f: 2 }]]]);
+d.push([[pad("inverse Mgjq")], [[0, 12, { n: 1 }]]]);
+// fill glyphs: eighth-blocks + shades (stretch targets)
+d.push([[pad("▁▂▃▄▅▆▇█ ░▒▓ ▏▎▍▌▋▊▉")]]);
+d.push([[pad("underline row Mgjq")], [[0, 18, { u: 1 }]]]);
+for (let i = d.length; i < ROWS; i++) d.push([[pad(`row ${i} Mgjq baseline probe`)]]);
+
+apply({ v: 4 });
+apply({ d, w: COLS, h: ROWS });
+benchFlush(); // synchronous paint — safe to screenshot at onload
+
+if (MODE === "storm") {
+  benchStorm(true); // repaints every row on the canvas
+}
+document.title = "verified-ready";
+</script></body></html>

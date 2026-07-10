@@ -368,6 +368,62 @@ let ctx: CanvasRenderingContext2D | null = null;
 let fontPx = 16; // device-pixel font size for storm-mode fillText (set in sizeCanvas)
 let fontFam = "monospace";
 
+// ── canvas text metrics (baseline parity + fill-glyph stretch) ────────────────
+//
+// The DOM aligns every run on the row's STRUT baseline — the base font's
+// ascent placed after half-leading — regardless of a span's own font. Canvas
+// must do the same: one baseline per row, derived from the base font, or text
+// visibly jumps when storm engages. Computed lazily per (font string), reset
+// with the caches on resize/font-load (sizeCanvas bumps fontPx into the key).
+const fontMetricsCache = new Map<string, { asc: number; desc: number }>();
+function strutMetrics(font: string): { asc: number; desc: number } {
+  let m = fontMetricsCache.get(font);
+  if (!m && ctx) {
+    const prev = ctx.font;
+    ctx.font = font;
+    const tm = ctx.measureText("Mg");
+    // fontBoundingBox* is in device px here (the font is sized in device px).
+    // Fallback ratios approximate common monospace metrics.
+    m = {
+      asc: tm.fontBoundingBoxAscent ?? fontPx * 0.8,
+      desc: tm.fontBoundingBoxDescent ?? fontPx * 0.25,
+    };
+    ctx.font = prev;
+    fontMetricsCache.set(font, m);
+  }
+  return m ?? { asc: fontPx * 0.8, desc: fontPx * 0.25 };
+}
+
+// The strut baseline for row r (device px): half-leading above the base
+// font's content box, then its ascent — the same arithmetic CSS inline
+// layout uses to place the line box baseline.
+function rowBaseline(r: number): number {
+  const m = strutMetrics(`${fontPx}px ${fontFam}`);
+  return Math.round(r * cellH * dpr + (cellH * dpr - (m.asc + m.desc)) / 2 + m.asc);
+}
+
+// Ink boxes for fill-glyph stretching, cached per (font, glyph).
+const inkBoxCache = new Map<string, { l: number; r: number; a: number; d: number }>();
+function inkBox(font: string, glyph: string): { l: number; r: number; a: number; d: number } | null {
+  const key = `${font}\0${glyph}`;
+  let m = inkBoxCache.get(key);
+  if (m === undefined && ctx) {
+    const prev = ctx.font;
+    ctx.font = font;
+    const tm = ctx.measureText(glyph);
+    ctx.font = prev;
+    m = {
+      l: tm.actualBoundingBoxLeft,
+      r: tm.actualBoundingBoxRight,
+      a: tm.actualBoundingBoxAscent,
+      d: tm.actualBoundingBoxDescent,
+    };
+    inkBoxCache.set(key, m);
+  }
+  if (!m || m.l + m.r <= 0 || m.a + m.d <= 0) return null;
+  return m;
+}
+
 let obsScreen: HTMLElement | null = null;
 let gCols = 0;
 let gRows = 0;
@@ -380,6 +436,8 @@ let dprMedia: MediaQueryList | null = null;
 // callers redraw after. Re-run on any .screen reflow (webfont load, zoom, DPR) via a
 // ResizeObserver.
 function sizeCanvas(): void {
+  fontMetricsCache.clear();
+  inkBoxCache.clear();
   if (!canvasEl || !obsScreen || !gCols || !gRows) return;
   const rect = obsScreen.getBoundingClientRect();
   if (!rect.width || !rect.height) return;
@@ -820,8 +878,10 @@ function drawRowStorm(r: number): void {
   ctx.clearRect(0, y0, canvasEl.width, y1 - y0);
   const row = screen.cells[r];
   if (!row) return;
-  ctx.textBaseline = "middle";
-  const midY = Math.round((r + 0.5) * cellH * dpr);
+  // Alphabetic at the row's strut baseline — the DOM line box's own
+  // arithmetic, so toggling storm produces no vertical shift.
+  ctx.textBaseline = "alphabetic";
+  const baseY = rowBaseline(r);
   const ul = Math.max(1, Math.round(dpr));
   const defBg = cfg.defBg.toLowerCase();
   let curFont = "";
@@ -845,7 +905,6 @@ function drawRowStorm(r: number): void {
     } else if (cell.t && cell.t !== " ") {
       // symbol_map / fill-glyph cells draw with their mapped family — canvas
       // uses the served webfonts once loaded, same faces as the DOM path.
-      // (Fill-glyph SVG *stretch* stays approximated; family is correct.)
       const fam = svgFont(cell) ?? fontFam;
       const font = `${cell.i ? "italic " : ""}${cell.b ? "bold " : ""}${fontPx}px ${fam}`;
       if (font !== curFont) {
@@ -853,7 +912,21 @@ function drawRowStorm(r: number): void {
         curFont = font;
       }
       ctx.fillStyle = hex(cellFg(cell, isCursor));
-      ctx.fillText(cell.t, x0, midY, x1 - x0);
+      const ink = isFillGlyph(cp) ? inkBox(font, cell.t) : null;
+      if (ink !== null) {
+        // Fill glyphs tile the cell like the DOM's stretched SVG: map the
+        // glyph's ink box onto the exact cell rect, so separators and block
+        // fills leave no hairline gaps.
+        const sx = (x1 - x0) / (ink.l + ink.r);
+        const sy = (y1 - y0) / (ink.a + ink.d);
+        ctx.save();
+        ctx.translate(x0 + ink.l * sx, y0 + ink.a * sy);
+        ctx.scale(sx, sy);
+        ctx.fillText(cell.t, 0, 0);
+        ctx.restore();
+      } else {
+        ctx.fillText(cell.t, x0, baseY, x1 - x0);
+      }
       // Storm is the low-fidelity escape hatch: any underline style draws as a
       // plain bar (and ignores `k`); strikethrough gets a mid-height bar.
       if (cell.u) ctx.fillRect(x0, y1 - ul, x1 - x0, ul);
@@ -1596,6 +1669,27 @@ function startStats(): void {
   }, 1000);
 }
 
+// Viewer-owned CSS (anchor styling), injected at boot.
+function injectViewerCss(): void {
+  const linkCss = document.createElement("style");
+  linkCss.textContent =
+    "#screen a.run{color:inherit;text-decoration:none}" +
+    "#screen a.run:hover{text-decoration:underline}";
+  document.head.appendChild(linkCss);
+}
+
+// ── canvas-track verification hooks (verify.html; no SSE) ─────────────────────
+export function benchInit(el: HTMLElement): void {
+  screenEl = el;
+  injectViewerCss();
+}
+export function benchStorm(on: boolean): void {
+  setStorm(on);
+}
+export function benchFlush(): void {
+  flushPaint();
+}
+
 function main(): void {
   const boot = (
     window as unknown as { SHELLGLASS: { events: string; cfg: Cfg; proto?: number; js?: string } }
@@ -1605,11 +1699,7 @@ function main(): void {
   screenEl = document.getElementById("screen")!;
   // OSC 8 anchors: inherit the terminal styling (a page template's own `a`
   // rules must not repaint terminal text) and underline on hover, like kitty.
-  const linkCss = document.createElement("style");
-  linkCss.textContent =
-    "#screen a.run{color:inherit;text-decoration:none}" +
-    "#screen a.run:hover{text-decoration:underline}";
-  document.head.appendChild(linkCss);
+  injectViewerCss();
   connect(boot.events);
   startStats();
   // Web fonts load async; any glyph-width measured before they land is cached wrong

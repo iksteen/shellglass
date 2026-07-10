@@ -185,12 +185,55 @@ let canvasEl = null;
 let ctx = null;
 let fontPx = 16;
 let fontFam = "monospace";
+const fontMetricsCache = new Map();
+function strutMetrics(font) {
+    let m = fontMetricsCache.get(font);
+    if (!m && ctx) {
+        const prev = ctx.font;
+        ctx.font = font;
+        const tm = ctx.measureText("Mg");
+        m = {
+            asc: tm.fontBoundingBoxAscent ?? fontPx * 0.8,
+            desc: tm.fontBoundingBoxDescent ?? fontPx * 0.25,
+        };
+        ctx.font = prev;
+        fontMetricsCache.set(font, m);
+    }
+    return m ?? { asc: fontPx * 0.8, desc: fontPx * 0.25 };
+}
+function rowBaseline(r) {
+    const m = strutMetrics(`${fontPx}px ${fontFam}`);
+    return Math.round(r * cellH * dpr + (cellH * dpr - (m.asc + m.desc)) / 2 + m.asc);
+}
+const inkBoxCache = new Map();
+function inkBox(font, glyph) {
+    const key = `${font}\0${glyph}`;
+    let m = inkBoxCache.get(key);
+    if (m === undefined && ctx) {
+        const prev = ctx.font;
+        ctx.font = font;
+        const tm = ctx.measureText(glyph);
+        ctx.font = prev;
+        m = {
+            l: tm.actualBoundingBoxLeft,
+            r: tm.actualBoundingBoxRight,
+            a: tm.actualBoundingBoxAscent,
+            d: tm.actualBoundingBoxDescent,
+        };
+        inkBoxCache.set(key, m);
+    }
+    if (!m || m.l + m.r <= 0 || m.a + m.d <= 0)
+        return null;
+    return m;
+}
 let obsScreen = null;
 let gCols = 0;
 let gRows = 0;
 let ro = null;
 let dprMedia = null;
 function sizeCanvas() {
+    fontMetricsCache.clear();
+    inkBoxCache.clear();
     if (!canvasEl || !obsScreen || !gCols || !gRows)
         return;
     const rect = obsScreen.getBoundingClientRect();
@@ -569,8 +612,8 @@ function drawRowStorm(r) {
     const row = screen.cells[r];
     if (!row)
         return;
-    ctx.textBaseline = "middle";
-    const midY = Math.round((r + 0.5) * cellH * dpr);
+    ctx.textBaseline = "alphabetic";
+    const baseY = rowBaseline(r);
     const ul = Math.max(1, Math.round(dpr));
     const defBg = cfg.defBg.toLowerCase();
     let curFont = "";
@@ -597,7 +640,19 @@ function drawRowStorm(r) {
                 curFont = font;
             }
             ctx.fillStyle = hex(cellFg(cell, isCursor));
-            ctx.fillText(cell.t, x0, midY, x1 - x0);
+            const ink = isFillGlyph(cp) ? inkBox(font, cell.t) : null;
+            if (ink !== null) {
+                const sx = (x1 - x0) / (ink.l + ink.r);
+                const sy = (y1 - y0) / (ink.a + ink.d);
+                ctx.save();
+                ctx.translate(x0 + ink.l * sx, y0 + ink.a * sy);
+                ctx.scale(sx, sy);
+                ctx.fillText(cell.t, 0, 0);
+                ctx.restore();
+            }
+            else {
+                ctx.fillText(cell.t, x0, baseY, x1 - x0);
+            }
             if (cell.u)
                 ctx.fillRect(x0, y1 - ul, x1 - x0, ul);
             if (cell.s)
@@ -1117,16 +1172,29 @@ function startStats() {
         el.textContent = `${fmtRate(bps)} · ${fps.toFixed(0)} fps (cap ${cap.toFixed(0)})${storm ? " · canvas" : ""}`;
     }, 1000);
 }
-function main() {
-    const boot = window.SHELLGLASS;
-    setConfig(boot.cfg);
-    setProto(boot.proto, boot.js);
-    screenEl = document.getElementById("screen");
+function injectViewerCss() {
     const linkCss = document.createElement("style");
     linkCss.textContent =
         "#screen a.run{color:inherit;text-decoration:none}" +
             "#screen a.run:hover{text-decoration:underline}";
     document.head.appendChild(linkCss);
+}
+export function benchInit(el) {
+    screenEl = el;
+    injectViewerCss();
+}
+export function benchStorm(on) {
+    setStorm(on);
+}
+export function benchFlush() {
+    flushPaint();
+}
+function main() {
+    const boot = window.SHELLGLASS;
+    setConfig(boot.cfg);
+    setProto(boot.proto, boot.js);
+    screenEl = document.getElementById("screen");
+    injectViewerCss();
     connect(boot.events);
     startStats();
     const reflowGlyphs = () => {
