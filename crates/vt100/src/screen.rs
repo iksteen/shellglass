@@ -94,6 +94,11 @@ pub struct Screen {
     default_fg: Option<(u8, u8, u8)>,
     default_bg: Option<(u8, u8, u8)>,
 
+    // shellglass: window title (OSC 0/2; icon names aren't rendered) plus the
+    // XTWINOPS 22/23 save/restore stack. RIS wipes both.
+    title: String,
+    title_stack: Vec<String>,
+
     modes: u8,
     mouse_protocol_mode: MouseProtocolMode,
     mouse_protocol_encoding: MouseProtocolEncoding,
@@ -124,6 +129,9 @@ impl Screen {
 
             default_fg: None,
             default_bg: None,
+
+            title: String::new(),
+            title_stack: Vec::new(),
 
             modes: 0,
             mouse_protocol_mode: MouseProtocolMode::default(),
@@ -682,6 +690,35 @@ impl Screen {
     #[must_use]
     pub fn default_bg(&self) -> Option<(u8, u8, u8)> {
         self.default_bg
+    }
+
+    /// shellglass: the window title (OSC 0/2), empty if never set.
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    // shellglass: OSC 0/2
+    pub(crate) fn set_title(&mut self, s: &[u8]) {
+        self.title = String::from_utf8_lossy(s).into_owned();
+    }
+
+    // shellglass: XTWINOPS 22 — save the title on the stack. Bounded like
+    // xterm: beyond the cap the oldest entry is discarded.
+    pub(crate) fn title_push(&mut self) {
+        const MAX_TITLE_STACK: usize = 16;
+        if self.title_stack.len() >= MAX_TITLE_STACK {
+            self.title_stack.remove(0);
+        }
+        self.title_stack.push(self.title.clone());
+    }
+
+    // shellglass: XTWINOPS 23 — restore the last saved title (a pop from an
+    // empty stack is a no-op, like xterm).
+    pub(crate) fn title_pop(&mut self) {
+        if let Some(t) = self.title_stack.pop() {
+            self.title = t;
+        }
     }
 
     // shellglass: OSC 10 / 110

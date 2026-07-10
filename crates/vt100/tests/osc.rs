@@ -125,3 +125,34 @@ fn default_colors_track_set_and_reset() {
     assert_eq!(vt.screen().default_fg(), None);
     assert_eq!(vt.screen().default_bg(), None);
 }
+
+// shellglass: the window title is screen state — OSC 0/2 set it (OSC 1, icon
+// name only, doesn't), XTWINOPS 22/23 save/restore it, RIS wipes it.
+#[test]
+fn title_tracks_set_stack_and_reset() {
+    let mut vt = vt100::Parser::default();
+    assert_eq!(vt.screen().title(), "");
+    vt.process(b"\x1b]2;vim src/main.rs\x07");
+    assert_eq!(vt.screen().title(), "vim src/main.rs");
+    vt.process(b"\x1b]0;both\x07\x1b]1;icon-only\x07");
+    assert_eq!(
+        vt.screen().title(),
+        "both",
+        "OSC 1 must not touch the title"
+    );
+
+    // Push, change, pop — the vim-style save/restore dance.
+    vt.process(b"\x1b[22;0t\x1b]2;inner\x07");
+    assert_eq!(vt.screen().title(), "inner");
+    vt.process(b"\x1b[23;0t");
+    assert_eq!(vt.screen().title(), "both");
+    // Icon-only push/pop (sub 1) doesn't touch the title stack; a pop from an
+    // empty stack is a no-op.
+    vt.process(b"\x1b[22;1t\x1b]2;x\x07\x1b[23;1t");
+    assert_eq!(vt.screen().title(), "x");
+    vt.process(b"\x1b[23t\x1b[23t");
+    assert_eq!(vt.screen().title(), "x");
+
+    vt.process(b"\x1bc");
+    assert_eq!(vt.screen().title(), "");
+}

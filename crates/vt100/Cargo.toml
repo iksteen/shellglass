@@ -44,10 +44,15 @@
 #     digits), OSC 110/111 reset, RIS wipes; unparseable values (named colors)
 #     stay unhandled. Accessors default_fg()/default_bg(). Tests in
 #     tests/osc.rs (default_colors_track_set_and_reset).
+#   - screen.rs/perform.rs: window title as screen state — OSC 0/2 store it
+#     (title() accessor; the set_window_* callbacks stay), XTWINOPS 22/23
+#     push/pop a bounded stack (un-ignored from the no-op list below; sub 1 =
+#     icon-only stays skipped), RIS wipes. Tests in tests/osc.rs
+#     (title_tracks_set_stack_and_reset).
 #   - perform.rs: deliberate no-ops for non-visual queries/syntax — Primary and
-#     Secondary DA (`CSI c`/`CSI > c`), bare ST (`ESC \`), XTWINOPS reports and
-#     title stack (`CSI 11/13/14/16/18/19/21/22/23 t`), OSC 10/11 color
-#     *queries* (`;?` only; the set form stays unhandled on purpose), cursor
+#     Secondary DA (`CSI c`/`CSI > c`), bare ST (`ESC \`), XTWINOPS reports
+#     (`CSI 11/13/14/16/18/19/21 t`; 22/23 became the title stack above),
+#     OSC 10/11 color *queries* (`;?` only; the set form is mirrored), cursor
 #     blink (`CSI ? 12 h/l` — the mirror renders a steady cursor by design),
 #     and SCS US-ASCII (`ESC ( B`/`ESC ) B` — the only charset modeled;
 #     `ESC ( 0` DEC graphics keeps reporting). Tests in tests/csi.rs,

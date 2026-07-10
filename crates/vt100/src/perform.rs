@@ -198,11 +198,26 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                                 .resize(&mut self.screen, (rows, cols));
                         }
                         // shellglass: XTWINOPS reports (11/13/14/16/18/19/21
-                        // are queries the embedding terminal answers) and the
-                        // title stack (22/23 — nothing renders a title here)
-                        // have zero render effect. Deliberately ignored, not
+                        // are queries the embedding terminal answers) have
+                        // zero render effect — deliberately ignored, not
                         // unhandled; ops outside this set keep reporting.
-                        Some(11 | 13 | 14 | 16 | 18 | 19 | 21 | 22 | 23) => {}
+                        Some(11 | 13 | 14 | 16 | 18 | 19 | 21) => {}
+                        // shellglass: title save/restore (the title is
+                        // rendered now). Sub-param 1 = icon name only, which
+                        // isn't rendered — skip; 0/2 (or absent) = title.
+                        Some(op @ (22 | 23)) => {
+                            let which = params_iter
+                                .next()
+                                .and_then(|x| x.first().copied())
+                                .unwrap_or(0);
+                            if which != 1 {
+                                if op == 22 {
+                                    self.screen.title_push();
+                                } else {
+                                    self.screen.title_pop();
+                                }
+                            }
+                        }
                         _ => {
                             self.callbacks.unhandled_csi(
                                 &mut self.screen,
@@ -304,6 +319,9 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
     fn osc_dispatch(&mut self, params: &[&[u8]], _bel_terminated: bool) {
         match params {
             [b"0", s] => {
+                // shellglass: the title is screen state now (the mirror's
+                // page follows it); the callbacks stay for embedders.
+                self.screen.set_title(s);
                 self.callbacks.set_window_icon_name(&mut self.screen, s);
                 self.callbacks.set_window_title(&mut self.screen, s);
             }
@@ -311,6 +329,7 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                 self.callbacks.set_window_icon_name(&mut self.screen, s);
             }
             [b"2", s] => {
+                self.screen.set_title(s); // shellglass (see OSC 0)
                 self.callbacks.set_window_title(&mut self.screen, s);
             }
             // shellglass: default fg/bg *queries* (vim/neovim background
