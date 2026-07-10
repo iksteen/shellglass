@@ -223,13 +223,24 @@ split differently from round 2: two real gaps, two noise kinds.
    project could offer, and kitty supports OSC 8 locally so fidelity permits
    it.
 
-8. **Damage tracking.** No dirty/damage state exists in the crate; every dirty
-   frame does a full-screen `grid_from_screen` scan+alloc and `encode_delta`
-   re-compares every row. A dirty-rows bitset maintained by `grid.rs`'s own
-   write paths lets both skip clean rows. Perf only — the pipeline holds 30fps
-   today (see `zz_measure_wire_cost`), so this earns its keep on large screens
-   and single-cell updates (typing). Measure before/after; don't complicate the
-   publish path for a win the numbers don't show.
+8. **Damage tracking.** ⊘ Measured out 2026-07-10 — the item's own gate
+   ("don't complicate the publish path for a win the numbers don't show")
+   closed it. `zz_measure_frame_cost` (SG_FRAMECOST=1, release) puts the full
+   extract+encode cost at 84µs/frame at 80×24 and 1.2ms/frame at 320×100,
+   flat across typing/scroll/churn — confirming the O(screen-area) thesis,
+   but bounding the maximum win at ~3.6% of one core in the worst case
+   (320×100 sustained at the 30fps cap; a realistic large-screen typing
+   session is <0.5%, idle is zero, and none of it runs on the hub). Against
+   that: auditing every vt100 write path for dirty marking, where one missed
+   path is a *stale-content correctness bug* in service of a perf-only
+   feature. Re-measure before reviving (the meter is one env var away). Two
+   cheaper levers first if extraction cost ever matters: extraction dominates
+   encode 4–5×, and ~half of it is the per-cell `String` allocation in
+   `StyledCell.text` — an inline small-string type cuts that without touching
+   any write path; per-row `Arc` sharing in `model::Grid` would let
+   `encode_delta` ptr-skip clean rows without vt100 changes.
+   Original plan: a dirty-rows bitset maintained by `grid.rs`'s own write
+   paths letting both `grid_from_screen` and `encode_delta` skip clean rows.
 
 9. **OSC 10/11 set form: default foreground/background color.** ✅ Landed
    2026-07-10 as vt100 `888b956` + wire/viewers `6e2b120`. Both XParseColor
