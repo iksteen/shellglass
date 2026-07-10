@@ -332,7 +332,15 @@ at 0 in `Parser::new`.)
     browser pays per retained NODE (~cols×rows) while storm's screen is one
     canvas item. Node count, not mutation count, is the cost of full-screen
     animation. A successor experiment would need one-node-per-row text with
-    sparse styled overlays (ghost-style). Original idea: today the
+    sparse styled overlays (ghost-style). **Successor tested** (2026-07-10,
+    `exp/highlight-renderer`): one text node per row + CSS Custom Highlight
+    API styling. The skeleton is vindicated — at 1 range/row it holds the
+    16ms shaper cap at every size, confirming node count was the wall — but
+    Gecko's highlight painting re-resolves O(total ranges) per frame at
+    ~65µs/range, so realistic run granularity (~100 ranges/row) lands at
+    390-690ms/flush, worse than the matrix. Falsified on today's Firefox by
+    the primitive's implementation, not the architecture; revisit if Gecko
+    optimizes highlight invalidation. Original idea: today the
     DOM path rebuilds each dirty row's coalesced spans from scratch, and the
     cmatrix-class escape hatch is storm mode (canvas `fillText`, lower
     fidelity: no symbol_map, no glyph stretch, no links). The experiment: a
