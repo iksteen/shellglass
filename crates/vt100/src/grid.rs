@@ -1,21 +1,21 @@
 use crate::term::BufWrite as _;
 
 #[derive(Clone, Debug)]
-pub struct Grid {
+pub struct Grid<T = ()> {
     size: Size,
     pos: Pos,
     saved_pos: Pos,
-    rows: Vec<crate::row::Row>,
+    rows: Vec<crate::row::Row<T>>,
     scroll_top: u16,
     scroll_bottom: u16,
     origin_mode: bool,
     saved_origin_mode: bool,
-    scrollback: std::collections::VecDeque<crate::row::Row>,
+    scrollback: std::collections::VecDeque<crate::row::Row<T>>,
     scrollback_len: usize,
     scrollback_offset: usize,
 }
 
-impl Grid {
+impl<T> Grid<T> {
     pub fn new(size: Size, scrollback_len: usize) -> Self {
         Self {
             size,
@@ -43,7 +43,7 @@ impl Grid {
         }
     }
 
-    fn new_row(&self) -> crate::row::Row {
+    fn new_row(&self) -> crate::row::Row<T> {
         crate::row::Row::new(self.size.cols)
     }
 
@@ -76,9 +76,12 @@ impl Grid {
 
         self.size = size;
         for row in &mut self.rows {
-            row.resize(size.cols, crate::Cell::new());
+            row.resize(size.cols);
         }
-        self.rows.resize(usize::from(size.rows), self.new_row());
+        let cols = self.size.cols;
+        self.rows.resize_with(usize::from(size.rows), || {
+            crate::row::Row::new(cols)
+        });
 
         if self.scroll_bottom >= size.rows {
             self.scroll_bottom = size.rows - 1;
@@ -123,7 +126,7 @@ impl Grid {
         self.origin_mode = self.saved_origin_mode;
     }
 
-    pub fn visible_rows(&self) -> impl Iterator<Item = &crate::row::Row> {
+    pub fn visible_rows(&self) -> impl Iterator<Item = &crate::row::Row<T>> {
         let scrollback_len = self.scrollback.len();
         let rows_len = self.rows.len();
         self.scrollback
@@ -143,46 +146,49 @@ impl Grid {
             )
     }
 
-    pub fn drawing_rows(&self) -> impl Iterator<Item = &crate::row::Row> {
+    pub fn drawing_rows(&self) -> impl Iterator<Item = &crate::row::Row<T>> {
         self.rows.iter()
     }
 
     pub fn drawing_rows_mut(
         &mut self,
-    ) -> impl Iterator<Item = &mut crate::row::Row> {
+    ) -> impl Iterator<Item = &mut crate::row::Row<T>> {
         self.rows.iter_mut()
     }
 
-    pub fn visible_row(&self, row: u16) -> Option<&crate::row::Row> {
+    pub fn visible_row(&self, row: u16) -> Option<&crate::row::Row<T>> {
         self.visible_rows().nth(usize::from(row))
     }
 
-    pub fn drawing_row(&self, row: u16) -> Option<&crate::row::Row> {
+    pub fn drawing_row(&self, row: u16) -> Option<&crate::row::Row<T>> {
         self.drawing_rows().nth(usize::from(row))
     }
 
     pub fn drawing_row_mut(
         &mut self,
         row: u16,
-    ) -> Option<&mut crate::row::Row> {
+    ) -> Option<&mut crate::row::Row<T>> {
         self.drawing_rows_mut().nth(usize::from(row))
     }
 
-    pub fn current_row_mut(&mut self) -> &mut crate::row::Row {
+    pub fn current_row_mut(&mut self) -> &mut crate::row::Row<T> {
         self.drawing_row_mut(self.pos.row)
             // we assume self.pos.row is always valid
             .unwrap()
     }
 
-    pub fn visible_cell(&self, pos: Pos) -> Option<&crate::Cell> {
+    pub fn visible_cell(&self, pos: Pos) -> Option<&crate::Cell<T>> {
         self.visible_row(pos.row).and_then(|r| r.get(pos.col))
     }
 
-    pub fn drawing_cell(&self, pos: Pos) -> Option<&crate::Cell> {
+    pub fn drawing_cell(&self, pos: Pos) -> Option<&crate::Cell<T>> {
         self.drawing_row(pos.row).and_then(|r| r.get(pos.col))
     }
 
-    pub fn drawing_cell_mut(&mut self, pos: Pos) -> Option<&mut crate::Cell> {
+    pub fn drawing_cell_mut(
+        &mut self,
+        pos: Pos,
+    ) -> Option<&mut crate::Cell<T>> {
         self.drawing_row_mut(pos.row)
             .and_then(|r| r.get_mut(pos.col))
     }
@@ -529,7 +535,7 @@ impl Grid {
         for _ in 0..(count.min(size.cols - pos.col)) {
             row.remove(pos.col);
         }
-        row.resize(size.cols, crate::Cell::new());
+        row.resize(size.cols);
     }
 
     pub fn erase_cells(&mut self, count: u16, attrs: crate::attrs::Attrs) {

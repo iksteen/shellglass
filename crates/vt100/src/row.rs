@@ -1,15 +1,19 @@
 use crate::term::BufWrite as _;
 
 #[derive(Clone, Debug)]
-pub struct Row {
-    cells: Vec<crate::Cell>,
+pub struct Row<T = ()> {
+    cells: Vec<crate::Cell<T>>,
     wrapped: bool,
 }
 
-impl Row {
+impl<T> Row<T> {
     pub fn new(cols: u16) -> Self {
         Self {
-            cells: vec![crate::Cell::new(); usize::from(cols)],
+            cells: {
+                let mut cells = Vec::with_capacity(usize::from(cols));
+                cells.resize_with(usize::from(cols), crate::Cell::new);
+                cells
+            },
             wrapped: false,
         }
     }
@@ -29,19 +33,19 @@ impl Row {
         self.wrapped = false;
     }
 
-    fn cells(&self) -> impl Iterator<Item = &crate::Cell> {
+    fn cells(&self) -> impl Iterator<Item = &crate::Cell<T>> {
         self.cells.iter()
     }
 
-    pub fn get(&self, col: u16) -> Option<&crate::Cell> {
+    pub fn get(&self, col: u16) -> Option<&crate::Cell<T>> {
         self.cells.get(usize::from(col))
     }
 
-    pub fn get_mut(&mut self, col: u16) -> Option<&mut crate::Cell> {
+    pub fn get_mut(&mut self, col: u16) -> Option<&mut crate::Cell<T>> {
         self.cells.get_mut(usize::from(col))
     }
 
-    pub fn insert(&mut self, i: u16, cell: crate::Cell) {
+    pub fn insert(&mut self, i: u16, cell: crate::Cell<T>) {
         self.cells.insert(usize::from(i), cell);
         self.wrapped = false;
     }
@@ -70,8 +74,8 @@ impl Row {
         }
     }
 
-    pub fn resize(&mut self, len: u16, cell: crate::Cell) {
-        self.cells.resize(usize::from(len), cell);
+    pub fn resize(&mut self, len: u16) {
+        self.cells.resize_with(usize::from(len), crate::Cell::new);
         self.wrapped = false;
     }
 

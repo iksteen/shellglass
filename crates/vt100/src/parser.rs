@@ -1,8 +1,11 @@
 /// A parser for terminal output which produces an in-memory representation of
 /// the terminal contents.
-pub struct Parser<CB: crate::callbacks::Callbacks = ()> {
+///
+/// shellglass: generic over the per-cell data slot `T` too (default `()`);
+/// see [`Cell`](crate::Cell) and [`Screen::place_data`](crate::Screen).
+pub struct Parser<CB: crate::callbacks::Callbacks<T> = (), T = ()> {
     parser: vte::Parser,
-    screen: crate::perform::WrappedScreen<CB>,
+    screen: crate::perform::WrappedScreen<CB, T>,
 }
 
 impl Parser {
@@ -21,11 +24,15 @@ impl Parser {
     }
 }
 
-impl<CB: crate::callbacks::Callbacks> Parser<CB> {
+impl<CB: crate::callbacks::Callbacks<T>, T> Parser<CB, T> {
     /// Creates a new terminal parser of the given size and with the given
     /// amount of scrollback. Terminal events will be reported via method
     /// calls on the provided [`Callbacks`](crate::callbacks::Callbacks)
     /// implementation.
+    ///
+    /// shellglass: also generic over the cell-data type `T` — annotate the
+    /// parser type (or the screen use) when stamping data, e.g.
+    /// `let p: vt100::Parser<CB, MyTag> = vt100::Parser::new_with_callbacks(…)`.
     pub fn new_with_callbacks(
         rows: u16,
         cols: u16,
@@ -52,14 +59,14 @@ impl<CB: crate::callbacks::Callbacks> Parser<CB> {
     /// Returns a reference to a [`Screen`](crate::Screen) object containing
     /// the terminal state.
     #[must_use]
-    pub fn screen(&self) -> &crate::Screen {
+    pub fn screen(&self) -> &crate::Screen<T> {
         &self.screen.screen
     }
 
     /// Returns a mutable reference to a [`Screen`](crate::Screen) object
     /// containing the terminal state.
     #[must_use]
-    pub fn screen_mut(&mut self) -> &mut crate::Screen {
+    pub fn screen_mut(&mut self) -> &mut crate::Screen<T> {
         &mut self.screen.screen
     }
 

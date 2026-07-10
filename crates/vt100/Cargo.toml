@@ -22,10 +22,13 @@
 #     wrapping BSU/ESU counters (synchronized_update{,_starts,_ends}) so a
 #     sampling consumer can see edges that open and close within one read.
 #     Tests in tests/mode.rs (synchronized_update).
-#   - cell.rs/screen.rs: per-cell inline-image tags — Cell carries an optional
-#     (id, row_off, col_off) stamped by Screen::place_image and cleared by the
-#     cell's own set/clear, so image lifetime rides vt100's scroll/erase/reflow
-#     exactly (Cell grows 32→40 bytes). Tests in tests/image.rs.
+#   - cell.rs/row.rs/grid.rs/screen.rs/perform.rs/parser.rs/callbacks.rs:
+#     generic per-cell data slot — Cell<T> (default T = (): no overhead)
+#     carries Option<T> cleared by the cell's own set/clear, stamped over a
+#     region by Screen::place_data; Parser/Screen/Callbacks gain the T param
+#     with defaults so the upstream-shaped API is unchanged. Consumer-agnostic
+#     (shellglass stores its inline-image overlay tag in T; any region
+#     metadata works). Tests in tests/cell_data.rs.
 #   - attrs.rs/term.rs/screen.rs/cell.rs: modern SGR — underline styles
 #     (4:n subparam, 21 double, kitty numbering 0-5), strikethrough (9/29),
 #     underline color (58/59 incl. the colon/colorspace form). Upstream's

@@ -58,10 +58,13 @@ pub enum MouseProtocolEncoding {
 }
 
 /// Represents the overall terminal state.
+///
+/// shellglass: generic over the per-cell data slot `T` (default `()` — see
+/// [`Cell`](crate::Cell) and [`Screen::place_data`]).
 #[derive(Clone, Debug)]
-pub struct Screen {
-    grid: crate::grid::Grid,
-    alternate_grid: crate::grid::Grid,
+pub struct Screen<T = ()> {
+    grid: crate::grid::Grid<T>,
+    alternate_grid: crate::grid::Grid<T>,
 
     attrs: crate::attrs::Attrs,
     saved_attrs: crate::attrs::Attrs,
@@ -114,7 +117,7 @@ pub struct Screen {
     mouse_protocol_encoding: MouseProtocolEncoding,
 }
 
-impl Screen {
+impl<T> Screen<T> {
     pub(crate) fn new(
         size: crate::grid::Size,
         scrollback_len: usize,
@@ -607,28 +610,27 @@ impl Screen {
     /// Returns the [`Cell`](crate::Cell) object at the given location in the
     /// terminal, if it exists.
     #[must_use]
-    pub fn cell(&self, row: u16, col: u16) -> Option<&crate::Cell> {
+    pub fn cell(&self, row: u16, col: u16) -> Option<&crate::Cell<T>> {
         self.grid().visible_cell(crate::grid::Pos { row, col })
     }
 
-    /// shellglass: stamp an inline-image placement of `width`×`height` cells
-    /// into the grid at the current cursor position, advancing (and scrolling)
-    /// one row per image row exactly as printing the image would, and leaving
-    /// the cursor at column 0 of the image's last row — where a sixel-scrolling
-    /// terminal leaves it.
+    /// shellglass: stamp per-cell data over a `width`×`height` region at the
+    /// current cursor position, advancing (and scrolling) one row per region
+    /// row exactly as printing it would, and leaving the cursor at column 0
+    /// of the region's last row — where a sixel-scrolling terminal leaves it
+    /// after an inline image, the motivating consumer.
     ///
-    /// Each covered cell is tagged with `id` plus its offset within the image
-    /// (see [`ImageCell`](crate::ImageCell)); the tag rides the cell through
-    /// scrolling, reflow, and line insertion/deletion, and dies when the cell's
-    /// contents are overwritten or erased — mirroring a cell-based sixel
-    /// terminal's own erase semantics. Cell text and attributes are untouched
-    /// (the terminal draws images *over* cells). A too-wide image is clipped at
-    /// the right edge, like the terminal clips it.
-    pub fn place_image(
+    /// Each covered cell gets `data(row_off, col_off)` in its data slot; the
+    /// slot rides the cell through scrolling, reflow, and line
+    /// insertion/deletion, and dies when the cell's contents are overwritten
+    /// or erased — mirroring a cell-based sixel terminal's own erase
+    /// semantics. Cell text and attributes are untouched (overlays draw
+    /// *over* cells). A too-wide region is clipped at the right edge.
+    pub fn place_data(
         &mut self,
-        id: std::num::NonZeroU32,
         width: u16,
         height: u16,
+        mut data: impl FnMut(u16, u16) -> T,
     ) {
         let cols = self.grid().size().cols;
         let left = self.grid().pos().col.min(cols - 1);
@@ -644,9 +646,7 @@ impl Screen {
                     col: left + col_off,
                 };
                 if let Some(cell) = self.grid_mut().drawing_cell_mut(pos) {
-                    cell.set_image(Some(crate::cell::ImageCell::new(
-                        id, row_off, col_off,
-                    )));
+                    cell.set_data(Some(data(row_off, col_off)));
                 }
             }
         }
@@ -865,7 +865,7 @@ impl Screen {
         self.attrs.inverse()
     }
 
-    pub(crate) fn grid(&self) -> &crate::grid::Grid {
+    pub(crate) fn grid(&self) -> &crate::grid::Grid<T> {
         if self.mode(MODE_ALTERNATE_SCREEN) {
             &self.alternate_grid
         } else {
@@ -873,7 +873,7 @@ impl Screen {
         }
     }
 
-    fn grid_mut(&mut self) -> &mut crate::grid::Grid {
+    fn grid_mut(&mut self) -> &mut crate::grid::Grid<T> {
         if self.mode(MODE_ALTERNATE_SCREEN) {
             &mut self.alternate_grid
         } else {
@@ -934,7 +934,7 @@ impl Screen {
     }
 }
 
-impl Screen {
+impl<T> Screen<T> {
     pub(crate) fn text(&mut self, c: char) {
         let pos = self.grid().pos();
         let size = self.grid().size();

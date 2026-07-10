@@ -2,8 +2,8 @@ const BASE64: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
 const CLIPBOARD_SELECTOR: &[u8] = b"cpqs01234567";
 
-pub struct WrappedScreen<CB: crate::callbacks::Callbacks = ()> {
-    pub screen: crate::screen::Screen,
+pub struct WrappedScreen<CB: crate::callbacks::Callbacks<T> = (), T = ()> {
+    pub screen: crate::screen::Screen<T>,
     pub callbacks: CB,
 }
 
@@ -13,7 +13,7 @@ impl WrappedScreen<()> {
     }
 }
 
-impl<CB: crate::callbacks::Callbacks> WrappedScreen<CB> {
+impl<CB: crate::callbacks::Callbacks<T>, T> WrappedScreen<CB, T> {
     pub fn new_with_callbacks(
         rows: u16,
         cols: u16,
@@ -30,7 +30,9 @@ impl<CB: crate::callbacks::Callbacks> WrappedScreen<CB> {
     }
 }
 
-impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
+impl<CB: crate::callbacks::Callbacks<T>, T> vte::Perform
+    for WrappedScreen<CB, T>
+{
     fn print(&mut self, c: char) {
         if c == '\u{fffd}' || ('\u{80}'..'\u{a0}').contains(&c) {
             self.callbacks.unhandled_char(&mut self.screen, c);
@@ -103,7 +105,7 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
         _ignore: bool,
         c: char,
     ) {
-        let unhandled = |screen: &mut crate::screen::Screen| {
+        let unhandled = |screen: &mut crate::screen::Screen<T>| {
             self.callbacks.unhandled_csi(
                 screen,
                 intermediates.first().copied(),

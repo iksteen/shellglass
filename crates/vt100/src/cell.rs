@@ -1,72 +1,33 @@
 use unicode_width::UnicodeWidthChar as _;
 
-// chosen to make the size of the cell struct 32 bytes upstream (52 with the
-// shellglass image tag and underline-color + hyperlink attrs)
+// chosen to make the size of the cell struct 32 bytes upstream (44 with the
+// shellglass underline-color + hyperlink attrs; per-cell data is `T`-sized
+// on top of that)
 const CONTENT_BYTES: usize = 22;
 
 const IS_WIDE: u8 = 0b1000_0000;
 const IS_WIDE_CONTINUATION: u8 = 0b0100_0000;
 const LEN_BITS: u8 = 0b0001_1111;
 
-/// shellglass: one cell's share of an inline-image placement.
-///
-/// See [`Screen::place_image`](crate::Screen::place_image). The offsets locate
-/// this cell within the image, so any surviving cell reconstructs the
-/// placement's top-left exactly — scrolling, line insertion/deletion, and
-/// erasure need no extra tracking.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ImageCell {
-    id: std::num::NonZeroU32,
-    row_off: u16,
-    col_off: u16,
-}
-
-impl ImageCell {
-    pub(crate) fn new(
-        id: std::num::NonZeroU32,
-        row_off: u16,
-        col_off: u16,
-    ) -> Self {
-        Self {
-            id,
-            row_off,
-            col_off,
-        }
-    }
-
-    /// The placement id passed to
-    /// [`Screen::place_image`](crate::Screen::place_image).
-    #[must_use]
-    pub fn id(self) -> std::num::NonZeroU32 {
-        self.id
-    }
-
-    /// Rows below the image's top edge.
-    #[must_use]
-    pub fn row_off(self) -> u16 {
-        self.row_off
-    }
-
-    /// Columns right of the image's left edge.
-    #[must_use]
-    pub fn col_off(self) -> u16 {
-        self.col_off
-    }
-}
-
 /// Represents a single terminal cell.
-#[derive(Clone, Debug, Eq)]
-pub struct Cell {
+///
+/// shellglass: generic over an optional per-cell data slot `T` (default `()`:
+/// no slot, no overhead). Consumers stamp data with
+/// [`Screen::place_data`](crate::Screen::place_data); the slot dies with the
+/// cell's contents (overwrite/erase), so its lifetime rides the terminal's own
+/// cell semantics — shellglass stores its inline-image overlay tag here.
+/// Equality deliberately ignores the slot: two cells that render identically
+/// are equal; the data is consumer metadata, not part of the picture.
+#[derive(Clone, Debug)]
+pub struct Cell<T = ()> {
     contents: [u8; CONTENT_BYTES],
     len: u8,
     attrs: crate::attrs::Attrs,
-    // shellglass: inline-image tag; dies with the cell's contents (set/clear),
-    // which is exactly a cell-based sixel terminal's erase semantics.
-    image: Option<ImageCell>,
+    data: Option<T>,
 }
-const _: () = assert!(std::mem::size_of::<Cell>() == 52);
+const _: () = assert!(std::mem::size_of::<Cell<()>>() == 44);
 
-impl PartialEq<Self> for Cell {
+impl<T> PartialEq<Self> for Cell<T> {
     fn eq(&self, other: &Self) -> bool {
         if self.len != other.len {
             return false;
@@ -79,13 +40,15 @@ impl PartialEq<Self> for Cell {
     }
 }
 
-impl Cell {
+impl<T> Eq for Cell<T> {}
+
+impl<T> Cell<T> {
     pub(crate) fn new() -> Self {
         Self {
             contents: Default::default(),
             len: 0,
             attrs: crate::attrs::Attrs::default(),
-            image: None,
+            data: None,
         }
     }
 
@@ -95,7 +58,7 @@ impl Cell {
 
     pub(crate) fn set(&mut self, c: char, a: crate::attrs::Attrs) {
         self.len = 0;
-        self.image = None; // shellglass: overwriting text erases the image here
+        self.data = None; // shellglass: overwriting text drops the data slot
         self.append_char(0, c);
         // strings in this context should always be an arbitrary character
         // followed by zero or more zero-width characters, so we should only
@@ -129,22 +92,22 @@ impl Cell {
         self.len = 0;
         self.attrs = attrs;
         // shellglass: an erased cell keeps drawing attrs (bg) but must never
-        // be a clickable link, and erasing the cell erases the image here.
+        // be a clickable link, and erasing drops the data slot.
         self.attrs.link = None;
-        self.image = None;
+        self.data = None;
     }
 
-    /// shellglass: this cell's share of an inline-image placement, if it is
-    /// covered by one (see [`Screen::place_image`](crate::Screen::place_image)).
+    /// shellglass: this cell's data slot, if a consumer stamped one (see
+    /// [`Screen::place_data`](crate::Screen::place_data)).
     #[must_use]
-    pub fn image_cell(&self) -> Option<ImageCell> {
-        self.image
+    pub fn data(&self) -> Option<&T> {
+        self.data.as_ref()
     }
 
-    // shellglass: stamp (or clear) the image tag without touching the cell's
-    // text or attributes — the terminal draws images *over* cells.
-    pub(crate) fn set_image(&mut self, image: Option<ImageCell>) {
-        self.image = image;
+    // shellglass: stamp (or clear) the data slot without touching the cell's
+    // text or attributes — overlays draw *over* cells.
+    pub(crate) fn set_data(&mut self, data: Option<T>) {
+        self.data = data;
     }
 
     /// Returns the text contents of the cell.
