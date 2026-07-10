@@ -89,6 +89,11 @@ pub struct Screen {
     // 0 default, 1/2 blinking/steady block, 3/4 underline, 5/6 bar.
     cursor_style: u8,
 
+    // shellglass: OSC 10/11 default foreground/background overrides
+    // (`None` = the terminal's own default); OSC 110/111 reset, RIS wipes.
+    default_fg: Option<(u8, u8, u8)>,
+    default_bg: Option<(u8, u8, u8)>,
+
     modes: u8,
     mouse_protocol_mode: MouseProtocolMode,
     mouse_protocol_encoding: MouseProtocolEncoding,
@@ -116,6 +121,9 @@ impl Screen {
             sync_ends: 0,
 
             cursor_style: 0,
+
+            default_fg: None,
+            default_bg: None,
 
             modes: 0,
             mouse_protocol_mode: MouseProtocolMode::default(),
@@ -661,6 +669,29 @@ impl Screen {
     #[must_use]
     pub fn cursor_style(&self) -> u8 {
         self.cursor_style
+    }
+
+    /// shellglass: the OSC 10 default-foreground override, if an application
+    /// set one (`None` = the terminal's own default).
+    #[must_use]
+    pub fn default_fg(&self) -> Option<(u8, u8, u8)> {
+        self.default_fg
+    }
+
+    /// shellglass: the OSC 11 default-background override.
+    #[must_use]
+    pub fn default_bg(&self) -> Option<(u8, u8, u8)> {
+        self.default_bg
+    }
+
+    // shellglass: OSC 10 / 110
+    pub(crate) fn set_default_fg(&mut self, c: Option<(u8, u8, u8)>) {
+        self.default_fg = c;
+    }
+
+    // shellglass: OSC 11 / 111
+    pub(crate) fn set_default_bg(&mut self, c: Option<(u8, u8, u8)>) {
+        self.default_bg = c;
     }
 
     /// shellglass: whether a synchronized update (DEC private mode 2026) is

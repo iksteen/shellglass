@@ -39,6 +39,11 @@
 #     cursor at the right margin like xterm) and IRM (`CSI 4 h/l`, insert mode
 #     shifts the row right; first bare-SM/RM dispatch). Both reset by DECSTR.
 #     Tests in tests/mode.rs (decawm_off…, irm_…).
+#   - screen.rs/perform.rs: OSC 10/11 default fg/bg overrides — set forms
+#     parsed (`rgb:R/G/B` 1-4 hex digits per component, `#R…G…B…` 3/6/9/12
+#     digits), OSC 110/111 reset, RIS wipes; unparseable values (named colors)
+#     stay unhandled. Accessors default_fg()/default_bg(). Tests in
+#     tests/osc.rs (default_colors_track_set_and_reset).
 #   - perform.rs: deliberate no-ops for non-visual queries/syntax — Primary and
 #     Secondary DA (`CSI c`/`CSI > c`), bare ST (`ESC \`), XTWINOPS reports and
 #     title stack (`CSI 11/13/14/16/18/19/21/22/23 t`), OSC 10/11 color

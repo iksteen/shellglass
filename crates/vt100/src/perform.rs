@@ -315,9 +315,25 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
             }
             // shellglass: default fg/bg *queries* (vim/neovim background
             // detection) — the embedding terminal answers; nothing to render.
-            // The set form (a color value) must stay unhandled until it is
-            // mirrored (roadmap item 9): it really changes the local screen.
             [b"10" | b"11", b"?"] => {}
+            // shellglass: OSC 10/11 set form — override the default fg/bg
+            // (theme switchers, OSC 11-emitting TUIs); OSC 110/111 reset.
+            // A value we can't parse (named colors, rgbi:) stays unhandled
+            // so it keeps reporting instead of silently mis-rendering.
+            [b"10", value] => match parse_osc_color(value) {
+                Some(c) => self.screen.set_default_fg(Some(c)),
+                None => {
+                    self.callbacks.unhandled_osc(&mut self.screen, params);
+                }
+            },
+            [b"11", value] => match parse_osc_color(value) {
+                Some(c) => self.screen.set_default_bg(Some(c)),
+                None => {
+                    self.callbacks.unhandled_osc(&mut self.screen, params);
+                }
+            },
+            [b"110"] => self.screen.set_default_fg(None),
+            [b"111"] => self.screen.set_default_bg(None),
             [b"52", ty, data] => {
                 match (
                     ty.iter().all(|c| CLIPBOARD_SELECTOR.contains(c)),
@@ -347,6 +363,60 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
             }
         }
     }
+}
+
+// shellglass: the two XParseColor shapes real emitters use — `rgb:R/G/B`
+// (1-4 hex digits per component, left-aligned fractions: scale to 8 bits) and
+// `#R…G…B…` (3/6/9/12 digits, raw bit patterns: take the top 8 bits, with
+// 4-bit components replicated like XParseColor). Named colors and `rgbi:`
+// return None (→ unhandled, so telemetry keeps flagging them).
+fn parse_osc_color(value: &[u8]) -> Option<(u8, u8, u8)> {
+    fn hexval(digits: &[u8]) -> Option<u16> {
+        if digits.is_empty() || digits.len() > 4 {
+            return None;
+        }
+        let s = std::str::from_utf8(digits).ok()?;
+        u16::from_str_radix(s, 16).ok()
+    }
+    // A component of `n` hex digits scaled to 8 bits: one digit replicates
+    // (0xA → 0xAA), two passes through, three/four keep the top byte.
+    fn scale(v: u16, digits: usize) -> u8 {
+        let byte = match digits {
+            1 => v * 0x11,
+            2 => v,
+            3 => v >> 4,
+            _ => v >> 8,
+        };
+        // hexval bounds v by the digit count, so this is always ≤ 0xFF
+        u8::try_from(byte).unwrap_or(u8::MAX)
+    }
+    if let Some(rgb) = value.strip_prefix(b"rgb:") {
+        let mut parts = rgb.split(|&b| b == b'/');
+        let (r, g, b) = (parts.next()?, parts.next()?, parts.next()?);
+        if parts.next().is_some() {
+            return None;
+        }
+        return Some((
+            scale(hexval(r)?, r.len()),
+            scale(hexval(g)?, g.len()),
+            scale(hexval(b)?, b.len()),
+        ));
+    }
+    if let Some(hex) = value.strip_prefix(b"#") {
+        let n = match hex.len() {
+            3 => 1,
+            6 => 2,
+            9 => 3,
+            12 => 4,
+            _ => return None,
+        };
+        return Some((
+            scale(hexval(&hex[..n])?, n),
+            scale(hexval(&hex[n..2 * n])?, n),
+            scale(hexval(&hex[2 * n..])?, n),
+        ));
+    }
+    None
 }
 
 fn canonicalize_params_1(params: &vte::Params, default: u16) -> u16 {

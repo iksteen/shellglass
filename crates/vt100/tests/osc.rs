@@ -83,28 +83,45 @@ fn unknown_osc() {
     helpers::fixture("unknown_osc");
 }
 
-// shellglass: OSC 10/11 *queries* (vim background detection) are answered by
-// the embedding terminal and must be silent; the *set* form really changes
-// the local screen and must keep reporting until mirrored (roadmap item 9).
+// shellglass: OSC 10/11 set forms override the default fg/bg (both XParseColor
+// shapes), 110/111 reset, queries stay silent, and unparseable values report.
 #[test]
-fn default_color_queries_silent_set_form_reports() {
+fn default_colors_track_set_and_reset() {
     #[derive(Default)]
-    struct Rec(Vec<Vec<Vec<u8>>>);
+    struct Rec(usize);
     impl vt100::Callbacks for Rec {
-        fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
-            self.0.push(params.iter().map(|p| p.to_vec()).collect());
+        fn unhandled_osc(&mut self, _: &mut vt100::Screen, _: &[&[u8]]) {
+            self.0 += 1;
         }
     }
-    let mut parser =
-        vt100::Parser::new_with_callbacks(24, 80, 0, Rec::default());
-    parser.process(b"\x1b]10;?\x1b\\\x1b]11;?\x07");
-    assert_eq!(parser.callbacks().0, Vec::<Vec<Vec<u8>>>::new());
-    parser.process(b"\x1b]11;#300a24\x1b\\\x1b]10;rgb:ff/ff/ff\x07");
-    assert_eq!(
-        parser.callbacks().0,
-        vec![
-            vec![b"11".to_vec(), b"#300a24".to_vec()],
-            vec![b"10".to_vec(), b"rgb:ff/ff/ff".to_vec()],
-        ]
-    );
+    let mut vt = vt100::Parser::new_with_callbacks(24, 80, 0, Rec::default());
+    assert_eq!(vt.screen().default_fg(), None);
+    assert_eq!(vt.screen().default_bg(), None);
+
+    vt.process(b"\x1b]11;#300a24\x07\x1b]10;rgb:ff/fe/fd\x1b\\");
+    assert_eq!(vt.screen().default_bg(), Some((0x30, 0x0a, 0x24)));
+    assert_eq!(vt.screen().default_fg(), Some((0xff, 0xfe, 0xfd)));
+
+    // 16-bit-per-component rgb: (what most theme tools emit) scales to 8.
+    vt.process(b"\x1b]11;rgb:1e1e/2e2e/3e3e\x07");
+    assert_eq!(vt.screen().default_bg(), Some((0x1e, 0x2e, 0x3e)));
+    // #RGB replicates nibbles.
+    vt.process(b"\x1b]10;#fa0\x07");
+    assert_eq!(vt.screen().default_fg(), Some((0xff, 0xaa, 0x00)));
+
+    // Queries stay silent no-ops; a named color is unparseable → reports.
+    vt.process(b"\x1b]10;?\x1b\\\x1b]11;?\x07");
+    assert_eq!(vt.callbacks().0, 0);
+    vt.process(b"\x1b]11;papayawhip\x07");
+    assert_eq!(vt.callbacks().0, 1);
+    assert_eq!(vt.screen().default_bg(), Some((0x1e, 0x2e, 0x3e)), "kept");
+
+    // 110/111 reset; RIS wipes both.
+    vt.process(b"\x1b]110\x07");
+    assert_eq!(vt.screen().default_fg(), None);
+    vt.process(b"\x1b]111\x07");
+    assert_eq!(vt.screen().default_bg(), None);
+    vt.process(b"\x1b]10;#111111\x07\x1b]11;#222222\x07\x1bc");
+    assert_eq!(vt.screen().default_fg(), None);
+    assert_eq!(vt.screen().default_bg(), None);
 }
