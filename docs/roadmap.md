@@ -267,11 +267,14 @@ at 0 in `Parser::new`.)
     item on this page for the smallest visible payoff. Documented divergence;
     revisit only if users actually hit it.
 
-12. **Window title in the viewer.** vt100 already tracks OSC 0/2 titles; the
-    viewer page title could follow the session's. Trivial-ish (additive wire
-    key), just never important. Bundle it with whichever phase-2/3 item next
-    touches the wire. If this lands, un-ignore XTWINOPS 22/23 (title push/pop,
-    no-op'd in phase 1.6) — with a rendered title they become state changes.
+12. **Window title in the viewer.** ✅ Landed 2026-07-10 as vt100 `649e530` +
+    wire/viewers `4e0c56d` (bundled behind the item-9 wire work, as planned).
+    Title is `Screen` state (OSC 0/2; XTWINOPS 22/23 un-ignored into a bounded
+    save/restore stack; RIS wipes); wire key `t` on full/Diff shapes only —
+    deliberately never the flattened `c` form, where old viewers spread
+    envelope keys into cell objects and `t` would overwrite cell *text* — so
+    no salt bump. Browser follows via document.title (boot title restored on
+    clear); SSH viewer passes OSC 2 through.
 
 ## Sequencing note
 
