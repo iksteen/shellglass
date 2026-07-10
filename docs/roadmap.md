@@ -455,10 +455,14 @@ own CRT effect.
 
 ### C. Canvas-mode-only improvements (after B; DOM mode keeps its behavior)
 
-1. **Text over inline images.** In canvas mode, draw image cells behind
-   glyphs (decode the `i` list to `ImageBitmap`s, draw before text) so text
-   placed over an image wins, like a real cell terminal. DOM mode keeps the
-   `<img>` overlay.
+1. ✅ **Text over inline images** (landed 2026-07-10, `canvas-track-a`):
+   storm hides the `<img>` overlays and `drawRowStorm` draws the same
+   (already decoded) elements as per-band slices under the glyphs
+   (contain-fit, top-left, one uniform scale); a written cell over an image
+   paints its bg so text wins. Untouched blanks keep showing the image (the
+   wire doesn't distinguish written-blank from never-touched — documented
+   approximation). DOM mode keeps the overlay. Verified: `verify.py`
+   `?mode=image` self-check.
 2. ✅ **Device-pixel backgrounds** (verified 2026-07-10, `canvas-track-a`):
    already satisfied by the A.3 coordinate restructure — storm bg fills use
    the same `Math.round(c·cellW·dpr)` edges as `drawGlyph`, and adjacent

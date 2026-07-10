@@ -644,6 +644,24 @@ function drawRowStorm(r) {
     const y0 = Math.round(r * cellH * dpr);
     const y1 = Math.round((r + 1) * cellH * dpr);
     ctx.clearRect(0, y0, canvasEl.width, y1 - y0);
+    const imgSpans = [];
+    for (const { ref, el } of screenImages) {
+        const natW = el.naturalWidth;
+        const natH = el.naturalHeight;
+        if (!el.complete || !natW || !natH)
+            continue;
+        const sc = ref.w && ref.h
+            ? Math.min((ref.w * cellW * dpr) / natW, (ref.h * cellH * dpr) / natH)
+            : dpr;
+        const ix = ref.c * cellW * dpr;
+        const iy = ref.r * cellH * dpr;
+        const top = Math.max(y0, iy);
+        const bot = Math.min(y1, iy + natH * sc);
+        if (bot <= top)
+            continue;
+        ctx.drawImage(el, 0, (top - iy) / sc, natW, (bot - top) / sc, ix, top, natW * sc, bot - top);
+        imgSpans.push([ix, ix + natW * sc]);
+    }
     const row = screen.cells[r];
     if (!row)
         return;
@@ -709,6 +727,12 @@ function drawRowStorm(r) {
         const bg = cellBgRgb(cell, curBlock);
         if (bg && hex(bg) !== defBg) {
             ctx.fillStyle = hex(bg);
+            ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+        }
+        else if (imgSpans.length &&
+            ((cell.t && cell.t !== " ") || bg) &&
+            imgSpans.some(([a, b]) => x0 < b && x1 > a)) {
+            ctx.fillStyle = defBg;
             ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
         }
         const cp = cell.t ? cell.t.codePointAt(0) : 0;
@@ -859,6 +883,8 @@ function setStorm(on) {
     storm = on;
     if (!on)
         setHover(undefined, -1);
+    for (const { el } of screenImages)
+        el.style.visibility = on ? "hidden" : "";
     ensureGhostCss();
     for (const el of screen.rowEls)
         el.classList.toggle("ghost", on);
@@ -1061,6 +1087,7 @@ function cursorCol(cur, row) {
     return cur && cur[0] === row ? cur[1] : -1;
 }
 let screen = { cells: [], cur: null, sty: 0, links: {}, rowEls: [] };
+let screenImages = [];
 let screenEl;
 export function patchCells(state, dp) {
     const dirty = new Set();
@@ -1215,6 +1242,18 @@ function paintFull(dims) {
     redrawCanvasAll();
     if (dims.i?.length)
         screenDiv.insertAdjacentHTML("beforeend", renderImages(dims.i));
+    screenImages = (dims.i ?? []).map((ref, idx) => ({
+        ref,
+        el: screenDiv.querySelectorAll("img.inline-img")[idx],
+    }));
+    for (const { el } of screenImages) {
+        el.style.visibility = storm ? "hidden" : "";
+        if (!el.complete)
+            el.addEventListener("load", () => {
+                if (storm)
+                    redrawCanvasAll();
+            });
+    }
 }
 function renderImages(imgs) {
     return imgs

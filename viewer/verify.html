@@ -88,6 +88,40 @@ if (MODE === "links") {
   document.body.style.background = pass ? "#00ff00" : "#ff0000";
 }
 
+// ?mode=image: canvas-mode inline-image self-check — in storm the <img>
+// overlay hides and the image draws on the canvas UNDER the glyphs: a text
+// cell over the image shows its painted bg (text wins, like a real cell
+// terminal), an untouched cell shows the image. Green/red convention.
+if (MODE === "image") {
+  const RED8 = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP8z4AdMOEQH6QSAM1BAQ/oQeJvAAAAAElFTkSuQmCC";
+  const d3 = [];
+  for (let i = 0; i < ROWS; i++) d3.push([[pad(i === 2 ? "    OVERWRITE" : "")]]);
+  apply({ d: d3, w: COLS, h: ROWS,
+          i: [{ r: 1, c: 2, w: 10, h: 4, m: "image/png", d: RED8 }] });
+  benchFlush();
+  const img = document.querySelector("img.inline-img");
+  img.decode().then(() => {
+    benchStorm(true);
+    const scr = document.querySelector("#screen .screen");
+    const canvas = document.querySelector("#screen canvas");
+    const g = canvas.getContext("2d");
+    const cw = (scr.getBoundingClientRect().width / COLS) * devicePixelRatio;
+    const lh = 17 * devicePixelRatio;
+    const px = (x, y) => g.getImageData(Math.round(x), Math.round(y), 1, 1).data;
+    const imgPx = px(3.5 * cw, 3.5 * lh); // row 3 col 3: image, no text
+    const txtPx = px(5 * cw + 1, 2 * lh + 1); // row 2 col 5: text cell corner → bg
+    const hidden = getComputedStyle(img).visibility === "hidden";
+    benchStorm(false);
+    const shown = getComputedStyle(img).visibility !== "hidden";
+    const pass = hidden && shown
+      && imgPx[0] > 180 && imgPx[1] < 60 // red image under blank cells
+      && txtPx[0] < 60 && txtPx[1] < 60 && txtPx[2] < 60; // painted bg under text
+    document.getElementById("screen").style.display = "none";
+    document.body.style.background = pass ? "#00ff00" : "#ff0000";
+    document.title = "verified-ready";
+  });
+}
+
 // ?mode=crt: canvas phosphor self-check — flipping the #crt toggle on must
 // add bloom ink to storm rows (blurred lighter self-composite), and off must
 // remove it. Same green/red screenshot convention as ?mode=links.

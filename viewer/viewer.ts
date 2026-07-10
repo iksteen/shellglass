@@ -920,6 +920,25 @@ function drawRowStorm(r: number): void {
   const y0 = Math.round(r * cellH * dpr);
   const y1 = Math.round((r + 1) * cellH * dpr);
   ctx.clearRect(0, y0, canvasEl.width, y1 - y0);
+  // Image slices for this band, under the glyphs. Contain-fit anchored
+  // top-left (same math as the <img> overlay), one uniform scale s.
+  const imgSpans: [number, number][] = [];
+  for (const { ref, el } of screenImages) {
+    const natW = el.naturalWidth;
+    const natH = el.naturalHeight;
+    if (!el.complete || !natW || !natH) continue;
+    const sc =
+      ref.w && ref.h
+        ? Math.min((ref.w * cellW * dpr) / natW, (ref.h * cellH * dpr) / natH)
+        : dpr; // no cell box: natural CSS-pixel size
+    const ix = ref.c * cellW * dpr;
+    const iy = ref.r * cellH * dpr;
+    const top = Math.max(y0, iy);
+    const bot = Math.min(y1, iy + natH * sc);
+    if (bot <= top) continue;
+    ctx.drawImage(el, 0, (top - iy) / sc, natW, (bot - top) / sc, ix, top, natW * sc, bot - top);
+    imgSpans.push([ix, ix + natW * sc]);
+  }
   const row = screen.cells[r];
   if (!row) return;
   // Alphabetic at the row's strut baseline — the DOM line box's own
@@ -990,6 +1009,17 @@ function drawRowStorm(r: number): void {
     // blanket the selection highlight painting in the ghost layer below.
     if (bg && hex(bg) !== defBg) {
       ctx.fillStyle = hex(bg);
+      ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+    } else if (
+      imgSpans.length &&
+      ((cell.t && cell.t !== " ") || bg) &&
+      imgSpans.some(([a, b]) => x0 < b && x1 > a)
+    ) {
+      // A written cell over an image paints its bg like a real cell terminal
+      // (the default-bg skip above is only a selection-highlight courtesy).
+      // Untouched blank cells keep showing the image — the wire doesn't say
+      // written-blank vs never-touched, so blanks stay transparent.
+      ctx.fillStyle = defBg;
       ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
     }
     const cp = cell.t ? cell.t.codePointAt(0)! : 0;
@@ -1162,6 +1192,7 @@ function setStorm(on: boolean): void {
   if (storm === on) return;
   storm = on;
   if (!on) setHover(undefined, -1);
+  for (const { el } of screenImages) el.style.visibility = on ? "hidden" : "";
   ensureGhostCss();
   for (const el of screen.rowEls) el.classList.toggle("ghost", on);
   if (on) {
@@ -1476,6 +1507,11 @@ interface ScreenState {
 }
 
 let screen: ScreenState = { cells: [], cur: null, sty: 0, links: {}, rowEls: [] };
+// Inline images: DOM mode shows them as <img> overlays above the grid; storm
+// hides the overlays and draws the same (already decoded) elements onto the
+// canvas UNDER the glyphs, so text painted over an image wins — like a real
+// cell terminal. Rebuilt on every full frame (images ride only fulls).
+let screenImages: { ref: ImageRef; el: HTMLImageElement }[] = [];
 let screenEl: HTMLElement;
 
 // Update the screen's cell buffer + cursor from decoded line patches, returning
@@ -1692,6 +1728,19 @@ function paintFull(dims: { w: number; h: number; i?: ImageRef[] }): void {
   // add/remove/move forces one server-side), so rebuilding them here is authoritative;
   // diffs never touch them. Appended after the canvas ⇒ they stack on top.
   if (dims.i?.length) screenDiv.insertAdjacentHTML("beforeend", renderImages(dims.i));
+  screenImages = (dims.i ?? []).map((ref, idx) => ({
+    ref,
+    el: screenDiv.querySelectorAll("img.inline-img")[idx] as HTMLImageElement,
+  }));
+  for (const { el } of screenImages) {
+    el.style.visibility = storm ? "hidden" : "";
+    // data: URLs still decode async — a static screen would never repaint, so
+    // redraw the canvas when a not-yet-ready image lands.
+    if (!el.complete)
+      el.addEventListener("load", () => {
+        if (storm) redrawCanvasAll();
+      });
+  }
 }
 
 // `<img>` overlays positioned at their cell. Given cols/rows, the image is fit into
