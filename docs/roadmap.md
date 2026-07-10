@@ -140,9 +140,17 @@ split differently from round 2: two real gaps, two noise kinds.
    stays loud — if it ever shows up in a report, charset support becomes a
    real roadmap item.
 
-## Phase 1.8 — telemetry fallout, round 4
+## Phase 1.8 — telemetry fallout, round 4 ✅ (landed 2026-07-11)
 
-The fourth exit report (10 kinds) splits 2 real / 8 noise.
+The fourth exit report (10 kinds) splits 2 real / 8 noise. Landed as vt100
+`7d2ef42` + wire/viewers `d003e06` (conceal), vt100 `773569a` (no-ops +
+private-DSR telemetry params), vt100 `5f23134` + wire/viewers `0d4c1d5`
+(blink). One deviation from the sketches below: blink got REAL rendering
+(kitty blinks — cursor.c `S(blink, …)` — so terminal parity demanded it),
+via CSS keyframes in the DOM and a lazy phase-timer row repaint on the
+canvas; conceal deliberately deviates from kitty (which ignores SGR 8)
+because the alternative leaks hidden content — documented in the vendored
+provenance header.
 
 1. **SGR 8 conceal (`CSI 8 m`, `28` reveal)** — real, and the worse
    direction: the local terminal HIDES concealed text while the mirror shows
