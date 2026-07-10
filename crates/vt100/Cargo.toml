@@ -58,7 +58,8 @@
 #     table on Screen (link_uri(); stable ids ⇒ no spurious diffs on redraws).
 #     kitty's id= params ignored; `;` in URIs rejoined; formatted output does
 #     not re-emit links (documented gap — they render as plain text anyway).
-#     Cell grows 44→52. Tests in tests/osc.rs (hyperlinks_…).
+#     Attrs carries the id (Cell<()> is 44 bytes with it). Tests in
+#     tests/osc.rs (hyperlinks_…).
 #   - perform.rs: deliberate no-ops for non-visual queries/syntax — Primary and
 #     Secondary DA (`CSI c`/`CSI > c`), bare ST (`ESC \`), XTWINOPS reports
 #     (`CSI 11/13/14/16/18/19/21 t`; 22/23 became the title stack above),
