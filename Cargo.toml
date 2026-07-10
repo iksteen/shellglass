@@ -7,6 +7,9 @@ name = "shellglass"
 # .github/workflows/release.yml). Local/dev builds report the placeholder on purpose.
 version = "0.0.0-dev"
 edition = "2024"
+# `cargo run` means the full multi-call binary; the per-mode bins are explicit
+# (`--bin shellglass-hub` etc.).
+default-run = "shellglass"
 license = "MIT"
 
 # Modes are cargo features (roadmap item 13): the default build is the full
