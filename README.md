@@ -265,6 +265,9 @@ remembered per browser in localStorage:
 - **CRT** — a CRT tube effect (scanlines, phosphor bloom, flicker, vignette; also
   `?crt`). Works in both renderer modes.
 
+`?cursor=smooth` (opt-in, canvas rendering only) makes the cursor glide between
+cells over ~80ms instead of teleporting.
+
 For a fully custom page, point `template` at a full HTML document with three tokens
 the renderer fills at serve time:
 

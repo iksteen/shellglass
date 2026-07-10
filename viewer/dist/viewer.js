@@ -603,6 +603,66 @@ function cellBgRgb(cell, isCursor) {
         return resolveRgb(cell.f) ?? parseHex(cfg.defFg);
     return resolveRgb(cell.g);
 }
+let smoothCursor;
+function smoothCursorOn() {
+    if (smoothCursor === undefined)
+        smoothCursor = new URLSearchParams(location.search).get("cursor") === "smooth";
+    return smoothCursor;
+}
+const CUR_TRAVEL_MS = 80;
+let curAnim = null;
+let lastCurPos = null;
+function startCurAnim(from, to) {
+    let fr = from[0];
+    let fc = from[1];
+    if (curAnim) {
+        const k = Math.min(1, (clock() - curAnim.t0) / CUR_TRAVEL_MS);
+        const e = 1 - (1 - k) * (1 - k);
+        fr = curAnim.fr + (curAnim.tr - curAnim.fr) * e;
+        fc = curAnim.fc + (curAnim.tc - curAnim.fc) * e;
+    }
+    const running = curAnim !== null;
+    curAnim = { fr, fc, tr: to[0], tc: to[1], t0: clock(), rows: [] };
+    if (!running)
+        requestAnimationFrame(stepCurAnim);
+}
+function stepCurAnim() {
+    if (!curAnim)
+        return;
+    if (!ctx || !storm) {
+        curAnim = null;
+        return;
+    }
+    const wipe = curAnim.rows;
+    const k = Math.min(1, (clock() - curAnim.t0) / CUR_TRAVEL_MS);
+    if (k >= 1) {
+        const tr = curAnim.tr;
+        curAnim = null;
+        for (const r of wipe)
+            redrawCanvasRow(r);
+        redrawCanvasRow(tr);
+        return;
+    }
+    for (const r of wipe)
+        redrawCanvasRow(r);
+    const e = 1 - (1 - k) * (1 - k);
+    const r = curAnim.fr + (curAnim.tr - curAnim.fr) * e;
+    const c = curAnim.fc + (curAnim.tc - curAnim.fc) * e;
+    const x0 = Math.round(c * cellW * dpr);
+    const x1 = Math.round((c + 1) * cellW * dpr);
+    const y0 = Math.round(r * cellH * dpr);
+    const y1 = Math.round((r + 1) * cellH * dpr);
+    curAnim.rows = [...new Set([Math.floor(r), Math.ceil(r)])].filter((v) => v >= 0 && v < screen.cells.length);
+    ctx.fillStyle = defaultsCss.fg;
+    const bar = Math.max(1, Math.round(fontPx * 0.14));
+    if (screen.sty >= 5)
+        ctx.fillRect(x0, y0, bar, y1 - y0);
+    else if (screen.sty >= 3)
+        ctx.fillRect(x0, y1 - bar, x1 - x0, bar);
+    else
+        ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+    requestAnimationFrame(stepCurAnim);
+}
 let renderBox;
 let renderPref;
 function canvasModeOn() {
@@ -720,7 +780,7 @@ function drawRowStorm(r) {
     let c = 0;
     for (const cell of row) {
         const w = cell.w ? 2 : 1;
-        const isCursor = !!screen.cur && screen.cur[0] === r && screen.cur[1] === c;
+        const isCursor = curAnim === null && !!screen.cur && screen.cur[0] === r && screen.cur[1] === c;
         const curBlock = isCursor && blocky;
         const x0 = Math.round(c * cellW * dpr);
         const x1 = Math.round((c + w) * cellW * dpr);
@@ -1163,6 +1223,7 @@ function flushPaint() {
         dirtyRows.clear();
         if (canvasModeOn())
             setStorm(true);
+        lastCurPos = screen.cur ? [screen.cur[0], screen.cur[1]] : null;
     }
     else {
         const stormy = dirtyRows.size >= STORM_RATIO * (screen.cells.length || 1);
@@ -1174,6 +1235,12 @@ function flushPaint() {
         else if (!storm) {
             stormHot = 0;
         }
+        const cur = screen.cur;
+        if (storm && smoothCursorOn() && cur && lastCurPos &&
+            (cur[0] !== lastCurPos[0] || cur[1] !== lastCurPos[1])) {
+            startCurAnim(lastCurPos, cur);
+        }
+        lastCurPos = cur ? [cur[0], cur[1]] : null;
         const frozen = storm && selectionActive();
         if (storm && !frozen && ghostStale) {
             for (let r = 0; r < screen.cells.length; r++)
@@ -1402,6 +1469,9 @@ export function benchStorm(on) {
 }
 export function benchFlush() {
     flushPaint();
+}
+export function benchCursorStep() {
+    stepCurAnim();
 }
 function main() {
     const boot = window.SHELLGLASS;

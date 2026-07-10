@@ -468,8 +468,14 @@ own CRT effect.
    the same `Math.round(c·cellW·dpr)` edges as `drawGlyph`, and adjacent
    cells share the rounded edge by construction. `verify.py` now scans a
    50-cell contiguous bg run for dark seam columns (both modes: none).
-3. **Smooth cursor travel** (opt-in): animate the cursor rect between cells
-   over ~80ms instead of teleporting; off by default.
+3. ✅ **Smooth cursor travel** (landed 2026-07-10, `canvas-track-a`):
+   opt-in `?cursor=smooth`, storm/canvas only. `startCurAnim`/`stepCurAnim`
+   glide the cursor shape (block/bar per DECSCUSR) over 80ms ease-out on
+   rAF, retargeting mid-flight from the interpolated position; the static
+   cursor is suppressed while traveling and restored on landing (full
+   rebuilds teleport). Verified: `verify.py` `?mode=cursor` self-check
+   (suppression + mid-travel position + landing, driven synchronously via
+   `benchCursorStep`).
 
 ## Sequencing note
 

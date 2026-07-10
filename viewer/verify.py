@@ -51,11 +51,13 @@ def main():
         c = "/tmp/sg-verify-links.png"
         e = "/tmp/sg-verify-crt.png"
         f = "/tmp/sg-verify-image.png"
+        h = "/tmp/sg-verify-cursor.png"
         shot(port, "dom", a)
         shot(port, "storm", b)
         shot(port, "links", c)
         shot(port, "crt", e)
         shot(port, "image", f)
+        shot(port, "cursor&cursor=smooth", h)
         srv.shutdown()
     dom, storm = Image.open(a).convert("RGB"), Image.open(b).convert("RGB")
     print(f"{'row':>3} {'dom-y':>7} {'storm-y':>8} {'shift':>6} {'ink dom':>9} {'ink storm':>10}")
@@ -83,7 +85,7 @@ def main():
         med = sorted(cols)[len(cols) // 2]
         seams = sum(1 for v in cols if v < med * 0.5)
         print(f"bg seam check ({label}): {'PASS' if seams == 0 else f'FAIL ({seams} dark cols)'}")
-    for name, path in (("links", c), ("crt", e), ("image", f)):
+    for name, path in (("links", c), ("crt", e), ("image", f), ("cursor", h)):
         lr, lg, lb = Image.open(path).convert("RGB").load()[20, 20]
         print(f"{name} self-check: {'PASS' if lg > 200 and lr < 60 else 'FAIL'}")
 

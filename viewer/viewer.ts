@@ -871,6 +871,71 @@ function cellBgRgb(cell: Cell, isCursor: boolean): RGB | null {
 // show through), per-cell backgrounds, then ink — crisp geometry for canvas glyphs,
 // fillText for everything else. maxWidth pins a glyph into its cell box like the
 // DOM's .run overflow:hidden does.
+// Smooth cursor travel (opt-in, ?cursor=smooth): in canvas mode the cursor
+// glides between cells over ~80ms instead of teleporting. The traveling shape
+// is drawn on the canvas each animation frame after repainting the rows it
+// touched (static cursor drawing is suppressed while the animation runs);
+// when it lands, a normal row repaint restores the exact static cursor.
+let smoothCursor: boolean | undefined;
+function smoothCursorOn(): boolean {
+  if (smoothCursor === undefined)
+    smoothCursor = new URLSearchParams(location.search).get("cursor") === "smooth";
+  return smoothCursor;
+}
+const CUR_TRAVEL_MS = 80;
+let curAnim: { fr: number; fc: number; tr: number; tc: number; t0: number; rows: number[] } | null =
+  null;
+let lastCurPos: [number, number] | null = null;
+function startCurAnim(from: [number, number], to: [number, number]): void {
+  // retarget mid-flight from the current interpolated position — no jump
+  let fr = from[0];
+  let fc = from[1];
+  if (curAnim) {
+    const k = Math.min(1, (clock() - curAnim.t0) / CUR_TRAVEL_MS);
+    const e = 1 - (1 - k) * (1 - k);
+    fr = curAnim.fr + (curAnim.tr - curAnim.fr) * e;
+    fc = curAnim.fc + (curAnim.tc - curAnim.fc) * e;
+  }
+  const running = curAnim !== null;
+  curAnim = { fr, fc, tr: to[0], tc: to[1], t0: clock(), rows: [] };
+  if (!running) requestAnimationFrame(stepCurAnim);
+}
+function stepCurAnim(): void {
+  if (!curAnim) return;
+  if (!ctx || !storm) {
+    curAnim = null;
+    return;
+  }
+  const wipe = curAnim.rows;
+  const k = Math.min(1, (clock() - curAnim.t0) / CUR_TRAVEL_MS);
+  if (k >= 1) {
+    const tr = curAnim.tr;
+    curAnim = null; // first: so the repaints draw the static cursor
+    for (const r of wipe) redrawCanvasRow(r);
+    redrawCanvasRow(tr);
+    return;
+  }
+  for (const r of wipe) redrawCanvasRow(r);
+  const e = 1 - (1 - k) * (1 - k); // ease-out
+  const r = curAnim.fr + (curAnim.tr - curAnim.fr) * e;
+  const c = curAnim.fc + (curAnim.tc - curAnim.fc) * e;
+  const x0 = Math.round(c * cellW * dpr);
+  const x1 = Math.round((c + 1) * cellW * dpr);
+  const y0 = Math.round(r * cellH * dpr);
+  const y1 = Math.round((r + 1) * cellH * dpr);
+  curAnim.rows = [...new Set([Math.floor(r), Math.ceil(r)])].filter(
+    (v) => v >= 0 && v < screen.cells.length,
+  );
+  // The traveling shape matches the cursor style; a block travels as a solid
+  // fg rect (reverse-video needs a whole cell — kitty/neovide do the same).
+  ctx.fillStyle = defaultsCss.fg;
+  const bar = Math.max(1, Math.round(fontPx * 0.14));
+  if (screen.sty >= 5) ctx.fillRect(x0, y0, bar, y1 - y0);
+  else if (screen.sty >= 3) ctx.fillRect(x0, y1 - bar, x1 - x0, bar);
+  else ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+  requestAnimationFrame(stepCurAnim);
+}
+
 // The renderer switch: canvas mode pins storm on — every dirty row paints on
 // the canvas, the DOM stays as ghost text + image overlays. Driven by the
 // template's #render checkbox when present (change flips live), else by the
@@ -999,7 +1064,8 @@ function drawRowStorm(r: number): void {
   let c = 0;
   for (const cell of row) {
     const w = cell.w ? 2 : 1;
-    const isCursor = !!screen.cur && screen.cur[0] === r && screen.cur[1] === c;
+    const isCursor =
+      curAnim === null && !!screen.cur && screen.cur[0] === r && screen.cur[1] === c;
     const curBlock = isCursor && blocky;
     const x0 = Math.round(c * cellW * dpr);
     const x1 = Math.round((c + w) * cellW * dpr);
@@ -1634,6 +1700,8 @@ function flushPaint(): void {
     rebuildDims = null;
     dirtyRows.clear();
     if (canvasModeOn()) setStorm(true); // canvas mode: re-pin after the rebuild
+    // a rebuild teleports the cursor; the NEXT move animates from here
+    lastCurPos = screen.cur ? [screen.cur[0], screen.cur[1]] : null;
   } else {
     // Storm detection: a flush touching most rows, several times in a row, means
     // full-screen animation — flip to canvas rendering (see storm mode above).
@@ -1644,6 +1712,15 @@ function flushPaint(): void {
     } else if (!storm) {
       stormHot = 0;
     }
+    // Smooth cursor: catch the move BEFORE painting rows, so this flush's row
+    // repaints already suppress the static cursor at the target (no double
+    // cursor while the rect travels). Full rebuilds teleport (layout change).
+    const cur = screen.cur;
+    if (storm && smoothCursorOn() && cur && lastCurPos &&
+        (cur[0] !== lastCurPos[0] || cur[1] !== lastCurPos[1])) {
+      startCurAnim(lastCurPos, cur);
+    }
+    lastCurPos = cur ? [cur[0], cur[1]] : null;
     const frozen = storm && selectionActive();
     if (storm && !frozen && ghostStale) {
       // Selection just cleared — the ghost layer froze while it was live; resync all.
@@ -1924,6 +2001,11 @@ export function benchStorm(on: boolean): void {
 }
 export function benchFlush(): void {
   flushPaint();
+}
+// Drive one smooth-cursor animation step synchronously (headless rAF is
+// unreliable pre-load; verify.html busy-waits wall-clock then steps).
+export function benchCursorStep(): void {
+  stepCurAnim();
 }
 
 function main(): void {

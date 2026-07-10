@@ -14,7 +14,7 @@
 <input type="checkbox" id="crt" hidden>
 <div id="screen"></div>
 <script type="module">
-import { setConfig, apply, benchInit, benchStorm, benchFlush } from "./viewer.js";
+import { setConfig, apply, benchInit, benchStorm, benchFlush, benchCursorStep } from "./viewer.js";
 
 const MODE = new URLSearchParams(location.search).get("mode") ?? "dom";
 setConfig({ defFg: "#d0d0d0", defBg: "#000000", fillFont: "monospace", sym: [] });
@@ -120,6 +120,49 @@ if (MODE === "image") {
     document.body.style.background = pass ? "#00ff00" : "#ff0000";
     document.title = "verified-ready";
   });
+}
+
+// ?mode=cursor (with &cursor=smooth): smooth cursor travel self-check. After
+// a cursor move the static cursor is suppressed (the row repaint leaves no
+// block at the target); the traveling rect lands on the target within ~80ms
+// and the static cursor is restored there. Green/red convention.
+if (MODE === "cursor") {
+  const d4 = [];
+  for (let i = 0; i < ROWS; i++) d4.push([[pad("")]]);
+  apply({ d: d4, w: COLS, h: ROWS, p: [5, 5] });
+  benchFlush();
+  benchStorm(true);
+  const scr = document.querySelector("#screen .screen");
+  const canvas = document.querySelector("#screen canvas");
+  const g = canvas.getContext("2d");
+  const cw = (scr.getBoundingClientRect().width / COLS) * devicePixelRatio;
+  const lh = 17 * devicePixelRatio;
+  const rectCol = () => { // centroid column of bright ink in row 5's band
+    const px = g.getImageData(0, Math.round(5 * lh), canvas.width, Math.round(lh)).data;
+    let sum = 0, n = 0;
+    for (let i = 0; i < px.length; i += 4) {
+      if (px[i + 3] > 100 && px[i] + px[i + 1] + px[i + 2] > 300) {
+        sum += (i / 4) % canvas.width; n++;
+      }
+    }
+    return n ? sum / n / cw : -1;
+  };
+  const spin = (ms) => { const t = performance.now(); while (performance.now() - t < ms); };
+  const start = rectCol(); // static block at col 5 (center ~5.5)
+  apply({ p: [5, 40] });
+  spin(50); // let the shaper interval pass so the next flush paints now
+  benchFlush(); // starts the travel animation, suppresses the static cursor
+  const after = rectCol(); // suppressed: no block anywhere yet
+  spin(30); // ~mid-travel
+  benchCursorStep(); // draw the traveling rect at the interpolated position
+  const mid = rectCol();
+  spin(60); // past the 80ms travel budget
+  benchCursorStep(); // lands: static cursor restored at the target
+  const end = rectCol();
+  const pass = Math.abs(start - 5.5) < 1 && after === -1
+    && mid > 7 && mid < 39 && Math.abs(end - 40.5) < 1;
+  document.getElementById("screen").style.display = "none";
+  document.body.style.background = pass ? "#00ff00" : "#ff0000";
 }
 
 // ?mode=crt: canvas phosphor self-check — flipping the #crt toggle on must
