@@ -357,3 +357,36 @@ fn decscusr() {
     vt.process(b"\x1b[6 q\x1bc");
     assert_eq!(vt.screen().cursor_style(), 0);
 }
+
+// shellglass: no-op arms, telemetry round 4 — keyboard/query protocol with
+// zero render effect. Each must parse cleanly WITHOUT hitting unhandled_csi
+// (deliberately-ignored ≠ unhandled) and without disturbing screen state.
+#[test]
+fn noop_arms_round4() {
+    struct Panic;
+    impl vt100::Callbacks for Panic {
+        fn unhandled_csi(
+            &mut self,
+            _: &mut vt100::Screen,
+            i1: Option<u8>,
+            i2: Option<u8>,
+            params: &[&[u16]],
+            c: char,
+        ) {
+            panic!("unhandled CSI: {i1:?} {i2:?} {params:?} {c}");
+        }
+    }
+
+    let mut vt = vt100::Parser::new_with_callbacks(24, 80, 0, Panic);
+    vt.process(b"a");
+    vt.process(b"\x1b[>4;2m\x1b[>4m\x1b[>m"); // XTMODKEYS (modifyOtherKeys)
+    vt.process(b"\x1b[>q"); // XTVERSION
+    vt.process(b"\x1b[?1004h\x1b[?1004l"); // focus-event reporting
+    vt.process(b"\x1b[?2031h\x1b[?2031l"); // color-scheme notifications
+    vt.process(b"\x1b[?7727h\x1b[?7727l"); // urxvt application-ESC mode
+    vt.process(b"\x1b[?6n\x1b[?15n\x1b[?25n"); // private DSR (DECXCPR, printer, UDK)
+    vt.process(b"b");
+    // nothing rendered, nothing moved beyond the two printed glyphs
+    assert_eq!(vt.screen().contents(), "ab");
+    assert_eq!(vt.screen().cursor_position(), (0, 2));
+}

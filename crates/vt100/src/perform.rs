@@ -250,6 +250,11 @@ impl<CB: crate::callbacks::Callbacks<T>, T> vte::Perform
                     .decsel(canonicalize_params_1(params, 0), unhandled),
                 'h' => self.screen.decset(params, unhandled),
                 'l' => self.screen.decrst(params, unhandled),
+                // shellglass: private DSR (`CSI ? … n` — DECXCPR cursor
+                // position, printer/UDK/locator status): queries the
+                // embedding terminal answers via the tee; zero render
+                // effect. Deliberately ignored, not unhandled.
+                'n' => {}
                 _ => {
                     self.callbacks.unhandled_csi(
                         &mut self.screen,
@@ -261,9 +266,12 @@ impl<CB: crate::callbacks::Callbacks<T>, T> vte::Perform
                 }
             },
             // shellglass: Secondary DA (`CSI > c`) — same identity-query
-            // family as Primary DA above; deliberately ignored.
+            // family as Primary DA above; deliberately ignored. XTVERSION
+            // (`CSI > q`) likewise — the tee delivers the local terminal's
+            // answer. XTMODKEYS (`CSI > 4 m` and friends) is keyboard
+            // protocol config with zero render effect.
             Some(b'>') => match c {
-                'c' => {}
+                'c' | 'q' | 'm' => {}
                 _ => {
                     self.callbacks.unhandled_csi(
                         &mut self.screen,

@@ -74,7 +74,11 @@
 #     OSC 10/11 color *queries* (`;?` only; the set form is mirrored), cursor
 #     blink (`CSI ? 12 h/l` — the mirror renders a steady cursor by design),
 #     and SCS US-ASCII (`ESC ( B`/`ESC ) B` — the only charset modeled;
-#     `ESC ( 0` DEC graphics keeps reporting). Tests in tests/csi.rs,
+#     `ESC ( 0` DEC graphics keeps reporting). Round 4 added XTVERSION
+#     (`CSI > q`), XTMODKEYS (`CSI > … m`), private DSR (`CSI ? … n`), and
+#     modes 1004 (focus reporting), 2031 (color-scheme notifications) and
+#     7727 (urxvt application-ESC) — all keyboard/query protocol, zero render
+#     effect. Tests in tests/csi.rs (incl. noop_arms_round4),
 #     tests/escape.rs, tests/osc.rs.
 [package]
 name = "vt100"

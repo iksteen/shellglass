@@ -456,7 +456,10 @@ fn csi_kind(i1: Option<u8>, i2: Option<u8>, params: &[&[u16]], c: char) -> Strin
         s.push(' ');
         s.push(char::from(i));
     }
-    if matches!(c, 'h' | 'l' | 'm' | 't') {
+    // Param-carrying finals where the numbers ARE the diagnosis (modes, SGR,
+    // window ops, DSR queries) — join them into the kind so an unknown one is
+    // identifiable straight from the exit line.
+    if matches!(c, 'h' | 'l' | 'm' | 't' | 'n') {
         for p in params {
             s.push(' ');
             let sub: Vec<String> = p.iter().map(u16::to_string).collect();

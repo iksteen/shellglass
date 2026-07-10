@@ -1516,10 +1516,15 @@ impl<T> Screen<T> {
                 // shellglass: DECAWM — autowrap back on (the default)
                 [7] => self.clear_mode(MODE_NO_AUTOWRAP),
                 [9] => self.set_mouse_mode(MouseProtocolMode::Press),
-                // shellglass: att610 cursor blink — the mirror renders a
-                // steady cursor by design (see viewer.ts cursorDeco), so
-                // deliberately ignored, not unhandled.
-                [12] => {}
+                // shellglass, deliberately ignored (not unhandled):
+                // 12 — att610 cursor blink; the mirror renders a steady
+                //      cursor by design (see viewer.ts cursorDeco).
+                // 1004 — focus-event reporting; input protocol, the
+                //        embedding terminal sends the focus events.
+                // 2031 — color-scheme-change notifications (contour spec),
+                //        a subscription the embedding terminal answers.
+                // 7727 — urxvt application-ESC mode, keyboard protocol.
+                [12 | 1004 | 2031 | 7727] => {}
                 [25] => self.clear_mode(MODE_HIDE_CURSOR),
                 [47] => self.enter_alternate_grid(),
                 [1000] => {
@@ -1564,8 +1569,9 @@ impl<T> Screen<T> {
                 // shellglass: DECAWM — autowrap off (clamp at the margin)
                 [7] => self.set_mode(MODE_NO_AUTOWRAP),
                 [9] => self.clear_mouse_mode(MouseProtocolMode::Press),
-                // shellglass: cursor blink off — steady is all we render
-                [12] => {}
+                // shellglass: blink / focus / scheme-notify / urxvt app-ESC
+                // off — the deliberately-ignored set, see decset
+                [12 | 1004 | 2031 | 7727] => {}
                 [25] => self.set_mode(MODE_HIDE_CURSOR),
                 [47] => {
                     self.exit_alternate_grid();
