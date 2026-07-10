@@ -10,7 +10,7 @@ COPY . .
 # Hub-only build (roadmap item 13): the image never runs serve/push, so the
 # PTY/image/font stacks stay out. The full CLI shape is kept (the entrypoint
 # stays `shellglass hub …`); the binary just has only the hub subcommand.
-RUN cargo build --release --locked --no-default-features --features hub
+RUN cargo build --profile dist --locked --no-default-features --features hub
 
 # Runtime: slim glibc image; ca-certificates so the hub can validate Let's Encrypt.
 FROM debian:bookworm-slim
@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -u 10001 shellglass \
     && mkdir /data && chown shellglass /data
-COPY --from=build /src/target/release/shellglass /usr/local/bin/shellglass
+COPY --from=build /src/target/dist/shellglass /usr/local/bin/shellglass
 
 # ACME cache lives here — mount a named volume at /data to keep the account +
 # certificate across restarts (pass --acme-cache /data/acme).

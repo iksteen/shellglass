@@ -71,14 +71,16 @@ jobs:
 
       - name: Build
         run: |
+          # `dist` = release + fat LTO (see Cargo.toml) — smaller shipped
+          # binaries, dev builds keep the faster thin-LTO release profile.
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --locked --target ${{ matrix.target }}
+            cross build --profile dist --locked --target ${{ matrix.target }}
           else
-            cargo build --release --locked --target ${{ matrix.target }}
+            cargo build --profile dist --locked --target ${{ matrix.target }}
           fi
 
       - name: Package
-        run: tar -czf shellglass-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release shellglass
+        run: tar -czf shellglass-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/dist shellglass
 
       - uses: softprops/action-gh-release@v3
         with:
