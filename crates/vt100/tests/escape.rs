@@ -77,3 +77,24 @@ fn decsc_resize() {
     assert_eq!(parser.screen().contents(), "yoo\n\n\n\n\n\n\n\n\n\n\n\n\n\n                                                           z");
     assert_eq!(parser.screen().cursor_position(), (14, 60));
 }
+
+// shellglass: a bare ST (`ESC \`) is how vte reports the terminator of an
+// OSC/DCS string it already ended — pure syntax, must be silent.
+#[test]
+fn st_is_deliberately_ignored() {
+    struct Panic;
+    impl vt100::Callbacks for Panic {
+        fn unhandled_escape(
+            &mut self,
+            _: &mut vt100::Screen,
+            i1: Option<u8>,
+            i2: Option<u8>,
+            b: u8,
+        ) {
+            panic!("unhandled escape: {i1:?} {i2:?} {b:#x}");
+        }
+    }
+    let mut parser = vt100::Parser::new_with_callbacks(24, 80, 0, Panic);
+    parser.process(b"a\x1b]10;?\x1b\\b");
+    assert_eq!(parser.screen().contents(), "ab");
+}

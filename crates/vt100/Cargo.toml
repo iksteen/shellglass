@@ -26,6 +26,11 @@
 #     (id, row_off, col_off) stamped by Screen::place_image and cleared by the
 #     cell's own set/clear, so image lifetime rides vt100's scroll/erase/reflow
 #     exactly (Cell grows 32→40 bytes). Tests in tests/image.rs.
+#   - perform.rs: deliberate no-ops for non-visual queries/syntax — Primary and
+#     Secondary DA (`CSI c`/`CSI > c`), bare ST (`ESC \`), XTWINOPS reports and
+#     title stack (`CSI 11/13/14/16/18/19/21/22/23 t`), and OSC 10/11 color
+#     *queries* (`;?` only; the set form stays unhandled on purpose). Tests in
+#     tests/csi.rs, tests/escape.rs, tests/osc.rs.
 [package]
 name = "vt100"
 version = "0.16.2"

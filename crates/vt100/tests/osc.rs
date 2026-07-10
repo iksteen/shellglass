@@ -82,3 +82,29 @@ fn clipboard() {
 fn unknown_osc() {
     helpers::fixture("unknown_osc");
 }
+
+// shellglass: OSC 10/11 *queries* (vim background detection) are answered by
+// the embedding terminal and must be silent; the *set* form really changes
+// the local screen and must keep reporting until mirrored (roadmap item 13).
+#[test]
+fn default_color_queries_silent_set_form_reports() {
+    #[derive(Default)]
+    struct Rec(Vec<Vec<Vec<u8>>>);
+    impl vt100::Callbacks for Rec {
+        fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+            self.0.push(params.iter().map(|p| p.to_vec()).collect());
+        }
+    }
+    let mut parser =
+        vt100::Parser::new_with_callbacks(24, 80, 0, Rec::default());
+    parser.process(b"\x1b]10;?\x1b\\\x1b]11;?\x07");
+    assert_eq!(parser.callbacks().0, Vec::<Vec<Vec<u8>>>::new());
+    parser.process(b"\x1b]11;#300a24\x1b\\\x1b]10;rgb:ff/ff/ff\x07");
+    assert_eq!(
+        parser.callbacks().0,
+        vec![
+            vec![b"11".to_vec(), b"#300a24".to_vec()],
+            vec![b"10".to_vec(), b"rgb:ff/ff/ff".to_vec()],
+        ]
+    );
+}

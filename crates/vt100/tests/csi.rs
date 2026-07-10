@@ -302,3 +302,34 @@ fn tab_at_wrap_pending_column() {
     vt.process(b"\t");
     assert_eq!(vt.screen().cursor_position(), (0, 79));
 }
+
+// shellglass: DA queries and XTWINOPS reports/title-stack ops have no render
+// effect (the embedding terminal answers the queries) — they must be silent
+// no-ops, not unhandled; XTWINOPS ops outside the known-harmless set keep
+// reporting.
+#[test]
+fn da_and_xtwinops_noise_is_deliberately_ignored() {
+    #[derive(Default)]
+    struct Rec(Vec<(Option<u8>, Vec<u16>, char)>);
+    impl vt100::Callbacks for Rec {
+        fn unhandled_csi(
+            &mut self,
+            _: &mut vt100::Screen,
+            i1: Option<u8>,
+            _: Option<u8>,
+            params: &[&[u16]],
+            c: char,
+        ) {
+            self.0.push((i1, params.iter().map(|p| p[0]).collect(), c));
+        }
+    }
+    let mut vt = vt100::Parser::new_with_callbacks(24, 80, 0, Rec::default());
+    vt.process(b"before\x1b[c\x1b[0c\x1b[>c");
+    vt.process(b"\x1b[11t\x1b[13t\x1b[14t\x1b[16t\x1b[18t\x1b[19t\x1b[21t");
+    vt.process(b"\x1b[22;0t\x1b[23;0t after");
+    assert_eq!(vt.callbacks().0, vec![], "noise must not report");
+    assert_eq!(vt.screen().contents(), "before after");
+    // An op outside the known-harmless set still reports (9 = maximize).
+    vt.process(b"\x1b[9;1t");
+    assert_eq!(vt.callbacks().0, vec![(None, vec![9, 1], 't')]);
+}

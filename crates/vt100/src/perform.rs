@@ -71,6 +71,10 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                 b'>' => self.screen.deckpnm(),
                 b'H' => self.screen.hts(), // shellglass: HTS
                 b'M' => self.screen.ri(),
+                // shellglass: ST — vte ends an OSC/DCS string itself and then
+                // reports the terminator as a bare escape; pure syntax,
+                // deliberately ignored (not a fidelity gap).
+                b'\\' => {}
                 b'c' => self.screen.ris(),
                 b'g' => self.callbacks.visual_bell(&mut self.screen),
                 _ => {
@@ -143,6 +147,10 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                 // shellglass: REP
                 'b' => self.screen.rep(canonicalize_params_1(params, 1)),
                 'd' => self.screen.vpa(canonicalize_params_1(params, 1)),
+                // shellglass: Primary DA — an identity query with zero render
+                // effect; answering is the embedding terminal's job.
+                // Deliberately ignored, not unhandled.
+                'c' => {}
                 // shellglass: TBC
                 'g' => self.screen.tbc(canonicalize_params_1(params, 0)),
                 'm' => self.screen.sgr(params, unhandled),
@@ -164,25 +172,36 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                     let mut params_iter = params.iter();
                     let op =
                         params_iter.next().and_then(|x| x.first().copied());
-                    if op == Some(8) {
-                        let (screen_rows, screen_cols) = self.screen.size();
-                        let rows =
-                            params_iter.next().map_or(screen_rows, |x| {
-                                *x.first().unwrap_or(&screen_rows)
-                            });
-                        let cols =
-                            params_iter.next().map_or(screen_cols, |x| {
-                                *x.first().unwrap_or(&screen_cols)
-                            });
-                        self.callbacks.resize(&mut self.screen, (rows, cols));
-                    } else {
-                        self.callbacks.unhandled_csi(
-                            &mut self.screen,
-                            None,
-                            None,
-                            &params.iter().collect::<Vec<_>>(),
-                            c,
-                        );
+                    match op {
+                        Some(8) => {
+                            let (screen_rows, screen_cols) =
+                                self.screen.size();
+                            let rows =
+                                params_iter.next().map_or(screen_rows, |x| {
+                                    *x.first().unwrap_or(&screen_rows)
+                                });
+                            let cols =
+                                params_iter.next().map_or(screen_cols, |x| {
+                                    *x.first().unwrap_or(&screen_cols)
+                                });
+                            self.callbacks
+                                .resize(&mut self.screen, (rows, cols));
+                        }
+                        // shellglass: XTWINOPS reports (11/13/14/16/18/19/21
+                        // are queries the embedding terminal answers) and the
+                        // title stack (22/23 — nothing renders a title here)
+                        // have zero render effect. Deliberately ignored, not
+                        // unhandled; ops outside this set keep reporting.
+                        Some(11 | 13 | 14 | 16 | 18 | 19 | 21 | 22 | 23) => {}
+                        _ => {
+                            self.callbacks.unhandled_csi(
+                                &mut self.screen,
+                                None,
+                                None,
+                                &params.iter().collect::<Vec<_>>(),
+                                c,
+                            );
+                        }
                     }
                 }
                 _ => {
@@ -208,6 +227,20 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                     self.callbacks.unhandled_csi(
                         &mut self.screen,
                         Some(b'?'),
+                        intermediates.get(1).copied(),
+                        &params.iter().collect::<Vec<_>>(),
+                        c,
+                    );
+                }
+            },
+            // shellglass: Secondary DA (`CSI > c`) — same identity-query
+            // family as Primary DA above; deliberately ignored.
+            Some(b'>') => match c {
+                'c' => {}
+                _ => {
+                    self.callbacks.unhandled_csi(
+                        &mut self.screen,
+                        Some(b'>'),
                         intermediates.get(1).copied(),
                         &params.iter().collect::<Vec<_>>(),
                         c,
@@ -252,6 +285,11 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
             [b"2", s] => {
                 self.callbacks.set_window_title(&mut self.screen, s);
             }
+            // shellglass: default fg/bg *queries* (vim/neovim background
+            // detection) — the embedding terminal answers; nothing to render.
+            // The set form (a color value) must stay unhandled until it is
+            // mirrored (roadmap item 13): it really changes the local screen.
+            [b"10" | b"11", b"?"] => {}
             [b"52", ty, data] => {
                 match (
                     ty.iter().all(|c| CLIPBOARD_SELECTOR.contains(c)),
