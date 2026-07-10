@@ -140,7 +140,7 @@ struct KittyAccum {
     /// consumed (accumulated and flushed) so `m=1` chains stay coherent.
     // ponytail: `a=p` (place a previously-transmitted id) would need an id→image
     // store keyed on `i=`; until then a t-then-p emitter shows no web image.
-    // `a=d` could evict placements, but corner-sentinel erase already covers the
+    // `a=d` could evict placements, but per-cell tag erase already covers the
     // common clears.
     display: bool,
     /// Payload outgrew [`MAX_B64_BYTES`] — condemned, same as `ItermAccum::over`.
@@ -727,8 +727,8 @@ fn parse_kv(s: &[u8], sep: u8) -> std::collections::HashMap<String, String> {
 
 /// A cols/rows display hint, only when both are plain *nonzero* integers (cells) —
 /// iTerm2's `Npx`/`N%`/`auto`, kitty pixel sizing, and a zero fall back to natural
-/// size. Zero matters: a `width=0` reaching the corner math in pty.rs would
-/// underflow `col + w - 1` at column 0.
+/// size. Zero matters: both protocols define `0` as "unspecified", not a
+/// zero-extent image.
 fn cells_from(c: Option<&String>, r: Option<&String>) -> Option<(u16, u16)> {
     let c = c?.parse::<u16>().ok().filter(|&v| v > 0)?;
     let r = r?.parse::<u16>().ok().filter(|&v| v > 0)?;
@@ -1275,9 +1275,8 @@ mod tests {
 
     #[test]
     fn zero_cell_hints_fall_back_to_natural_size() {
-        // width=0 / c=0 must read as "unspecified", not a zero-width image — a
-        // zero reaching pty.rs's right-corner math (col + w - 1) underflows at
-        // column 0.
+        // width=0 / c=0 must read as "unspecified", not a zero-width image —
+        // both protocols define 0 as "auto".
         let b64 = png_b64();
         let mut it = Interceptor::new();
         let s = format!("\x1b]1337;File=inline=1;width=0;height=0:{b64}\x07");
@@ -1294,8 +1293,8 @@ mod tests {
     #[test]
     fn non_image_escapes_pass_through_untouched() {
         // The interceptor only extracts images; a clear/alt-screen sequence is not
-        // its concern (image eviction rides the grid sentinel now), so it must pass
-        // straight through to vt100.
+        // its concern (image eviction rides the grid's per-cell tags now), so it
+        // must pass straight through to vt100.
         let mut it = Interceptor::new();
         let passed: Vec<u8> = it
             .feed(b"abc\x1b[2Jdef")

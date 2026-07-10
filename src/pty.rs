@@ -231,15 +231,15 @@ fn screen_thread(
     let mut connected = true; // teeing shell output to the terminal
     let mut last_frame = Instant::now();
     let mut dirty = false;
-    // Inline images live outside vt100 (it drops the sequences). The interceptor
-    // pulls them from the byte stream; we place each at the cursor and write
-    // sentinel glyphs into the parser grid at the image's corners. Those cells
-    // then ride vt100's own scrolling/eviction/reflow, so each frame we just read
-    // the sentinels' positions back (see `resolve_images`) — no scroll heuristics.
+    // Inline images live outside vt100's byte stream (it drops the sequences).
+    // The interceptor pulls them out; each is placed at the cursor by stamping
+    // per-cell image tags into the parser grid (`place_image`), which then ride
+    // vt100's own scrolling/eviction/reflow — each frame we just read the
+    // surviving tags back (see `resolve_images`), no scroll heuristics.
     let mut interceptor = Interceptor::with(intercept.0, intercept.1, intercept.2);
     let mut sync = SyncGate::new();
     let mut images: Vec<Placed> = Vec::new();
-    let mut mark_seq: u32 = 0;
+    let mut image_seq = std::num::NonZeroU32::MIN;
     loop {
         let msg = if dirty {
             match msg_rx.recv_timeout(MIN_FRAME) {
@@ -280,77 +280,33 @@ fn screen_thread(
                             });
                             let (cols, rows) =
                                 cells.map_or((None, None), |(c, r)| (Some(c), Some(r)));
-                            // Track the image by sampling its four corners with sentinel
-                            // glyphs written into the parser grid, so vt100 handles
-                            // scroll/reflow/eviction for us (`resolve_images` reads them
-                            // back). Corner sampling approximates a cell-based sixel
-                            // terminal's own erase semantics: text written over an image
-                            // cell erases that portion of the image, so a sentinel dying
-                            // means the terminal erased that corner too. Any surviving
-                            // corner reconstructs the top-left via its stored offset;
-                            // the image is evicted only once *every* corner is gone —
-                            // i.e. once the terminal has erased it wholesale (full
-                            // repaint, clear, scrolled fully off). Concretely:
-                            //   • a prompt repainted after a raw `cat image.sixel` (no
-                            //     trailing newline) kills the bottom-left corner — the
-                            //     other three keep the image alive, even at 1 row tall
-                            //     (the top-right/bottom-right corner outlives any prompt
-                            //     shorter than the image is wide);
-                            //   • scrolling off the top removes the top corners — the
-                            //     bottom ones reconstruct a negative row, so the viewer
-                            //     keeps clipping until even the last row is gone.
-                            // ponytail: corners only — an interior overwrite doesn't
-                            // punch a hole in the overlay; per-cell erase mirroring would
-                            // need viewer-side clip regions.
-                            // Sentinels come from Plane-16 PUA (U+100000+), which real
-                            // terminal content never carries — unlike U+E000 BMP PUA,
-                            // where Nerd Font / Powerline glyphs would false-match.
-                            let (_, screen_cols) = parser.screen().size();
-                            // Rightmost on-screen column of the image (clamped to the
-                            // grid edge, like the terminal clips a too-wide sixel); no
-                            // right corners for 1-cell-wide or unknown-size images.
-                            let right = cols
-                                .map(|w| {
-                                    let rc = (u32::from(col) + u32::from(w) - 1)
-                                        .min(u32::from(screen_cols.max(1)) - 1);
-                                    u16::try_from(rc).unwrap_or(col)
-                                })
-                                .filter(|&rc| rc > col);
-                            let mut marks = Vec::with_capacity(4);
-                            marks.push((drop_mark(&mut parser, &mut mark_seq, col), 0, 0));
-                            if let Some(rc) = right {
-                                marks.push((
-                                    drop_mark(&mut parser, &mut mark_seq, rc),
-                                    0,
-                                    rc - col,
-                                ));
-                            }
-                            // Advance onto the image's last row and drop the bottom
-                            // corners; leave the cursor there (col 0), which is where a
-                            // sixel-scrolling terminal leaves it — an emitter's own
-                            // trailing newline (chafa) then lands one line below,
-                            // matching the terminal exactly.
-                            if let Some(h) = rows {
-                                parser.process(b"\r");
-                                parser.process(&vec![b'\n'; usize::from(h.saturating_sub(1))]);
-                                if h > 1 {
-                                    marks.push((
-                                        drop_mark(&mut parser, &mut mark_seq, col),
-                                        h - 1,
-                                        0,
-                                    ));
-                                    if let Some(rc) = right {
-                                        marks.push((
-                                            drop_mark(&mut parser, &mut mark_seq, rc),
-                                            h - 1,
-                                            rc - col,
-                                        ));
-                                    }
-                                }
-                            }
-                            parser.process(b"\r");
+                            // Track the image by stamping per-cell tags into the parser
+                            // grid (`place_image`): vt100's own scroll/erase/reflow then
+                            // manage the image's lifetime cell by cell, exactly mirroring
+                            // a cell-based sixel terminal's erase semantics — text written
+                            // over an image cell erases that cell's share of the image.
+                            // Each frame `resolve_images` finds the surviving cells and
+                            // reconstructs the top-left from the best one (each tag stores
+                            // its in-image offset, so any survivor is exact); the image is
+                            // evicted only once *every* covered cell is gone — full
+                            // repaint, clear, or scrolled fully off. A partially
+                            // scrolled-off image reconstructs a negative row, so the
+                            // viewer keeps clipping it against the top edge.
+                            // Placement leaves the cursor at col 0 of the image's last
+                            // row, where a sixel-scrolling terminal leaves it — an
+                            // emitter's own trailing newline (chafa) then lands one line
+                            // below, matching the terminal exactly.
+                            let id = image_seq;
+                            image_seq = image_seq
+                                .checked_add(1)
+                                .unwrap_or(std::num::NonZeroU32::MIN);
+                            parser.screen_mut().place_image(
+                                id,
+                                cols.unwrap_or(1),
+                                rows.unwrap_or(1),
+                            );
                             images.push(Placed {
-                                marks,
+                                id,
                                 img: ImagePlacement {
                                     row: i16::try_from(row).unwrap_or(0),
                                     col,
@@ -602,94 +558,64 @@ fn report_unmirrored(seen: &SeqSeen) {
     );
 }
 
-/// An inline image plus its corner sentinels — Plane-16 private-use glyphs written
-/// into the parser at up to four corners of the image, each remembering its offset
-/// from the top-left as `(glyph, rows_below_top, cols_right_of_left)`. They ride
-/// the vt100 grid, so scrolling, eviction, and reflow are tracked by the parser,
-/// not guessed; any surviving corner reconstructs the image position, and the
-/// image is evicted only once all of them are gone (see placement for why that
-/// mirrors a sixel terminal's erase semantics).
+/// An inline image plus the tag id its covered cells carry in the parser grid
+/// (see `place_image` in the vendored vt100). The tagged cells ride vt100's own
+/// scrolling, eviction, and reflow, so the parser tracks the image's fate per
+/// cell; `resolve_images` reads the survivors back each frame.
 struct Placed {
-    marks: Vec<(char, u16, u16)>,
+    id: std::num::NonZeroU32,
     img: ImagePlacement,
 }
 
-/// Write one sentinel glyph at `at_col` on the parser's current row (CHA is
-/// 1-based) and return it. Sentinels rotate through Plane-16 PUA.
-fn drop_mark(parser: &mut vt100::Parser<SeqLog>, mark_seq: &mut u32, at_col: u16) -> char {
-    let m = char::from_u32(0x10_0000 + *mark_seq % 0xFFFE).unwrap();
-    *mark_seq = mark_seq.wrapping_add(1);
-    parser.process(format!("\x1b[{}G", at_col + 1).as_bytes());
-    parser.process(m.encode_utf8(&mut [0u8; 4]).as_bytes());
-    m
-}
-
-/// Snapshot the PTY screen as a [`Frame`], resolving each image's sentinel to its
-/// current cell and dropping images whose sentinel is gone (scrolled off the top,
-/// cleared, or overwritten).
+/// Snapshot the PTY screen as a [`Frame`], resolving each tracked image's tagged
+/// cells to its current position and dropping images with no covered cell left
+/// (scrolled off the top, cleared, or overwritten).
 fn frame_from(parser: &vt100::Parser<SeqLog>, images: &mut Vec<Placed>) -> Arc<Frame> {
     let mut grid = crate::parse::grid_from_screen(parser.screen());
-    resolve_images(&mut grid, images);
+    grid.images = resolve_images(parser.screen(), images);
     Arc::new(Frame::Screen(grid))
 }
 
-/// For each tracked image, locate its surviving corner sentinels in the grid and
-/// reconstruct the top-left from the best one (placement order: top-left,
-/// top-right, bottom-left, bottom-right — a bottom corner reconstructs a negative
-/// row once the image has partially scrolled off the top, so the viewer clips it).
-/// Blank every sentinel cell found so it never renders (the overlay covers it, but
-/// a transparent image would otherwise show it). Drop images with no corner left —
-/// fully scrolled off, cleared, or wholly overwritten.
-fn resolve_images(grid: &mut crate::model::Grid, images: &mut Vec<Placed>) {
-    // One pass over the grid (not one per image): find and scrub every tracked
-    // sentinel. The row vec omits wide continuation cells, so the true screen
-    // column is tracked by advancing per cell *width* — a CJK/emoji prompt before
-    // a sentinel on its row must not drag the reconstructed column left, or the
-    // browser draws the overlay shifted onto the preceding text.
-    let mut hits: Vec<(char, i16, u16)> = Vec::new();
-    for (r, row) in grid.rows.iter_mut().enumerate() {
-        let mut col: u16 = 0;
-        for cell in row.iter_mut() {
-            let width = if cell.wide { 2 } else { 1 };
-            if let Some(ch) = cell.text.chars().next() {
-                // Sentinels live in Plane-16 PUA — cheap pre-filter, then confirm
-                // the glyph belongs to a tracked image before scrubbing it.
-                if ch >= '\u{100000}'
-                    && images
-                        .iter()
-                        .any(|p| p.marks.iter().any(|&(m, _, _)| m == ch))
-                {
-                    hits.push((ch, r as i16, col));
-                    *cell = crate::model::StyledCell::default(); // scrub
+/// For each tracked image, find its surviving tagged cells in the parser grid and
+/// reconstruct the top-left from the most top-left survivor — each tag stores its
+/// in-image offset, so any survivor reconstructs it exactly (a bottom-row survivor
+/// yields a negative row once the image has partially scrolled off the top, and
+/// the viewer clips it). Drop images with no surviving cell — fully scrolled off,
+/// cleared, or wholly overwritten, which is exactly when the terminal no longer
+/// shows any part of them either.
+fn resolve_images(screen: &vt100::Screen, images: &mut Vec<Placed>) -> Vec<ImagePlacement> {
+    if !images.is_empty() {
+        // One pass over the grid (not one per image, and skipped entirely in the
+        // imageless common case): the minimal-offset survivor per tracked image,
+        // as (row_off, col_off, screen_row, screen_col).
+        let mut best: Vec<Option<(u16, u16, u16, u16)>> = vec![None; images.len()];
+        let (srows, scols) = screen.size();
+        for r in 0..srows {
+            for c in 0..scols {
+                let Some(icell) = screen.cell(r, c).and_then(vt100::Cell::image_cell) else {
+                    continue;
+                };
+                let Some(i) = images.iter().position(|p| p.id == icell.id()) else {
+                    continue;
+                };
+                let off = (icell.row_off(), icell.col_off());
+                if best[i].is_none_or(|(dr, dc, _, _)| off < (dr, dc)) {
+                    best[i] = Some((off.0, off.1, r, c));
                 }
             }
-            col += width;
         }
-    }
-    images.retain_mut(|p| {
-        let mut found: Option<(i16, u16)> = None; // reconstructed top-left
-        let mut best = usize::MAX;
-        for &(ch, r, c) in &hits {
-            if let Some(i) = p.marks.iter().position(|&(m, _, _)| m == ch)
-                && i < best
-            {
-                let (_, dr, dc) = p.marks[i];
-                best = i;
-                found = Some((
-                    r - i16::try_from(dr).unwrap_or(i16::MAX),
-                    c.saturating_sub(dc),
-                ));
-            }
-        }
-        if let Some((row, col)) = found {
-            p.img.row = row;
-            p.img.col = col;
+        let mut best = best.into_iter();
+        images.retain_mut(|p| {
+            let Some(Some((dr, dc, r, c))) = best.next() else {
+                return false; // every covered cell gone → evict
+            };
+            p.img.row =
+                i16::try_from(r).unwrap_or(i16::MAX) - i16::try_from(dr).unwrap_or(i16::MAX);
+            p.img.col = c.saturating_sub(dc);
             true
-        } else {
-            false // every corner gone → evict
-        }
-    });
-    grid.images = images.iter().map(|p| p.img.clone()).collect();
+        });
+    }
+    images.iter().map(|p| p.img.clone()).collect()
 }
 
 /// Controlling-terminal geometry: cell counts plus the PTY's pixel dimensions.
@@ -997,53 +923,47 @@ mod tests {
         assert_eq!(parser.screen().cursor_position(), (0, 4));
     }
 
-    fn img_2x2() -> ImagePlacement {
-        ImagePlacement {
-            row: 0,
-            col: 0,
-            cols: Some(2),
-            rows: Some(2),
-            mime: "image/png".into(),
-            data: "".into(),
-        }
+    /// Place a `w`×`h` image at the parser's cursor, exactly as the screen
+    /// thread does: stamp the cell tags and record the placement.
+    fn place(parser: &mut vt100::Parser<SeqLog>, w: u16, h: u16) -> Vec<Placed> {
+        let (row, col) = parser.screen().cursor_position();
+        let id = std::num::NonZeroU32::MIN;
+        parser.screen_mut().place_image(id, w, h);
+        vec![Placed {
+            id,
+            img: ImagePlacement {
+                row: i16::try_from(row).unwrap_or(0),
+                col,
+                cols: Some(w),
+                rows: Some(h),
+                mime: "image/png".into(),
+                data: "".into(),
+            },
+        }]
     }
 
-    // A 2-row-tall image tracked only by its bottom-left corner (the top corner's
-    // glyph is never written to the grid), exercising the clip-as-it-scrolls
-    // fallback path.
-    fn placed(mark: char) -> Placed {
-        Placed {
-            marks: vec![('\u{10FFF0}', 0, 0), (mark, 1, 0)],
-            img: img_2x2(),
-        }
-    }
-
-    /// The bottom sentinel rides vt100's own scrolling: the reported top row falls
-    /// as the screen scrolls, goes negative while the image clips against the top
-    /// edge, and the image is only evicted once even its bottom row is gone.
+    /// The tagged cells ride vt100's own scrolling: the reported top row falls
+    /// as the screen scrolls, goes negative while the image clips against the
+    /// top edge, and the image is only evicted once even its bottom row is gone.
     #[test]
-    fn sentinel_tracks_scroll_clips_then_evicts() {
+    fn image_tracks_scroll_clips_then_evicts() {
         let mut parser = new_parser(3, 10); // 3 rows
-        let mark = '\u{100003}'; // sentinels are always Plane-16 PUA (see drop_mark)
         parser.process(b"\r\n\r\n"); // cursor to the last row
-        parser.process(mark.encode_utf8(&mut [0u8; 4]).as_bytes());
-        let mut imgs = vec![placed(mark)];
-
-        // Bottom sentinel at row 2, height 2 → top row 1. Sentinel cell is scrubbed.
+        // Placing a 2-row image at the bottom scrolls once mid-placement.
+        let mut imgs = place(&mut parser, 2, 2);
         let Frame::Screen(g) = &*frame_from(&parser, &mut imgs) else {
             panic!("screen")
         };
         assert_eq!((g.images[0].row, g.images[0].col), (1, 0));
-        assert!(g.rows[2].first().is_none_or(|c| c.text.is_empty()));
 
-        // One scroll lifts the sentinel to row 1 → top row 0.
+        // One scroll lifts the image → top row 0.
         parser.process(b"\r\nx");
         let Frame::Screen(g) = &*frame_from(&parser, &mut imgs) else {
             panic!("screen")
         };
         assert_eq!(g.images[0].row, 0);
 
-        // Another scroll: sentinel at row 0 → top row -1, image still shown (clipped).
+        // Another: top row scrolls off → top row -1, image still shown (clipped).
         parser.process(b"\r\ny");
         let Frame::Screen(g) = &*frame_from(&parser, &mut imgs) else {
             panic!("screen")
@@ -1058,59 +978,36 @@ mod tests {
         assert!(g.images.is_empty());
     }
 
-    // A surviving top corner keeps the image alive when the bottom-left corner is
+    // A surviving top row keeps the image alive when its bottom row is
     // overwritten in place — e.g. a shell prompt repainted right after a raw
-    // `cat image.sixel`, which adds no trailing newline. The image reports its top
-    // row (reconstructed from the top corner) and is not evicted.
+    // `cat image.sixel`, which adds no trailing newline. The image reports its
+    // true top row and is not evicted.
     #[test]
-    fn top_corner_survives_bottom_overwrite() {
-        let (top, bottom) = ('\u{100000}', '\u{100001}');
+    fn top_row_survives_bottom_overwrite() {
         let mut parser = new_parser(4, 10);
-        // top corner on row 0, bottom corner on row 1 (a 2-row image).
-        parser.process(top.encode_utf8(&mut [0u8; 4]).as_bytes());
-        parser.process(b"\r\n");
-        parser.process(bottom.encode_utf8(&mut [0u8; 4]).as_bytes());
-        parser.process(b"\r"); // cursor at col 0 of the bottom row (as after placement)
-        let mut imgs = vec![Placed {
-            marks: vec![(top, 0, 0), (bottom, 1, 0)],
-            img: img_2x2(),
-        }];
+        // A 2×2 image at (0,0); placement leaves the cursor at col 0 of row 1.
+        let mut imgs = place(&mut parser, 2, 2);
 
-        // A prompt repaints the bottom corner's row, clobbering that sentinel.
-        parser.process(b"user@host$ ");
+        // A prompt repaints the bottom row, clobbering both of its image cells.
+        parser.process(b"user@host$");
         let Frame::Screen(g) = &*frame_from(&parser, &mut imgs) else {
             panic!("screen")
         };
-        // Still tracked, via the top corner, at its true top row.
+        // Still tracked, via the top row's cells, at its true top row.
         assert_eq!(g.images.len(), 1);
         assert_eq!((g.images[0].row, g.images[0].col), (0, 0));
     }
 
-    // A 1-row image wider than the prompt survives via its top-right corner: the
-    // prompt erases the left corner (and, in the terminal, that part of the
-    // image), the right corner reconstructs the original top-left.
+    // A 1-row image wider than the prompt survives via the cells right of it:
+    // the prompt erases the left cells (and, in the terminal, that part of the
+    // image), any survivor reconstructs the original top-left from its offset.
     #[test]
-    fn one_row_image_survives_prompt_via_right_corner() {
-        let (left, right) = ('\u{100000}', '\u{100001}');
+    fn one_row_image_survives_prompt_via_surviving_cells() {
         let mut parser = new_parser(4, 30);
-        // a 20-cell-wide, 1-row image at col 0: corners at cols 0 and 19.
-        parser.process(left.encode_utf8(&mut [0u8; 4]).as_bytes());
-        parser.process(b"\x1b[20G");
-        parser.process(right.encode_utf8(&mut [0u8; 4]).as_bytes());
-        parser.process(b"\r");
-        let mut imgs = vec![Placed {
-            marks: vec![(left, 0, 0), (right, 0, 19)],
-            img: ImagePlacement {
-                row: 0,
-                col: 0,
-                cols: Some(20),
-                rows: Some(1),
-                mime: "image/png".into(),
-                data: "".into(),
-            },
-        }];
+        // a 20-cell-wide, 1-row image at col 0.
+        let mut imgs = place(&mut parser, 20, 1);
 
-        // The prompt covers cols 0..11 — the left corner dies, the right survives.
+        // The prompt covers cols 0..11 — cells 11..20 survive.
         parser.process(b"user@host$ ");
         let Frame::Screen(g) = &*frame_from(&parser, &mut imgs) else {
             panic!("screen")
@@ -1119,48 +1016,45 @@ mod tests {
         assert_eq!((g.images[0].row, g.images[0].col), (0, 0));
     }
 
-    // Wide glyphs occupy two screen columns but only one row-vec slot (parsing
-    // drops the continuation cell) — CJK/emoji before a sentinel on its row must
-    // not drag the reconstructed column left, or the browser draws the overlay
-    // shifted onto the preceding text.
+    // Corner-sentinel tracking couldn't do this: overwrite *both* ends of a
+    // 1-row image and it lived on only via interior cells. Per-cell tags keep
+    // it alive as long as any covered cell survives — like the terminal, which
+    // still shows the image's middle.
     #[test]
-    fn sentinel_column_correct_after_wide_glyphs() {
-        let mark = '\u{100000}';
+    fn interior_cells_keep_image_alive() {
+        let mut parser = new_parser(4, 10);
+        let mut imgs = place(&mut parser, 3, 1);
+        // Overwrite the leftmost and rightmost image cells; the middle survives.
+        parser.process(b"x\x1b[3Gy");
+        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs) else {
+            panic!("screen")
+        };
+        assert_eq!(g.images.len(), 1);
+        assert_eq!((g.images[0].row, g.images[0].col), (0, 0));
+    }
+
+    // Wide glyphs occupy two screen columns — a CJK/emoji prompt before the
+    // image must not drag the reconstructed column left, or the browser draws
+    // the overlay shifted onto the preceding text.
+    #[test]
+    fn image_column_correct_after_wide_glyphs() {
         let mut parser = new_parser(4, 30);
         parser.process("日本語 ".as_bytes()); // three wide glyphs + a space → col 7
-        parser.process(mark.encode_utf8(&mut [0u8; 4]).as_bytes());
-        let mut imgs = vec![Placed {
-            marks: vec![(mark, 0, 0)],
-            img: img_2x2(),
-        }];
+        let mut imgs = place(&mut parser, 2, 2);
         let Frame::Screen(g) = &*frame_from(&parser, &mut imgs) else {
             panic!("screen")
         };
         assert_eq!((g.images[0].row, g.images[0].col), (0, 7));
     }
 
-    // A 1-row image narrower than what overwrites it is evicted — every corner is
-    // erased, which is exactly when the terminal has erased the whole image too.
+    // A 1-row image narrower than what overwrites it is evicted — every covered
+    // cell is erased, which is exactly when the terminal has erased the whole
+    // image too.
     #[test]
     fn fully_overwritten_image_evicts() {
-        let (left, right) = ('\u{100000}', '\u{100001}');
         let mut parser = new_parser(4, 30);
-        // a 5-cell-wide, 1-row image: corners at cols 0 and 4.
-        parser.process(left.encode_utf8(&mut [0u8; 4]).as_bytes());
-        parser.process(b"\x1b[5G");
-        parser.process(right.encode_utf8(&mut [0u8; 4]).as_bytes());
-        parser.process(b"\r");
-        let mut imgs = vec![Placed {
-            marks: vec![(left, 0, 0), (right, 0, 4)],
-            img: ImagePlacement {
-                row: 0,
-                col: 0,
-                cols: Some(5),
-                rows: Some(1),
-                mime: "image/png".into(),
-                data: "".into(),
-            },
-        }];
+        // a 5-cell-wide, 1-row image at col 0.
+        let mut imgs = place(&mut parser, 5, 1);
 
         // An 11-char prompt paints across the entire image row.
         parser.process(b"user@host$ ");
