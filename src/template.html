@@ -283,6 +283,9 @@ body[data-offline="operator"] .offline .off-op { display:block; }
     // Scrollbars only when magnified — at fit the content fits by construction,
     // and overflow:auto there is a scrollbar trap (see the .panel comment).
     panel.style.overflow = userZ > 1 ? 'auto' : 'hidden';
+    // The canvas renderer re-derives cell/font metrics from the zoomed boxes
+    // (nothing else fires on a zoom change — see watchZoom in the viewer).
+    window.dispatchEvent(new Event('sg-zoom'));
   };
   const fit = () => {
     const box = scr.firstElementChild;

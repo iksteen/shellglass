@@ -245,7 +245,9 @@ function sizeCanvas() {
     canvasEl.width = Math.round(rect.width * dpr);
     canvasEl.height = Math.round(rect.height * dpr);
     const cs = getComputedStyle(obsScreen);
-    fontPx = parseFloat(cs.fontSize) * dpr;
+    const localW = parseFloat(cs.width) || obsScreen.offsetWidth;
+    const z = localW > 0 ? rect.width / localW : 1;
+    fontPx = parseFloat(cs.fontSize) * z * dpr;
     fontFam = cs.fontFamily;
 }
 function onDprChange() {
@@ -260,6 +262,16 @@ function watchDpr() {
     dprMedia = matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
     dprMedia.addEventListener("change", onDprChange);
 }
+let zoomHooked = false;
+function watchZoom() {
+    if (zoomHooked || typeof window === "undefined")
+        return;
+    zoomHooked = true;
+    window.addEventListener("sg-zoom", () => {
+        sizeCanvas();
+        redrawCanvasAll();
+    });
+}
 function attachCanvas(cols, rows, screenDiv) {
     const c = document.createElement("canvas");
     c.style.cssText = "position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none";
@@ -270,6 +282,7 @@ function attachCanvas(cols, rows, screenDiv) {
     gCols = cols;
     gRows = rows;
     sizeCanvas();
+    watchZoom();
     if (typeof ResizeObserver !== "undefined") {
         if (!ro)
             ro = new ResizeObserver(() => { sizeCanvas(); redrawCanvasAll(); });
@@ -653,7 +666,7 @@ function stepCurAnim() {
     const y0 = Math.round(r * cellH * dpr);
     const y1 = Math.round((r + 1) * cellH * dpr);
     curAnim.rows = [...new Set([Math.floor(r), Math.ceil(r)])].filter((v) => v >= 0 && v < screen.cells.length);
-    ctx.fillStyle = defaultsCss.fg;
+    ctx.fillStyle = cfg.defFg;
     const bar = Math.max(1, Math.round(fontPx * 0.14));
     if (screen.sty >= 5)
         ctx.fillRect(x0, y0, bar, y1 - y0);
@@ -729,6 +742,10 @@ function drawRowStorm(r) {
     const y0 = Math.round(r * cellH * dpr);
     const y1 = Math.round((r + 1) * cellH * dpr);
     ctx.clearRect(0, y0, canvasEl.width, y1 - y0);
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, y0, canvasEl.width, y1 - y0);
+    ctx.clip();
     const imgSpans = [];
     for (const { ref, el } of screenImages) {
         const natW = el.naturalWidth;
@@ -748,8 +765,10 @@ function drawRowStorm(r) {
         imgSpans.push([ix, ix + natW * sc]);
     }
     const row = screen.cells[r];
-    if (!row)
+    if (!row) {
+        ctx.restore();
         return;
+    }
     ctx.textBaseline = "alphabetic";
     const baseY = rowBaseline(r);
     const defBg = cfg.defBg.toLowerCase();
@@ -878,6 +897,7 @@ function drawRowStorm(r) {
         ctx.drawImage(canvasEl, 0, y0, canvasEl.width, y1 - y0, 0, y0, canvasEl.width, y1 - y0);
         ctx.restore();
     }
+    ctx.restore();
 }
 let hoverA;
 let hoverRow = -1;

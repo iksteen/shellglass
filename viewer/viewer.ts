@@ -448,8 +448,16 @@ function sizeCanvas(): void {
   canvasEl.height = Math.round(rect.height * dpr);
   // Storm mode draws text on the canvas with the same face the DOM uses; capture it
   // here so the backing-store size and the font stay in lockstep (both dpr-scaled).
+  // CSS `zoom` (the template's fit + user zoom) splits the coordinate spaces:
+  // in Firefox getBoundingClientRect() is zoomed but computed width/font-size
+  // are local — so cellW/cellH above are zoomed while a raw fontSize is not,
+  // and glyphs would render mis-scaled and mis-seated in their cells. Derive
+  // the effective zoom from the two spaces and scale the font into the rect's.
+  // (Engines that zoom their computed values yield z = 1 — also correct.)
   const cs = getComputedStyle(obsScreen);
-  fontPx = parseFloat(cs.fontSize) * dpr;
+  const localW = parseFloat(cs.width) || obsScreen.offsetWidth;
+  const z = localW > 0 ? rect.width / localW : 1;
+  fontPx = parseFloat(cs.fontSize) * z * dpr;
   fontFam = cs.fontFamily;
 }
 
@@ -470,6 +478,20 @@ function watchDpr(): void {
   dprMedia.addEventListener("change", onDprChange);
 }
 
+// The template's fit/zoom script (CSS `zoom` on .tube) dispatches "sg-zoom"
+// after changing the factor — neither ResizeObserver (the local box is
+// unchanged) nor the dpr media query (unchanged too) fires for it. Custom
+// templates with their own zoom should dispatch the same event.
+let zoomHooked = false;
+function watchZoom(): void {
+  if (zoomHooked || typeof window === "undefined") return;
+  zoomHooked = true;
+  window.addEventListener("sg-zoom", () => {
+    sizeCanvas();
+    redrawCanvasAll();
+  });
+}
+
 function attachCanvas(cols: number, rows: number, screenDiv: HTMLElement): void {
   const c = document.createElement("canvas");
   // Overlay .screen exactly; the backing store is sized in sizeCanvas().
@@ -481,6 +503,7 @@ function attachCanvas(cols: number, rows: number, screenDiv: HTMLElement): void 
   gCols = cols;
   gRows = rows;
   sizeCanvas();
+  watchZoom();
   if (typeof ResizeObserver !== "undefined") {
     if (!ro) ro = new ResizeObserver(() => { sizeCanvas(); redrawCanvasAll(); });
     ro.disconnect();
@@ -928,7 +951,9 @@ function stepCurAnim(): void {
   );
   // The traveling shape matches the cursor style; a block travels as a solid
   // fg rect (reverse-video needs a whole cell — kitty/neovide do the same).
-  ctx.fillStyle = defaultsCss.fg;
+  // cfg.defFg, NOT defaultsCss.fg: the latter is "" without an OSC 10 override
+  // (it clears the inline style), and an empty fillStyle is silently ignored.
+  ctx.fillStyle = cfg.defFg;
   const bar = Math.max(1, Math.round(fontPx * 0.14));
   if (screen.sty >= 5) ctx.fillRect(x0, y0, bar, y1 - y0);
   else if (screen.sty >= 3) ctx.fillRect(x0, y1 - bar, x1 - x0, bar);
@@ -1015,6 +1040,16 @@ function drawRowStorm(r: number): void {
   const y0 = Math.round(r * cellH * dpr);
   const y1 = Math.round((r + 1) * cellH * dpr);
   ctx.clearRect(0, y0, canvasEl.width, y1 - y0);
+  // Clip all ink to the band — the DOM's .run{height:--lh;overflow:hidden}
+  // in canvas form. Without it, fonts whose bounding box is taller than the
+  // line height (Nerd Fonts, typically) paint descenders and low-riding
+  // decorations into the NEXT row's band, where the next repaint of either
+  // row wipes or restores them by turns — visible jitter on p/g/y tails and
+  // double underlines. Horizontal overflow (over-wide glyphs) stays free.
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, y0, canvasEl.width, y1 - y0);
+  ctx.clip();
   // Image slices for this band, under the glyphs. Contain-fit anchored
   // top-left (same math as the <img> overlay), one uniform scale s.
   const imgSpans: [number, number][] = [];
@@ -1035,7 +1070,10 @@ function drawRowStorm(r: number): void {
     imgSpans.push([ix, ix + natW * sc]);
   }
   const row = screen.cells[r];
-  if (!row) return;
+  if (!row) {
+    ctx.restore();
+    return;
+  }
   // Alphabetic at the row's strut baseline — the DOM line box's own
   // arithmetic, so toggling storm produces no vertical shift.
   ctx.textBaseline = "alphabetic";
@@ -1185,6 +1223,7 @@ function drawRowStorm(r: number): void {
     ctx.drawImage(canvasEl, 0, y0, canvasEl.width, y1 - y0, 0, y0, canvasEl.width, y1 - y0);
     ctx.restore();
   }
+  ctx.restore(); // the band clip
 }
 
 // The ghost backing for one row: the grid's plain characters as a single text node.

@@ -16,7 +16,10 @@
 <script type="module">
 import { setConfig, apply, benchInit, benchStorm, benchFlush, benchCursorStep } from "./viewer.js";
 
-const MODE = new URLSearchParams(location.search).get("mode") ?? "dom";
+const PARAMS = new URLSearchParams(location.search);
+const MODE = PARAMS.get("mode") ?? "dom";
+const ZOOM = parseFloat(PARAMS.get("zoom") ?? "1");
+if (ZOOM !== 1) document.getElementById("screen").style.zoom = String(ZOOM);
 setConfig({ defFg: "#d0d0d0", defBg: "#000000", fillFont: "monospace", sym: [] });
 benchInit(document.getElementById("screen"));
 
@@ -161,6 +164,35 @@ if (MODE === "cursor") {
   const end = rectCol();
   const pass = Math.abs(start - 5.5) < 1 && after === -1
     && mid > 7 && mid < 39 && Math.abs(end - 40.5) < 1;
+  document.getElementById("screen").style.display = "none";
+  document.body.style.background = pass ? "#00ff00" : "#ff0000";
+}
+
+// ?mode=bleed: cross-band ink containment — with a line height TIGHTER than
+// the font's bounding box (14px lh under a 14px font), descenders (gjqy) and
+// a double underline's low bar must stay clipped to their own row band, like
+// the DOM's .run overflow:hidden. Ink in the blank band below = the bleed
+// that repaints by turns (the p/g/y tail jitter). Green/red convention.
+if (MODE === "bleed") {
+  document.getElementById("screen").style.setProperty("--lh", "14px");
+  const d5 = [];
+  for (let i = 0; i < ROWS; i++) d5.push([[pad("")]]);
+  d5[2] = [[pad("gjqy pgqy Mgjq")]];
+  d5[5] = [[pad("double underline gjq")], [[0, 20, { u: 2 }]]];
+  apply({ d: d5, w: COLS, h: ROWS });
+  benchFlush();
+  benchStorm(true);
+  const canvas = document.querySelector("#screen canvas");
+  const g = canvas.getContext("2d");
+  const lh = 14 * devicePixelRatio;
+  const bandInk = (r) => {
+    const px = g.getImageData(0, Math.round(r * lh), canvas.width, Math.round(lh)).data;
+    let t = 0;
+    for (let i = 3; i < px.length; i += 4) t += px[i];
+    return t;
+  };
+  const pass = bandInk(2) > 0 && bandInk(5) > 0 // the rows themselves drew
+    && bandInk(3) === 0 && bandInk(6) === 0; // nothing escaped downward
   document.getElementById("screen").style.display = "none";
   document.body.style.background = pass ? "#00ff00" : "#ff0000";
 }
