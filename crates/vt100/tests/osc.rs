@@ -156,3 +156,48 @@ fn title_tracks_set_stack_and_reset() {
     vt.process(b"\x1bc");
     assert_eq!(vt.screen().title(), "");
 }
+
+// shellglass: OSC 8 hyperlinks — text printed between open and close carries
+// a link id resolvable to the URI; SGR 0 does NOT close a link (independent
+// state); erased cells are never linked; the same URI keeps the same id.
+#[test]
+fn hyperlinks_stamp_cells_and_dedupe() {
+    let mut vt = vt100::Parser::default();
+    let link = |vt: &vt100::Parser, col: u16| {
+        vt.screen()
+            .cell(0, col)
+            .unwrap()
+            .link()
+            .map(|id| vt.screen().link_uri(id).unwrap().to_string())
+    };
+
+    vt.process(b"a\x1b]8;;https://example.com\x1b\\b\x1b[1mc\x1b[0md");
+    vt.process(b"\x1b]8;;\x1b\\e");
+    assert_eq!(link(&vt, 0), None);
+    assert_eq!(link(&vt, 1), Some("https://example.com".into()));
+    assert_eq!(link(&vt, 2), Some("https://example.com".into()));
+    // SGR 0 between c and d must not have closed the link.
+    assert_eq!(link(&vt, 3), Some("https://example.com".into()));
+    assert_eq!(link(&vt, 4), None);
+
+    // Same URI again (a redraw) reuses the id; a different URI gets a new one.
+    let id1 = vt.screen().cell(0, 1).unwrap().link().unwrap();
+    vt.process(b"\x1b]8;;https://example.com\x1b\\x\x1b]8;;\x1b\\");
+    assert_eq!(vt.screen().cell(0, 5).unwrap().link(), Some(id1));
+    vt.process(b"\x1b]8;;https://other.example\x1b\\y\x1b]8;;\x1b\\");
+    assert_ne!(vt.screen().cell(0, 6).unwrap().link(), Some(id1));
+
+    // A URI containing `;` survives vte's param splitting.
+    vt.process(b"\x1b]8;;https://example.com/?a=1;b=2\x1b\\z\x1b]8;;\x1b\\");
+    assert_eq!(link(&vt, 7), Some("https://example.com/?a=1;b=2".into()));
+
+    // Erasing a linked cell leaves no clickable blank.
+    vt.process(b"\x1b[1;2H\x1b[X");
+    assert_eq!(link(&vt, 1), None);
+
+    // kitty's params field (id=…) is ignored but parsed past.
+    vt.process(
+        b"\x1b[1;1H\x1b]8;id=foo;https://p.example\x1b\\Q\x1b]8;;\x1b\\",
+    );
+    assert_eq!(link(&vt, 0), Some("https://p.example".into()));
+}

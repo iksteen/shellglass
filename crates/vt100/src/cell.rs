@@ -1,7 +1,7 @@
 use unicode_width::UnicodeWidthChar as _;
 
-// chosen to make the size of the cell struct 32 bytes upstream (44 with the
-// shellglass image tag and underline-color attr)
+// chosen to make the size of the cell struct 32 bytes upstream (52 with the
+// shellglass image tag and underline-color + hyperlink attrs)
 const CONTENT_BYTES: usize = 22;
 
 const IS_WIDE: u8 = 0b1000_0000;
@@ -64,7 +64,7 @@ pub struct Cell {
     // which is exactly a cell-based sixel terminal's erase semantics.
     image: Option<ImageCell>,
 }
-const _: () = assert!(std::mem::size_of::<Cell>() == 44);
+const _: () = assert!(std::mem::size_of::<Cell>() == 52);
 
 impl PartialEq<Self> for Cell {
     fn eq(&self, other: &Self) -> bool {
@@ -128,7 +128,10 @@ impl Cell {
     pub(crate) fn clear(&mut self, attrs: crate::attrs::Attrs) {
         self.len = 0;
         self.attrs = attrs;
-        self.image = None; // shellglass: erasing the cell erases the image here
+        // shellglass: an erased cell keeps drawing attrs (bg) but must never
+        // be a clickable link, and erasing the cell erases the image here.
+        self.attrs.link = None;
+        self.image = None;
     }
 
     /// shellglass: this cell's share of an inline-image placement, if it is
@@ -255,6 +258,13 @@ impl Cell {
     #[must_use]
     pub fn ulcolor(&self) -> crate::Color {
         self.attrs.ulcolor
+    }
+
+    /// shellglass: the OSC 8 hyperlink id covering this cell, resolved via
+    /// [`Screen::link_uri`](crate::Screen::link_uri).
+    #[must_use]
+    pub fn link(&self) -> Option<std::num::NonZeroU32> {
+        self.attrs.link
     }
 
     /// Returns whether the cell should be rendered with the inverse text

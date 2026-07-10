@@ -353,6 +353,18 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
             },
             [b"110"] => self.screen.set_default_fg(None),
             [b"111"] => self.screen.set_default_bg(None),
+            // shellglass: OSC 8 hyperlinks — `8 ; params ; URI`. The params
+            // (kitty's `id=` continuity hint) are ignored: the mirror renders
+            // each cell as an anchor, so multi-part unification buys nothing.
+            // vte splits the payload on `;`, so a URI containing `;` arrives
+            // as extra params — rejoin them. An empty URI closes the link.
+            [b"8", _params, uri @ ..] => {
+                if uri.iter().all(|part| part.is_empty()) {
+                    self.screen.link_close();
+                } else {
+                    self.screen.link_open(&uri.join(&b';'));
+                }
+            }
             [b"52", ty, data] => {
                 match (
                     ty.iter().all(|c| CLIPBOARD_SELECTOR.contains(c)),

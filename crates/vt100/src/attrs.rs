@@ -33,6 +33,12 @@ pub struct Attrs {
     pub bgcolor: Color,
     // shellglass: underline color (SGR 58/59); Default = follow the text color.
     pub ulcolor: Color,
+    // shellglass: OSC 8 hyperlink id, resolved through the Screen's link
+    // table. Rides the attrs because OSC 8 is SGR-like state (everything
+    // printed while a link is open carries it) — but it is NOT reset by
+    // SGR 0 (hyperlinks are independent of SGR; see sgr()/decstr()), and
+    // Cell::clear strips it so erased cells are never clickable.
+    pub link: Option<std::num::NonZeroU32>,
     pub mode: u8,
 }
 

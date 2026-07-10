@@ -99,6 +99,16 @@ pub struct Screen {
     title: String,
     title_stack: Vec<String>,
 
+    // shellglass: OSC 8 hyperlink table, id → URI, deduped by URI so a
+    // redrawn link keeps its id (no spurious diffs downstream) — plus the
+    // reverse map that does the dedup. Bounded: past the cap the lowest
+    // (oldest) ids are pruned; a pruned id still stamped in a cell resolves
+    // to no link, which can only happen if the cell has long scrolled into
+    // survival edge cases (the cap far exceeds any screen's cell count).
+    links: std::collections::BTreeMap<u32, String>,
+    link_ids: std::collections::HashMap<String, std::num::NonZeroU32>,
+    next_link_id: u32,
+
     modes: u8,
     mouse_protocol_mode: MouseProtocolMode,
     mouse_protocol_encoding: MouseProtocolEncoding,
@@ -132,6 +142,10 @@ impl Screen {
 
             title: String::new(),
             title_stack: Vec::new(),
+
+            links: std::collections::BTreeMap::new(),
+            link_ids: std::collections::HashMap::new(),
+            next_link_id: 1,
 
             modes: 0,
             mouse_protocol_mode: MouseProtocolMode::default(),
@@ -719,6 +733,41 @@ impl Screen {
         if let Some(t) = self.title_stack.pop() {
             self.title = t;
         }
+    }
+
+    /// shellglass: resolve an OSC 8 hyperlink id (from [`Cell::link`]) to its
+    /// URI. `None` for ids pruned from the bounded table.
+    #[must_use]
+    pub fn link_uri(&self, id: std::num::NonZeroU32) -> Option<&str> {
+        self.links.get(&id.get()).map(String::as_str)
+    }
+
+    // shellglass: OSC 8 open — everything printed until the close carries the
+    // link. Same URI ⇒ same id (dedup), so redrawn links are stable.
+    pub(crate) fn link_open(&mut self, uri: &[u8]) {
+        const MAX_LINKS: usize = 8192;
+        let uri = String::from_utf8_lossy(uri).into_owned();
+        if let Some(&id) = self.link_ids.get(&uri) {
+            self.attrs.link = Some(id);
+            return;
+        }
+        let Some(id) = std::num::NonZeroU32::new(self.next_link_id) else {
+            return; // 4 billion distinct URIs: stop allocating, keep parsing
+        };
+        self.next_link_id += 1;
+        while self.links.len() >= MAX_LINKS {
+            let (&oldest, _) = self.links.iter().next().unwrap();
+            let uri = self.links.remove(&oldest).unwrap();
+            self.link_ids.remove(&uri);
+        }
+        self.links.insert(id.get(), uri.clone());
+        self.link_ids.insert(uri, id);
+        self.attrs.link = Some(id);
+    }
+
+    // shellglass: OSC 8 close (`OSC 8 ; ; ST`).
+    pub(crate) fn link_close(&mut self) {
+        self.attrs.link = None;
     }
 
     // shellglass: OSC 10 / 110
@@ -1561,7 +1610,12 @@ impl Screen {
         // instance with a 0 in it, but vte doesn't allow creating new Params
         // instances
         if params.is_empty() {
-            self.attrs = crate::attrs::Attrs::default();
+            // shellglass: SGR resets don't close OSC 8 hyperlinks (they are
+            // independent state; only OSC 8 ; ; ST closes one).
+            self.attrs = crate::attrs::Attrs {
+                link: self.attrs.link,
+                ..crate::attrs::Attrs::default()
+            };
             return;
         }
 
@@ -1598,7 +1652,13 @@ impl Screen {
 
         loop {
             match next_param!() {
-                [0] => self.attrs = crate::attrs::Attrs::default(),
+                // shellglass: preserving the OSC 8 link — see above
+                [0] => {
+                    self.attrs = crate::attrs::Attrs {
+                        link: self.attrs.link,
+                        ..crate::attrs::Attrs::default()
+                    };
+                }
                 [1] => self.attrs.set_bold(),
                 [2] => self.attrs.set_dim(),
                 [3] => self.attrs.set_italic(true),
