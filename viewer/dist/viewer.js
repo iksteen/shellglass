@@ -713,6 +713,9 @@ function drawRowStorm(r) {
             if (cell.s)
                 ctx.fillRect(x0, strikeY, x1 - x0, th);
         }
+        if (r === hoverRow && cell.a !== undefined && cell.a === hoverA && !cell.u) {
+            drawUnderline(x0, x1, 1, hex(cellFg(cell, curBlock)));
+        }
         if (isCursor && !blocky) {
             const cw = Math.max(1, Math.round(fontPx * 0.14));
             ctx.fillStyle = hex(cellFg(cell, false));
@@ -723,6 +726,59 @@ function drawRowStorm(r) {
         }
         c += w;
     }
+}
+let hoverA;
+let hoverRow = -1;
+function cellAt(ev) {
+    if (!obsScreen || !cellW || !cellH)
+        return null;
+    const rect = obsScreen.getBoundingClientRect();
+    const col = Math.floor((ev.clientX - rect.left) / cellW);
+    const r = Math.floor((ev.clientY - rect.top) / cellH);
+    const row = screen.cells[r];
+    if (!row || col < 0)
+        return null;
+    let c = 0;
+    for (const cell of row) {
+        const w = cell.w ? 2 : 1;
+        if (col < c + w)
+            return { cell, r };
+        c += w;
+    }
+    return null;
+}
+function setHover(a, r) {
+    if (a === hoverA && r === hoverRow)
+        return;
+    const old = hoverRow;
+    hoverA = a;
+    hoverRow = r;
+    if (obsScreen)
+        obsScreen.style.cursor = a === undefined ? "" : "pointer";
+    if (old >= 0)
+        redrawCanvasRow(old);
+    if (r >= 0 && r !== old)
+        redrawCanvasRow(r);
+}
+function onScreenMove(ev) {
+    if (!storm)
+        return setHover(undefined, -1);
+    const hit = cellAt(ev);
+    const linked = hit !== null && linkHref(screen.links, hit.cell.a) !== null;
+    setHover(linked ? hit.cell.a : undefined, linked ? hit.r : -1);
+}
+function onScreenClick(ev) {
+    if (!storm || selectionActive())
+        return;
+    const hit = cellAt(ev);
+    const uri = hit === null ? null : linkHref(screen.links, hit.cell.a);
+    if (uri !== null)
+        window.open(uri, "_blank", "noopener,noreferrer");
+}
+function attachLinkHandlers() {
+    screenEl.addEventListener("mousemove", onScreenMove);
+    screenEl.addEventListener("mouseleave", () => setHover(undefined, -1));
+    screenEl.addEventListener("click", onScreenClick);
 }
 export function ghostText(row) {
     let text = "";
@@ -758,6 +814,8 @@ function setStorm(on) {
     if (storm === on)
         return;
     storm = on;
+    if (!on)
+        setHover(undefined, -1);
     ensureGhostCss();
     for (const el of screen.rowEls)
         el.classList.toggle("ghost", on);
@@ -1248,6 +1306,7 @@ function injectViewerCss() {
 export function benchInit(el) {
     screenEl = el;
     injectViewerCss();
+    attachLinkHandlers();
 }
 export function benchStorm(on) {
     setStorm(on);
@@ -1261,6 +1320,7 @@ function main() {
     setProto(boot.proto, boot.js);
     screenEl = document.getElementById("screen");
     injectViewerCss();
+    attachLinkHandlers();
     connect(boot.events);
     startStats();
     const reflowGlyphs = () => {

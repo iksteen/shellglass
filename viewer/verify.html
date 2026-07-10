@@ -44,5 +44,45 @@ benchFlush(); // synchronous paint — safe to screenshot at onload
 if (MODE === "storm") {
   benchStorm(true); // repaints every row on the canvas
 }
+
+// ?mode=links: storm-mode OSC 8 self-check — synthetic hover over a linked
+// cell must set cursor:pointer + draw underline ink on the canvas; hover off
+// a link must clear both. Paints the body green/red so verify.py can assert
+// from the screenshot alone.
+if (MODE === "links") {
+  const d2 = [];
+  d2.push([[pad("click https://example.com here")], [[6, 19, { a: 1 }]]]);
+  for (let i = d2.length; i < ROWS; i++) d2.push([[pad(`row ${i}`)]]);
+  apply({ d: d2, w: COLS, h: ROWS, y: { 1: "https://example.com" } });
+  benchFlush();
+  benchStorm(true);
+  const scr = document.querySelector("#screen .screen");
+  const canvas = document.querySelector("#screen canvas");
+  const cw = scr.getBoundingClientRect().width / COLS;
+  const hover = (col, row) => {
+    const r = scr.getBoundingClientRect();
+    scr.dispatchEvent(new MouseEvent("mousemove", {
+      bubbles: true, clientX: r.left + (col + 0.5) * cw, clientY: r.top + (row + 0.5) * 17,
+    }));
+  };
+  const band = () => { // ink in the hovered cell row's underline band
+    const g = canvas.getContext("2d");
+    const px = g.getImageData(0, 0, canvas.width, Math.round(17 * devicePixelRatio)).data;
+    let ink = 0;
+    for (let i = 3; i < px.length; i += 4) ink += px[i];
+    return ink;
+  };
+  const before = band();
+  hover(10, 0); // inside the link
+  const linkCursor = getComputedStyle(scr).cursor;
+  const after = band();
+  hover(40, 3); // plain cell
+  const plainCursor = getComputedStyle(scr).cursor;
+  const cleared = band();
+  const pass = linkCursor === "pointer" && plainCursor !== "pointer"
+    && after > before && cleared < after;
+  document.getElementById("screen").style.display = "none";
+  document.body.style.background = pass ? "#00ff00" : "#ff0000";
+}
 document.title = "verified-ready";
 </script></body></html>

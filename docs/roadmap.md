@@ -418,10 +418,11 @@ own CRT effect.
 2. ✅ **DECSCUSR shapes** (landed 2026-07-10, `canvas-track-a`): block
    reverse only when `screen.sty <= 2`; 3/4 bottom bar, 5/6 left bar,
    0.14em in the un-reversed fg. Verified: bar-cursor row at 0.00px.
-3. **OSC 8 interaction layer.** `click`/`mousemove` handlers on `#screen`:
-   map event x/y ÷ cellW/H to a cell, look up `cell.a` → `linkHref`; hover =
-   `cursor:pointer` + drawn underline on that link's cells; click =
-   `window.open(uri, "_blank", "noopener,noreferrer")`.
+3. ✅ **OSC 8 interaction layer** (landed 2026-07-10, `canvas-track-a`):
+   `cellAt` maps pointer x/y to a cell; hover = `cursor:pointer` + underline
+   drawn on that link's cells in the row (blanks included); click opens the
+   `linkHref`-vetted URI (`noopener,noreferrer`), suppressed while a
+   selection is live. Verified: `verify.py` `?mode=links` self-check.
 4. ✅ **Ghost layer hardening** (landed 2026-07-10, `canvas-track-a`):
    `ghostText` extracted pure and tested (wide-char single-emit,
    blank→space with trailing blanks kept, multi-codepoint graphemes);

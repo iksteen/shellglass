@@ -990,6 +990,10 @@ function drawRowStorm(r: number): void {
       }
       if (cell.s) ctx.fillRect(x0, strikeY, x1 - x0, th);
     }
+    // kitty's hover affordance — cell-level, so spaces inside a link underline too
+    if (r === hoverRow && cell.a !== undefined && cell.a === hoverA && !cell.u) {
+      drawUnderline(x0, x1, 1, hex(cellFg(cell, curBlock)));
+    }
     if (isCursor && !blocky) {
       // DECSCUSR underline (3/4) or bar (5/6) cursor, 0.14em like the DOM's
       // inset box-shadow, in the cell's un-reversed fg.
@@ -1006,6 +1010,56 @@ function drawRowStorm(r: number): void {
 // textContent (not innerHTML) — no parsing, no spans, no styles; wide cells emit
 // their grapheme once and monospace CJK advances 2ch, matching the styled path's
 // column math, so a selection maps to the picture the canvas paints on top.
+// ── OSC 8 links in storm mode ─────────────────────────────────────────────────
+//
+// The DOM path renders real anchors; storm's ghost text has none, so pointer
+// events map back to cells by grid arithmetic. Hover shows the kitty
+// affordance (pointer cursor + underline on the link's cells in that row) and
+// click opens the same linkHref-vetted URI a DOM anchor would.
+let hoverA: number | undefined;
+let hoverRow = -1;
+function cellAt(ev: MouseEvent): { cell: Cell; r: number } | null {
+  if (!obsScreen || !cellW || !cellH) return null;
+  const rect = obsScreen.getBoundingClientRect();
+  const col = Math.floor((ev.clientX - rect.left) / cellW);
+  const r = Math.floor((ev.clientY - rect.top) / cellH);
+  const row = screen.cells[r];
+  if (!row || col < 0) return null;
+  let c = 0;
+  for (const cell of row) {
+    const w = cell.w ? 2 : 1;
+    if (col < c + w) return { cell, r };
+    c += w;
+  }
+  return null;
+}
+function setHover(a: number | undefined, r: number): void {
+  if (a === hoverA && r === hoverRow) return;
+  const old = hoverRow;
+  hoverA = a;
+  hoverRow = r;
+  if (obsScreen) obsScreen.style.cursor = a === undefined ? "" : "pointer";
+  if (old >= 0) redrawCanvasRow(old);
+  if (r >= 0 && r !== old) redrawCanvasRow(r);
+}
+function onScreenMove(ev: MouseEvent): void {
+  if (!storm) return setHover(undefined, -1);
+  const hit = cellAt(ev);
+  const linked = hit !== null && linkHref(screen.links, hit.cell.a) !== null;
+  setHover(linked ? hit.cell.a : undefined, linked ? hit.r : -1);
+}
+function onScreenClick(ev: MouseEvent): void {
+  if (!storm || selectionActive()) return; // a drag-select release is not a click
+  const hit = cellAt(ev);
+  const uri = hit === null ? null : linkHref(screen.links, hit.cell.a);
+  if (uri !== null) window.open(uri, "_blank", "noopener,noreferrer");
+}
+function attachLinkHandlers(): void {
+  screenEl.addEventListener("mousemove", onScreenMove);
+  screenEl.addEventListener("mouseleave", () => setHover(undefined, -1));
+  screenEl.addEventListener("click", onScreenClick);
+}
+
 export function ghostText(row: Cell[]): string {
   let text = "";
   for (const cell of row) text += cell.t && cell.t.length ? cell.t : " ";
@@ -1052,6 +1106,7 @@ function ensureGhostCss(): void {
 function setStorm(on: boolean): void {
   if (storm === on) return;
   storm = on;
+  if (!on) setHover(undefined, -1);
   ensureGhostCss();
   for (const el of screen.rowEls) el.classList.toggle("ghost", on);
   if (on) {
@@ -1751,6 +1806,7 @@ function injectViewerCss(): void {
 export function benchInit(el: HTMLElement): void {
   screenEl = el;
   injectViewerCss();
+  attachLinkHandlers();
 }
 export function benchStorm(on: boolean): void {
   setStorm(on);
@@ -1769,6 +1825,7 @@ function main(): void {
   // OSC 8 anchors: inherit the terminal styling (a page template's own `a`
   // rules must not repaint terminal text) and underline on hover, like kitty.
   injectViewerCss();
+  attachLinkHandlers();
   connect(boot.events);
   startStats();
   // Web fonts load async; any glyph-width measured before they land is cached wrong

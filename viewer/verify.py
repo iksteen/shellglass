@@ -7,7 +7,7 @@ from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LH = 17  # --lh in verify.html (CSS px; screenshots at dpr=1 headless)
-ROWS, COLS, FS = 12, 60, 14
+ROWS, COLS, FS = 16, 60, 14
 
 class H(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *a, **kw):
@@ -48,8 +48,10 @@ def main():
         port = srv.server_address[1]
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         a, b = "/tmp/sg-verify-dom.png", "/tmp/sg-verify-storm.png"
+        c = "/tmp/sg-verify-links.png"
         shot(port, "dom", a)
         shot(port, "storm", b)
+        shot(port, "links", c)
         srv.shutdown()
     dom, storm = Image.open(a).convert("RGB"), Image.open(b).convert("RGB")
     print(f"{'row':>3} {'dom-y':>7} {'storm-y':>8} {'shift':>6} {'ink dom':>9} {'ink storm':>10}")
@@ -63,5 +65,7 @@ def main():
         worst = max(worst, abs(shift))
         print(f"{r:>3} {cd:>7.2f} {cs:>8.2f} {shift:>+6.2f} {id_:>9.0f} {is_:>10.0f}")
     print(f"worst vertical shift: {worst:.2f}px")
+    lr, lg, lb = Image.open(c).convert("RGB").load()[20, 20]
+    print(f"links self-check: {'PASS' if lg > 200 and lr < 60 else 'FAIL'}")
 
 main()
