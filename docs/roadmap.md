@@ -87,13 +87,21 @@ phase 2.
 
 ## Phase 2 — good to have
 
-4. **First-class image placements in the grid** *(the reason the crate was
-   vendored — replaces the corner-sentinel machinery)*. Today `pty.rs` tracks a
+4. **First-class image placements in the grid** ✅ *(the reason the crate was
+   vendored — replaces the corner-sentinel machinery)*. Landed 2026-07-10 as
+   vt100 `fddf2de` + PTY `76dac5b`, with one deviation from the plan below:
+   instead of an id-only cell field plus a grid-owned id→placement table (whose
+   positions every scroll/IL/DL path would have to maintain), each stamped cell
+   carries `(id, row_off, col_off)` — the offsets make any surviving cell
+   reconstruct the top-left exactly, so no table and no scroll hooks exist at
+   all. Remaining follow-ups (each small now that ids exist): per-cell holes on
+   the wire (`ImagePlacement` erased-cells key + viewer clip), kitty `a=p`
+   (id store) and `a=d` deletes, z-ordering. Original plan: `pty.rs` tracked a
    placed image by writing four Plane-16 PUA sentinel glyphs into the vt100 grid
    at the image's corners and reconstructing the top-left each frame
-   (`resolve_images`). It works, but it is an approximation with documented
-   ponytails: interior overwrites can't punch holes in the overlay, kitty
-   `a=p`/`a=d` are unimplementable, and the sentinel scan is a per-frame cost.
+   (`resolve_images`). It worked, but was an approximation with documented
+   ponytails: interior overwrites couldn't punch holes in the overlay, kitty
+   `a=p`/`a=d` were unimplementable, and the sentinel scan was a per-frame cost.
    Plan:
    - `crates/vt100`: give cells an optional image id (`Cell` grows a
      `Option<ImageId>`-shaped field; keep it `Copy`-friendly — an id, not the
@@ -183,7 +191,9 @@ phase 2.
 
 ## Sequencing note
 
-Items 4 and 7 both add a per-cell id side-table to the vendored grid — whoever
-lands first should shape the mechanism generically (a small per-cell tag
-namespace, ids resolved through a grid-owned table) so the second is a client,
-not a second implementation.
+Items 4 and 7 both hang a small per-cell tag off the vendored grid. Item 4
+landed first and set the pattern: an `Option`-of-`Copy`-struct field on `Cell`
+(`ImageCell`), cleared by the cell's own `set`/`clear`, stamped by a `Screen`
+method, read back by a consumer-side scan. OSC 8 (item 7) should be a client of
+that pattern — its own `Option<LinkId>` field resolved through a link table —
+not a second mechanism.
