@@ -340,7 +340,29 @@ at 0 in `Parser::new`.)
     ~65µs/range, so realistic run granularity (~100 ranges/row) lands at
     390-690ms/flush, worse than the matrix. Falsified on today's Firefox by
     the primitive's implementation, not the architecture; revisit if Gecko
-    optimizes highlight invalidation. Original idea: today the
+    optimizes highlight invalidation. **Final head-to-head** (2026-07-10,
+    definitive; flush ms, headless Firefox, ~16.5 = shaper pacing floor):
+
+    | load    | size    | classic+storm | classic no-storm | matrix |
+    |---------|---------|---------------|------------------|--------|
+    | typing  | 80×24   | 16.6          | 16.7             | 16.6   |
+    | typing  | 200×60  | 17.0          | 16.5             | 17.0   |
+    | typing  | 320×100 | 16.5          | 16.3             | 17.1   |
+    | editor  | 80×24   | 16.3 ⚡       | 16.2             | 16.2   |
+    | editor  | 200×60  | 16.8 ⚡       | 16.7             | 24.8   |
+    | editor  | 320×100 | 17.4 ⚡       | 27.9             | 64.0   |
+    | rain    | 80×24   | 16.9 ⚡       | 17.1             | 16.9   |
+    | rain    | 200×60  | 16.8 ⚡       | 16.6             | 25.5   |
+    | rain    | 320×100 | 21.8 ⚡       | 24.2             | 74.0   |
+
+    Matrix is strictly dominated — it never beats classic even with storm
+    disabled. The structural lesson: a dirty row's display-list rebuild is
+    charged per node PRESENT, not per node touched, so coalescing to few
+    fresh spans beats patching many retained cells — run coalescing IS the
+    optimization, and the classic renderer already sits at the right point
+    in the design space. Also measured: storm's margin over un-escalated
+    classic DOM is only ~10% on run-friendly content; its real payoff is
+    span-fragmentation-heavy screens. Original idea: today the
     DOM path rebuilds each dirty row's coalesced spans from scratch, and the
     cmatrix-class escape hatch is storm mode (canvas `fillText`, lower
     fidelity: no symbol_map, no glyph stretch, no links). The experiment: a
