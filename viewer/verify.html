@@ -22,7 +22,7 @@ benchInit(document.getElementById("screen"));
 
 // One static frame: text in several styles (baseline check rows) and a row of
 // fill glyphs (stretch/coverage check). 60x12.
-const COLS = 60, ROWS = 16;
+const COLS = 60, ROWS = 17;
 const pad = (s) => s + " ".repeat(Math.max(0, COLS - s.length));
 const d = [];
 d.push([[pad("plain text row Mgjq 0123456789 the quick brown fox")]]);
@@ -36,6 +36,8 @@ d.push([[pad("double underline Mgjq")], [[0, 21, { u: 2 }]]]);
 d.push([[pad("curly colored Mgjq")], [[0, 18, { u: 3, k: 1 }]]]);
 d.push([[pad("dotted Mgjq / dashed Mgjq")], [[0, 11, { u: 4 }], [14, 11, { u: 5 }]]]);
 d.push([[pad("strikethrough Mgjq")], [[0, 18, { s: 1 }]]]);
+// contiguous bg run (device-pixel seam check: verify.py scans this band)
+d.push([[pad("bg run seam probe")], [[0, 50, { g: 4 }]]]);
 for (let i = d.length; i < ROWS; i++) d.push([[pad(`row ${i} Mgjq baseline probe`)]]);
 
 apply({ v: 4 });

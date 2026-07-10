@@ -7,7 +7,7 @@ from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LH = 17  # --lh in verify.html (CSS px; screenshots at dpr=1 headless)
-ROWS, COLS, FS = 16, 60, 14
+ROWS, COLS, FS = 17, 60, 14
 
 class H(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *a, **kw):
@@ -67,6 +67,20 @@ def main():
         worst = max(worst, abs(shift))
         print(f"{r:>3} {cd:>7.2f} {cs:>8.2f} {shift:>+6.2f} {id_:>9.0f} {is_:>10.0f}")
     print(f"worst vertical shift: {worst:.2f}px")
+    # Device-pixel bg continuity: row 10 is a 50-cell contiguous bg run; a
+    # hairline seam shows as a column whose summed brightness dips far below
+    # its neighbours inside the run. (Row 10 in the frame = index BGROW.)
+    BGROW = 10
+    for label, img in (("dom", dom), ("storm", storm)):
+        px = img.load()
+        y0, y1 = BGROW * LH, (BGROW + 1) * LH
+        cols = []
+        for x in range(0, int(50 * 8.4)):  # stay inside the 50-cell run
+            v = sum(sum(px[x, y][:3]) for y in range(y0, y1))
+            cols.append(v)
+        med = sorted(cols)[len(cols) // 2]
+        seams = sum(1 for v in cols if v < med * 0.5)
+        print(f"bg seam check ({label}): {'PASS' if seams == 0 else f'FAIL ({seams} dark cols)'}")
     for name, path in (("links", c), ("crt", e)):
         lr, lg, lb = Image.open(path).convert("RGB").load()[20, 20]
         print(f"{name} self-check: {'PASS' if lg > 200 and lr < 60 else 'FAIL'}")

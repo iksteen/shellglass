@@ -459,9 +459,11 @@ own CRT effect.
    glyphs (decode the `i` list to `ImageBitmap`s, draw before text) so text
    placed over an image wins, like a real cell terminal. DOM mode keeps the
    `<img>` overlay.
-2. **Device-pixel backgrounds.** Snap bg fills to the same rounded device-
-   pixel cell edges as `drawGlyph` — kills hairline seams between cells at
-   fractional zoom.
+2. ✅ **Device-pixel backgrounds** (verified 2026-07-10, `canvas-track-a`):
+   already satisfied by the A.3 coordinate restructure — storm bg fills use
+   the same `Math.round(c·cellW·dpr)` edges as `drawGlyph`, and adjacent
+   cells share the rounded edge by construction. `verify.py` now scans a
+   50-cell contiguous bg run for dark seam columns (both modes: none).
 3. **Smooth cursor travel** (opt-in): animate the cursor rect between cells
    over ~80ms instead of teleporting; off by default.
 
