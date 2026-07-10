@@ -364,7 +364,11 @@ at 0 in `Parser::new`.)
     dense-churn fragmentation where whole spans rewrite; ties when calm).
     With storm retained for everything heavy, the main-renderer choice only
     governs the calm band, where all three tie — no measured configuration
-    beats classic + canvas storm. Kept as is. Original idea: today the
+    beats classic + canvas storm. Kept as is. A third strategy — span reuse
+    (row reconciliation onto existing elements, `exp/span-reuse`) — measured
+    a wash vs classic (2–5%, within noise): parse/create was never the cost;
+    dirty rows are charged per node present, style+paint dominates. Three
+    strategies, one wall. Original idea: today the
     DOM path rebuilds each dirty row's coalesced spans from scratch, and the
     cmatrix-class escape hatch is storm mode (canvas `fillText`, lower
     fidelity: no symbol_map, no glyph stretch, no links). The experiment: a
