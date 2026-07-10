@@ -262,6 +262,10 @@ remembered per browser in localStorage:
   (footer tag `canvas`); the DOM stays underneath as transparent ghost text, so
   select/copy/find keep working. Canvas mode is markedly faster under heavy,
   fragmented output; the DOM mode remains the fidelity reference.
+- **storm** — on by default; gates DOM mode's automatic escalation to the canvas
+  under full-screen animation load (also `?storm=off`). Turn it off to keep the
+  full DOM text semantics — real links, native selection and find — at whatever
+  frame rate the DOM manages. Ignored in canvas mode.
 - **CRT** — a CRT tube effect (scanlines, phosphor bloom, flicker, vignette; also
   `?crt`). Works in both renderer modes.
 

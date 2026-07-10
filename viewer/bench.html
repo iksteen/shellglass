@@ -23,13 +23,15 @@ const ROWS = Number(q.get("rows") ?? 60);
 const SECONDS = Number(q.get("secs") ?? 5);
 
 setConfig({ defFg: "#d0d0d0", defBg: "#000000", fillFont: "monospace", sym: [] });
-if (MODE === "canvas") {
-  // exercise the real renderer switch: the viewer reads this #render checkbox
+// exercise the real toggles: the viewer reads these checkboxes
+if (MODE === "canvas" || MODE === "dom-nostorm") {
   const c = document.createElement("input");
-  c.type = "checkbox"; c.id = "render"; c.checked = true; c.hidden = true;
+  c.type = "checkbox"; c.id = MODE === "canvas" ? "render" : "storm";
+  c.checked = MODE === "canvas"; // #storm unchecked = escalation off
+  c.hidden = true;
   document.body.appendChild(c);
 }
-benchInit(document.getElementById("screen"), MODE);
+benchInit(document.getElementById("screen"));
 
 // Honest cmatrix simulation: independent falling streams per column. Nearly
 // every ROW changes each frame (storm engages on the classic path, as in

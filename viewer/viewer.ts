@@ -966,6 +966,36 @@ function canvasModeOn(): boolean {
   return renderPref;
 }
 
+// The storm toggle: gates DOM mode's AUTO-escalation to canvas under load
+// (default on). Off = the DOM renderer never leaves the DOM — full text
+// semantics (real links, selection, find) at whatever frame rate the DOM
+// manages. Ignored in canvas mode, which pins storm explicitly.
+let stormBox: HTMLInputElement | null | undefined;
+let stormPref: boolean | undefined;
+function stormAutoOn(): boolean {
+  if (stormBox === undefined) {
+    stormBox = document.getElementById("storm") as HTMLInputElement | null;
+    stormBox?.addEventListener("change", () => {
+      // switching escalation off drops an active storm back to DOM now
+      // (unless a selection is live — the exit path would kill its Ranges)
+      if (!stormBox?.checked && storm && !canvasModeOn() && !selectionActive()) setStorm(false);
+    });
+  }
+  if (stormBox !== null) return stormBox.checked;
+  if (stormPref === undefined) {
+    let stored: string | null = null;
+    try {
+      stored = localStorage.getItem("shellglass-storm");
+    } catch {
+      /* viewer with localStorage disabled */
+    }
+    stormPref = stored
+      ? stored === "on"
+      : new URLSearchParams(location.search).get("storm") !== "off";
+  }
+  return stormPref;
+}
+
 // The template's CRT is mostly blend-mode overlays + a #screen filter, which
 // composite over the canvas for free; only the text-shadow phosphor bloom is
 // text-bound (and forced off on ghost rows). Canvas rows re-create it below in
@@ -1708,7 +1738,7 @@ function flushPaint(): void {
     const stormy = dirtyRows.size >= STORM_RATIO * (screen.cells.length || 1);
     if (stormy) {
       lastStormy = now;
-      if (stormEnabled && !storm && ++stormHot >= STORM_ENTER) setStorm(true); // paints all rows
+      if (stormAutoOn() && !storm && ++stormHot >= STORM_ENTER) setStorm(true); // paints all rows
     } else if (!storm) {
       stormHot = 0;
     }
@@ -1986,10 +2016,8 @@ function injectViewerCss(): void {
 }
 
 // ── canvas-track verification hooks (verify.html, bench.html; no SSE) ─────────
-let stormEnabled = true; // bench-only knob: pin the classic path for comparison
-export function benchInit(el: HTMLElement, mode?: string): void {
+export function benchInit(el: HTMLElement): void {
   screenEl = el;
-  stormEnabled = mode !== "dom-nostorm";
   injectViewerCss();
   attachLinkHandlers();
 }

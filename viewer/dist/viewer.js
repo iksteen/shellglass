@@ -690,6 +690,31 @@ function canvasModeOn() {
     }
     return renderPref;
 }
+let stormBox;
+let stormPref;
+function stormAutoOn() {
+    if (stormBox === undefined) {
+        stormBox = document.getElementById("storm");
+        stormBox?.addEventListener("change", () => {
+            if (!stormBox?.checked && storm && !canvasModeOn() && !selectionActive())
+                setStorm(false);
+        });
+    }
+    if (stormBox !== null)
+        return stormBox.checked;
+    if (stormPref === undefined) {
+        let stored = null;
+        try {
+            stored = localStorage.getItem("shellglass-storm");
+        }
+        catch {
+        }
+        stormPref = stored
+            ? stored === "on"
+            : new URLSearchParams(location.search).get("storm") !== "off";
+    }
+    return stormPref;
+}
 let crtBox;
 function crtOn() {
     if (crtBox === undefined) {
@@ -1229,7 +1254,7 @@ function flushPaint() {
         const stormy = dirtyRows.size >= STORM_RATIO * (screen.cells.length || 1);
         if (stormy) {
             lastStormy = now;
-            if (stormEnabled && !storm && ++stormHot >= STORM_ENTER)
+            if (stormAutoOn() && !storm && ++stormHot >= STORM_ENTER)
                 setStorm(true);
         }
         else if (!storm) {
@@ -1454,10 +1479,8 @@ function injectViewerCss() {
             "#screen a.run:hover{text-decoration:underline}";
     document.head.appendChild(linkCss);
 }
-let stormEnabled = true;
-export function benchInit(el, mode) {
+export function benchInit(el) {
     screenEl = el;
-    stormEnabled = mode !== "dom-nostorm";
     injectViewerCss();
     attachLinkHandlers();
 }

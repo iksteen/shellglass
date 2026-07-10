@@ -199,6 +199,7 @@ body[data-offline="operator"] .offline .off-op { display:block; }
   <span class="nav-right">
     <span class="meta">live terminal mirror</span>
     <label class="toggle"><input type="checkbox" id="render">canvas</label>
+    <label class="toggle"><input type="checkbox" id="storm">storm</label>
     <label class="toggle"><input type="checkbox" id="crt">CRT</label>
   </span>
 </nav>
@@ -221,6 +222,8 @@ body[data-offline="operator"] .offline .off-op { display:block; }
   };
   wire('crt', 'shellglass-crt', params.has('crt'));
   wire('render', 'shellglass-render', params.get('render') === 'canvas');
+  wire('storm', 'shellglass-storm', params.get('storm') !== 'off'); // default ON
+
 })();
 </script>
 <main class="stage">
