@@ -206,13 +206,22 @@ split differently from round 2: two real gaps, two noise kinds.
 
 ## Phase 3 — nice to have
 
-7. **OSC 8 hyperlinks.** Dropped today (no `[b"8", …]` arm). The viewer is a
-   browser — real `<a>` links are the most natural rendering this project could
-   offer, and kitty supports OSC 8 locally so fidelity permits it. Needs a
-   per-cell link id in the vendored crate (pairs naturally with the image-id
-   cell field from item 4), a link table on the wire (additive), and anchor
-   rendering + `rel="noreferrer"` hygiene in the viewer. Decide explicitly how
-   storm mode (canvas) degrades — likely links only in DOM mode.
+7. **OSC 8 hyperlinks.** ✅ Landed 2026-07-10 as vt100 `ef49e17` +
+   wire/viewer `46904b7`, with one deviation from the sketch below: the link
+   id rides `Attrs` (OSC 8 is SGR-like state stamped by the print path), not
+   an `ImageCell`-pattern cell field — with the guards that matter: SGR 0
+   does not close a link, `Cell::clear` strips it (no clickable blanks), and
+   ids are URI-deduped on a bounded Screen table so redraws are diff-stable.
+   Wire: style key `a` + table key `y` (full table on fulls, additions on
+   diffs — which forces the Diff shape), additive, no salt bump. Viewer:
+   real `<a target="_blank" rel="noopener noreferrer">` in the DOM path with
+   an http/https/ftp/mailto scheme allowlist (a hostile `javascript:` URI
+   renders unlinked), attribute-escaped hrefs, injected CSS pinning anchor
+   color to terminal styling, hover underline. Storm mode stays linkless, as
+   predicted. Original rationale: dropped entirely (no `[b"8", …]` arm); the
+   viewer is a browser — real links are the most natural rendering this
+   project could offer, and kitty supports OSC 8 locally so fidelity permits
+   it.
 
 8. **Damage tracking.** No dirty/damage state exists in the crate; every dirty
    frame does a full-screen `grid_from_screen` scan+alloc and `encode_delta`
@@ -278,9 +287,10 @@ at 0 in `Parser::new`.)
 
 ## Sequencing note
 
-Items 4 and 7 both hang a small per-cell tag off the vendored grid. Item 4
-landed first and set the pattern: an `Option`-of-`Copy`-struct field on `Cell`
-(`ImageCell`), cleared by the cell's own `set`/`clear`, stamped by a `Screen`
-method, read back by a consumer-side scan. OSC 8 (item 7) should be a client of
-that pattern — its own `Option<LinkId>` field resolved through a link table —
-not a second mechanism.
+Items 4 and 7 both hang per-cell metadata off the vendored grid, and both are
+landed. They ended up as two *deliberately different* shapes: images are a
+region stamped over cells from outside the print path (`ImageCell` on `Cell`,
+placed by `Screen::place_image`), while links are SGR-like state that flows
+through the print path (`link` on `Attrs`, resolved through a bounded
+URI-deduped `Screen` table). A future per-cell tag should pick whichever shape
+matches how the state arrives.
