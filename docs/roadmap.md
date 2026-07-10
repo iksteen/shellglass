@@ -422,13 +422,15 @@ own CRT effect.
    map event x/y ÷ cellW/H to a cell, look up `cell.a` → `linkHref`; hover =
    `cursor:pointer` + drawn underline on that link's cells; click =
    `window.open(uri, "_blank", "noopener,noreferrer")`.
-4. **Ghost layer hardening.** Make the transparent text layer the permanent
-   copy/find/a11y surface: pin wide-char and trailing-space copy fidelity
-   with tests; keep the selection-freeze; add `::selection` rule coverage for
-   custom templates.
-5. **Font + DPR lifecycle.** `document.fonts` `loadingdone` → re-measure +
-   `redrawCanvasAll()`; listen for `devicePixelRatio` changes (matchMedia
-   `resolution`) → resize canvas + full redraw.
+4. ✅ **Ghost layer hardening** (landed 2026-07-10, `canvas-track-a`):
+   `ghostText` extracted pure and tested (wide-char single-emit,
+   blank→space with trailing blanks kept, multi-codepoint graphemes);
+   selection-freeze unchanged; `::selection` was already viewer-injected so
+   custom templates were covered.
+5. ✅ **Font + DPR lifecycle** (landed 2026-07-10, `canvas-track-a`): DPR
+   matchMedia re-arm existed; `reflowGlyphs` (fonts `loadingdone`) now also
+   runs `sizeCanvas()` + `redrawCanvasAll()` so a same-advance font swap
+   can't leave stale canvas metrics.
 6. ✅ **Over-wide fallback glyphs** (landed 2026-07-10, `canvas-track-a`):
    `drawRowStorm` drops the `fillText` maxWidth clamp for
    `glyphOverflowsCell` cells (DOM lets ❯ overflow; canvas now does too).

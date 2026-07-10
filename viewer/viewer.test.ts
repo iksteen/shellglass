@@ -8,6 +8,7 @@ import {
   cellStyle,
   applyDefaults,
   linkHref,
+  ghostText,
   isFillGlyph,
   isCanvasGlyph,
   glyphOps,
@@ -455,4 +456,20 @@ test("flags as 1 style like true (weight, reverse, dim, wide)", () => {
   // Wide flag as 1 advances two columns.
   const split = renderRow([{ t: "世", w: 1 }, { t: "a", b: 1 }], -1);
   assert.match(split, /left:2ch;width:1ch;font-weight:bold;">a</);
+});
+
+// ── ghost layer (storm mode's copy/find/a11y surface) ─────────────────────────
+
+test("ghostText: wide cells emit their grapheme once (2ch advance is the font's)", () => {
+  assert.equal(ghostText([{ t: "漢", w: 1 }, { t: "x" }] as never), "漢x");
+});
+
+test("ghostText: blank and empty cells become spaces, trailing blanks preserved", () => {
+  // Trailing blanks stay: the ghost row spans the full grid width so column
+  // math (and selections past end-of-text) match the picture on the canvas.
+  assert.equal(ghostText([{ t: "a" }, { t: "" }, { t: undefined }] as never), "a  ");
+});
+
+test("ghostText: multi-codepoint graphemes survive intact", () => {
+  assert.equal(ghostText([{ t: "e\u0301" }, { t: "👩‍🚀", w: 1 }] as never), "e\u0301👩‍🚀");
 });

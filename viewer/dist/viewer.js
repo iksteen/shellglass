@@ -724,14 +724,17 @@ function drawRowStorm(r) {
         c += w;
     }
 }
+export function ghostText(row) {
+    let text = "";
+    for (const cell of row)
+        text += cell.t && cell.t.length ? cell.t : " ";
+    return text;
+}
 function ghostRow(r) {
     const el = screen.rowEls[r];
     if (!el)
         return;
-    let text = "";
-    for (const cell of screen.cells[r] ?? [])
-        text += cell.t && cell.t.length ? cell.t : " ";
-    el.textContent = text;
+    el.textContent = ghostText(screen.cells[r] ?? []);
 }
 let ghostStale = false;
 function selectionActive() {
@@ -1262,6 +1265,8 @@ function main() {
     startStats();
     const reflowGlyphs = () => {
         resetGlyphMeasure();
+        sizeCanvas();
+        redrawCanvasAll();
         for (let r = 0; r < screen.cells.length; r++)
             dirtyRows.add(r);
         schedulePaint();

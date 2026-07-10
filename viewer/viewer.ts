@@ -1006,12 +1006,15 @@ function drawRowStorm(r: number): void {
 // textContent (not innerHTML) — no parsing, no spans, no styles; wide cells emit
 // their grapheme once and monospace CJK advances 2ch, matching the styled path's
 // column math, so a selection maps to the picture the canvas paints on top.
+export function ghostText(row: Cell[]): string {
+  let text = "";
+  for (const cell of row) text += cell.t && cell.t.length ? cell.t : " ";
+  return text;
+}
 function ghostRow(r: number): void {
   const el = screen.rowEls[r];
   if (!el) return;
-  let text = "";
-  for (const cell of screen.cells[r] ?? []) text += cell.t && cell.t.length ? cell.t : " ";
-  el.textContent = text;
+  el.textContent = ghostText(screen.cells[r] ?? []);
 }
 
 // Replacing a row's text node destroys any selection Range anchored in it — at storm
@@ -1773,6 +1776,11 @@ function main(): void {
   // over-wide glyphs (❯) get pinned to their own cell instead of eating the next char.
   const reflowGlyphs = (): void => {
     resetGlyphMeasure();
+    // Canvas metrics can go stale even when .screen's box doesn't move (a
+    // same-advance font-face swap never fires the ResizeObserver), so re-derive
+    // them and repaint the canvas alongside the DOM rows.
+    sizeCanvas();
+    redrawCanvasAll();
     for (let r = 0; r < screen.cells.length; r++) dirtyRows.add(r);
     schedulePaint();
   };
