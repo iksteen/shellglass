@@ -18,9 +18,13 @@ pub struct Config {
     /// Terminal font size in px.
     #[serde(default = "default_font_size")]
     pub font_size_px: f32,
-    /// Line-height multiple relative to `font_size_px`.
-    #[serde(default = "default_line_height")]
-    pub line_height: f32,
+    /// Line-height multiple relative to `font_size_px`. Omit to derive it from
+    /// the primary font's own metrics (ascender − descender + line gap, the way
+    /// a terminal sizes its cells — see `fonts::metric_line_height`); the CLI
+    /// resolves the omission at startup, so a `None` past setup means no font
+    /// file was readable and the 1.2 fallback applies.
+    #[serde(default)]
+    pub line_height: Option<f32>,
 
     /// Codepoint-range → font overrides. First matching entry wins.
     #[serde(default)]
@@ -86,16 +90,12 @@ where
 fn default_font_size() -> f32 {
     14.0
 }
-fn default_line_height() -> f32 {
-    1.2
-}
-
 impl Default for Config {
     fn default() -> Self {
         Config {
             default_font: default_font(),
             font_size_px: default_font_size(),
-            line_height: default_line_height(),
+            line_height: None,
             symbol_map: Vec::new(),
             fonts: HashMap::new(),
             template: None,
@@ -112,9 +112,10 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Line height in px (`font_size_px * line_height`).
+    /// Line height in px (`font_size_px * line_height`); 1.2 is the last-resort
+    /// ratio when neither the config nor a font file provided one.
     pub fn line_height_px(&self) -> f32 {
-        self.font_size_px * self.line_height
+        self.font_size_px * self.line_height.unwrap_or(1.2)
     }
 
     /// The viewer template: a configured file, else the built-in page.

@@ -3589,6 +3589,7 @@ dependencies = [
  "tokio-stream",
  "toml",
  "tower-http 0.7.0",
+ "ttf-parser",
  "tungstenite 0.29.0",
  "vt100",
 ]

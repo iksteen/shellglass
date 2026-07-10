@@ -42,6 +42,7 @@ mirror = [
     "dep:signal-hook",
     "dep:rustix",
     "dep:fontdb",
+    "dep:ttf-parser",
     "dep:toml",
     "dep:png",
     "dep:icy_sixel",
@@ -86,6 +87,7 @@ bytes = "1"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 flate2 = { version = "1", optional = true }
 fontdb = { version = "0.23", optional = true }
+ttf-parser = { version = "0.25", optional = true }
 getrandom = "0.4"
 imagesize = { version = "0.15", optional = true }
 libc = { version = "0.2", optional = true }

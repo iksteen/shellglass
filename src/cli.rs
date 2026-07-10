@@ -342,6 +342,13 @@ fn setup(source: &SourceArgs) -> Result<Setup> {
     // host (which has them installed) so we can serve them to viewers that don't.
     fonts::resolve_generics(&mut config);
     let fonts = Arc::new(fonts::collect_fonts(&config));
+    // kitty's box model: the cell derives from the font. An explicit
+    // `line_height` in the config still wins; otherwise the served font's own
+    // metrics set it, so descenders and accents fit the row by construction
+    // (line_height_px falls back to 1.2 only when no font file resolved).
+    if config.line_height.is_none() {
+        config.line_height = fonts::metric_line_height(&fonts);
+    }
     let template = Arc::new(config.template_html().context("loading viewer template")?);
     Ok(Setup {
         config: Arc::new(config),

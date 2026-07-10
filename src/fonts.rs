@@ -281,6 +281,24 @@ fn concrete_generic(db: &Database, generic: &str) -> Option<String> {
         .map(std::string::ToString::to_string)
 }
 
+/// kitty's cell height, as a multiple of the em: the primary font's hhea line
+/// advance — ascender − descender + line gap — read from the file we serve
+/// (kitty freetype.c `calc_cell_height`: FreeType's `metrics.height`, the same
+/// three hhea fields). This is how a terminal sizes its cell FROM the font, so
+/// ink fits the box by construction instead of by a blind ratio.
+#[cfg(feature = "mirror")]
+pub fn metric_line_height(fonts: &[FontFile]) -> Option<f32> {
+    let first = fonts.iter().find(|f| !f.bold)?;
+    let face = ttf_parser::Face::parse(&first.bytes, 0).ok()?;
+    let upem = f32::from(face.units_per_em());
+    if upem <= 0.0 {
+        return None;
+    }
+    let advance =
+        f32::from(face.ascender()) - f32::from(face.descender()) + f32::from(face.line_gap());
+    (advance > 0.0).then_some(advance / upem)
+}
+
 /// The concrete family fontconfig resolves a CSS generic to — i.e. the OS/user
 /// configured default. `None` if `fc-match` isn't present (macOS/Windows). Used
 /// only for the generic→family hint; fontdb still locates and serves the file.
@@ -613,6 +631,25 @@ mod tests {
                 .iter()
                 .all(|f| f.family != "Definitely Not A Font 9271" && f.family != "Ghost"),
             "unlocatable/missing fonts must not be collected"
+        );
+    }
+
+    #[test]
+    fn metric_line_height_reads_real_font_metrics() {
+        assert_eq!(metric_line_height(&[]), None, "no fonts, no ratio");
+        // Any real installed monospace: hhea advance sits in a sane band —
+        // tighter than 0.8em means a broken face, taller than 2em means we
+        // misread the table. Skip quietly on fontless CI hosts.
+        let mut cfg = Config::default();
+        crate::fonts::resolve_generics(&mut cfg);
+        let fonts = collect_fonts(&cfg);
+        if fonts.is_empty() {
+            return;
+        }
+        let ratio = metric_line_height(&fonts).expect("a served font file parses");
+        assert!(
+            (0.8..=2.0).contains(&ratio),
+            "hhea line advance out of any plausible range: {ratio}"
         );
     }
 }
