@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# A box-drawing showcase for shellglass. Run it under the viewer:
+# A rendering showcase for shellglass. Run it under the viewer:
 #
-#     shellglass serve -- ./examples/glyphs.sh
+#     shellglass serve -- ./examples/showcase.sh
 #
 # then open the printed URL. It composes one screen of terminal art — line
-# weights, corner styles, thin↔thick intersections, blocks/shades/mosaics and a
-# powerline prompt — all rendered from the font with no local install. The
-# renderer draws these as crisp device-pixel geometry, so mixed-weight junctions
-# (┿ ╂ ┝) and tiling stay sharp. Press Enter to quit.
+# weights, corner styles, thin↔thick intersections, blocks/shades/mosaics, the
+# modern SGR text styles (undercurl & friends) and a powerline prompt — all
+# rendered from the font with no local install. The renderer draws box-drawing
+# as crisp device-pixel geometry, so mixed-weight junctions (┿ ╂ ┝) and tiling
+# stay sharp. Wants ≥30 rows. Press Enter to quit.
 set -u
 export LC_ALL=${LC_ALL:-C.UTF-8}
 
@@ -123,13 +124,40 @@ at 20 24; sgr '37'; printf 'spark '; sgr '93'; printf '▁▂▄▆█▆▄▂�
 at 21 2;  sgr '37'; printf 'sextant '; sgr '95'; printf '🬀🬃🬦🬭🬹🬞🬂🬰🬔🬧🬋🬻🬕🬬🬏🬭🬤🬐🬺🬖'; printf '%s' "$RST"
 at 21 44; sgr '37'; printf 'quads '; sgr '92'; printf '▖▗▘▙▚▛▜▝▞▟'; printf '%s' "$RST"
 
+# Text styles: classic attributes, the five underline styles (SGR 4:n),
+# strikethrough, and colored underlines (SGR 58) — editor-diagnostic style.
+caption 23 2 'text styles'
+styled() { at "$1" "$2"; sgr "$3"; printf '%s' "$4"; printf '%s' "$RST"; }
+
+styled 24 2  '1'     'bold'
+styled 24 9  '2'     'dim'
+styled 24 15 '3'     'italic'
+styled 24 24 '7'     'inverse'
+styled 24 34 '9'     'strike'
+styled 24 43 '1;3;9' 'bold italic strike'
+
+styled 25 2  '4'   'single'
+styled 25 11 '4:2' 'double'
+styled 25 20 '4:3' 'curly'
+styled 25 28 '4:4' 'dotted'
+styled 25 37 '4:5' 'dashed'
+styled 25 46 '21'  'double via SGR 21'
+
+# What helix/neovim diagnostics emit: an underline with its own color (58),
+# independent of the text color.
+styled 26 2  '4:3;58;5;196'     'spellling'
+styled 26 13 '4:3;58;5;220'     'deprecated()'
+styled 26 27 '4:4;58;5;39'      'hint'
+styled 26 33 '4;58;2;0;200;120' 'truecolor line'
+styled 26 49 '9;4:3;58;5;196'   'strike + red curl'
+
 # A powerline prompt (each ► inherits the previous segment's colour).
 a=$(printf '\ue0b0')
-at 23 2
+at 28 2
 sgr '48;5;33'; sgr '38;5;15'; printf ' ingmar '
 sgr '48;5;240'; sgr '38;5;33'; printf '%s' "$a"; sgr '38;5;15'; printf ' ~/src '
 sgr '48;5;34'; sgr '38;5;240'; printf '%s' "$a"; sgr '38;5;15'; printf ' main '
 sgr '49'; sgr '38;5;34'; printf '%s' "$a"; printf '%s' "$RST"
 
-at 24 2; sgr '2;37'; printf 'Press Enter to quit.'; printf '%s' "$RST"
+at 29 2; sgr '2;37'; printf 'Press Enter to quit.'; printf '%s' "$RST"
 read -r
