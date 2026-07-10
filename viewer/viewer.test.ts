@@ -158,6 +158,11 @@ test("linkHref allowlists schemes and tolerates pruned ids", () => {
   assert.equal(linkHref(links, 2), null, "javascript: refused");
   assert.equal(linkHref(links, 3), null, "data: refused");
   assert.equal(linkHref(links, 4), "MAILTO:a@b", "scheme match is case-insensitive");
+  assert.equal(
+    linkHref({ 5: "file://host/home/x" }, 5),
+    "file://host/home/x",
+    "ls --hyperlink emits file:",
+  );
   assert.equal(linkHref(links, 9), null, "pruned id renders unlinked");
   assert.equal(linkHref(links, undefined), null);
 });

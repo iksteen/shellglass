@@ -731,7 +731,7 @@ export function linkHref(links, id) {
     const uri = links[id];
     if (!uri)
         return null;
-    return /^(https?|ftp|mailto):/i.test(uri) ? uri : null;
+    return /^(https?|ftp|mailto|file):/i.test(uri) ? uri : null;
 }
 function symbolSpan(col, w, boxStyle, font, glyph, stretch) {
     const par = stretch ? "none" : "xMidYMid meet";

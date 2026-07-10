@@ -1029,11 +1029,14 @@ function escAttr(s: string): string {
 // OSC 8 comes from whatever program runs in the mirrored session, so treat the
 // URI as hostile: only schemes that can't execute in the page are rendered as
 // anchors (javascript:/data:/vbscript: would be viewer XSS one click away).
+// file: is allowed — `ls --hyperlink` emits it for every entry, and while the
+// browser itself refuses file: navigation from web content, the hover
+// affordance and copyable href still mirror what the terminal shows.
 export function linkHref(links: Record<number, string>, id: number | undefined): string | null {
   if (id === undefined) return null;
   const uri = links[id];
   if (!uri) return null; // pruned table entry: render unlinked
-  return /^(https?|ftp|mailto):/i.test(uri) ? uri : null;
+  return /^(https?|ftp|mailto|file):/i.test(uri) ? uri : null;
 }
 
 // Emit one SVG symbol span (already-escaped glyph, precomputed boxStyle) covering w
