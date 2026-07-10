@@ -882,13 +882,17 @@ function drawRowStorm(r) {
             else {
                 ctx.fillText(cell.t, x0, baseY, x1 - x0);
             }
+        }
+        if (cell.u || cell.s) {
+            const fg = hex(cellFg(cell, curBlock));
             if (cell.u) {
                 const ulColor = resolveRgb(cell.k);
                 drawUnderline(x0, x1, typeof cell.u === "number" ? cell.u : 1, ulColor ? hex(ulColor) : fg);
-                ctx.fillStyle = fg;
             }
-            if (cell.s)
+            if (cell.s) {
+                ctx.fillStyle = fg;
                 ctx.fillRect(x0, strikeY, x1 - x0, th);
+            }
         }
         if (r === hoverRow && cell.a !== undefined && cell.a === hoverA && !cell.u) {
             drawUnderline(x0, x1, 1, hex(cellFg(cell, curBlock)));

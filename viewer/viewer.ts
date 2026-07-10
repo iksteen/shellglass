@@ -1219,14 +1219,20 @@ function drawRowStorm(r: number): void {
       } else {
         ctx.fillText(cell.t, x0, baseY, x1 - x0);
       }
-      // Decorations, DOM-parity: underline in the cell's style and SGR 58
-      // color, strikethrough through the x-height.
+    }
+    // Decorations, DOM-parity: underline in the cell's style and SGR 58
+    // color, strikethrough through the x-height. Cell-level, not inside the
+    // text branch — text-decoration doesn't break at spaces (or box glyphs).
+    if (cell.u || cell.s) {
+      const fg = hex(cellFg(cell, curBlock));
       if (cell.u) {
         const ulColor = resolveRgb(cell.k);
         drawUnderline(x0, x1, typeof cell.u === "number" ? cell.u : 1, ulColor ? hex(ulColor) : fg);
-        ctx.fillStyle = fg; // drawUnderline may have changed it
       }
-      if (cell.s) ctx.fillRect(x0, strikeY, x1 - x0, th);
+      if (cell.s) {
+        ctx.fillStyle = fg;
+        ctx.fillRect(x0, strikeY, x1 - x0, th);
+      }
     }
     // kitty's hover affordance — cell-level, so spaces inside a link underline too
     if (r === hoverRow && cell.a !== undefined && cell.a === hoverA && !cell.u) {

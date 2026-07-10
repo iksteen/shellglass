@@ -119,6 +119,24 @@ def main():
         med = sorted(cols)[len(cols) // 2]
         seams = sum(1 for v in cols if v < med * 0.5)
         print(f"bg seam check ({label}): {'PASS' if seams == 0 else f'FAIL ({seams} dark cols)'}")
+    # Decoration continuity at SPACES: rows 5 (underline) and 9 (strike)
+    # style their first 18 cells including the spaces between words — the
+    # line must run through the space cells (text-decoration doesn't break
+    # at spaces). Only space cells are scanned: over glyphs, Firefox's
+    # text-decoration-skip-ink legitimately lifts the DOM underline around
+    # descenders (kitty's underline exclusion zones are the terminal
+    # equivalent; the canvas draws straight through — not checked here).
+    for label, img in (("dom", dom), ("storm", storm)):
+        px = img.load()
+        gaps = []
+        for r, cols_ in ((5, (9, 13)), (9, (13,))):
+            y0, y1 = r * LH, (r + 1) * LH
+            for col in cols_:
+                for x in range(int(col * 8.4) + 2, int((col + 1) * 8.4) - 2):
+                    if all(sum(px[x, y][:3]) <= 60 for y in range(y0, y1)):
+                        gaps.append((r, x))
+        print(f"decoration continuity ({label}): "
+              f"{'PASS' if not gaps else f'FAIL ({len(gaps)} empty cols, first {gaps[0]})'}")
     for name, path in (("links", c), ("crt", e), ("image", f), ("cursor", h), ("bleed", j)):
         lr, lg, lb = Image.open(path).convert("RGB").load()[20, 20]
         print(f"{name} self-check: {'PASS' if lg > 200 and lr < 60 else 'FAIL'}")
