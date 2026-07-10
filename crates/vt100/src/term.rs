@@ -124,6 +124,8 @@ pub struct Attrs {
     underline_style: Option<u8>,
     strikethrough: Option<bool>,
     inverse: Option<bool>,
+    // shellglass: conceal (SGR 8/28)
+    concealed: Option<bool>,
 }
 
 impl Attrs {
@@ -169,6 +171,12 @@ impl Attrs {
         self.inverse = Some(inverse);
         self
     }
+
+    // shellglass
+    pub fn concealed(mut self, concealed: bool) -> Self {
+        self.concealed = Some(concealed);
+        self
+    }
 }
 
 impl BufWrite for Attrs {
@@ -183,6 +191,7 @@ impl BufWrite for Attrs {
             && self.underline_style.is_none()
             && self.strikethrough.is_none()
             && self.inverse.is_none()
+            && self.concealed.is_none()
         {
             return;
         }
@@ -289,6 +298,16 @@ impl BufWrite for Attrs {
                 write_param!(9);
             } else {
                 write_param!(29);
+            }
+        }
+
+        // shellglass: conceal — re-emitted so the SSH view's real terminal
+        // applies its own hiding.
+        if let Some(concealed) = self.concealed {
+            if concealed {
+                write_param!(8);
+            } else {
+                write_param!(28);
             }
         }
 

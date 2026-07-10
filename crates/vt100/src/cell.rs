@@ -236,4 +236,12 @@ impl<T> Cell<T> {
     pub fn inverse(&self) -> bool {
         self.attrs.inverse()
     }
+
+    /// Returns whether the cell is concealed (SGR 8/28) — the contents stay
+    /// in the buffer, but a renderer must not draw the glyph.
+    // shellglass
+    #[must_use]
+    pub fn concealed(&self) -> bool {
+        self.attrs.concealed()
+    }
 }

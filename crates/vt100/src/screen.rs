@@ -1669,6 +1669,9 @@ impl<T> Screen<T> {
                     self.attrs.set_underline_style(to_u8!(*n));
                 }
                 [7] => self.attrs.set_inverse(true),
+                // shellglass: conceal (ECMA-48 "hidden"; kitty ignores it,
+                // most other terminals blank the glyph — see attrs.rs)
+                [8] => self.attrs.set_concealed(true),
                 // shellglass: strikethrough
                 [9] => self.attrs.set_strikethrough(true),
                 // shellglass: double underline (ECMA-48; kitty renders it)
@@ -1677,6 +1680,8 @@ impl<T> Screen<T> {
                 [23] => self.attrs.set_italic(false),
                 [24] => self.attrs.set_underline(false),
                 [27] => self.attrs.set_inverse(false),
+                // shellglass: conceal off (reveal)
+                [28] => self.attrs.set_concealed(false),
                 // shellglass: strikethrough off
                 [29] => self.attrs.set_strikethrough(false),
                 [n] if (30..=37).contains(n) => {

@@ -74,3 +74,30 @@ fn modern_sgr_formatted_roundtrip() {
         assert_eq!(a.ulcolor(), b.ulcolor(), "col {col}");
     }
 }
+
+// shellglass: conceal (SGR 8/28) — set, reveal, SGR-0 reset, and the repaint
+// path re-emitting 8 so a downstream terminal (the SSH view) hides it too.
+#[test]
+fn conceal() {
+    let mut vt = vt100::Parser::default();
+    vt.process(b"\x1b[8ma\x1b[28mb\x1b[8mc\x1b[md");
+    let concealed = |vt: &vt100::Parser, col: u16| {
+        vt.screen().cell(0, col).unwrap().concealed()
+    };
+    assert!(concealed(&vt, 0), "SGR 8 conceals");
+    assert!(!concealed(&vt, 1), "SGR 28 reveals");
+    assert!(concealed(&vt, 2), "re-conceal");
+    assert!(!concealed(&vt, 3), "SGR 0 resets conceal");
+    // the buffer keeps the real characters — only rendering hides them
+    assert_eq!(vt.screen().contents(), "abcd");
+
+    let mut vt2 = vt100::Parser::default();
+    vt2.process(&vt.screen().contents_formatted());
+    for col in 0..4 {
+        assert_eq!(
+            concealed(&vt, col),
+            concealed(&vt2, col),
+            "formatted roundtrip, col {col}"
+        );
+    }
+}

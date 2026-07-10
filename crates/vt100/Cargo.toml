@@ -37,6 +37,12 @@
 #     underline bit became a 3-bit style; formatted output emits 4/24 for
 #     single/off (byte-compatible) and 4:n only for fancy styles. Tests in
 #     tests/attr.rs (modern_sgr*).
+#   - attrs.rs/term.rs/screen.rs/cell.rs: conceal (SGR 8/28) — Attrs::mode
+#     widened to u16 (the low byte was full); buffer keeps the characters,
+#     Cell::concealed() tells renderers to hide the glyph; formatted output
+#     re-emits 8/28. Deliberate deviation from kitty, which ignores SGR 8:
+#     a mirror SHOWING text the local terminal hides is a content leak.
+#     Tests in tests/attr.rs (conceal).
 #   - screen.rs/perform.rs: DECSCUSR (`CSI n SP q`) cursor style — raw 0-6
 #     tracked on Screen (cursor_style()), reset by DECSTR and RIS; out-of-range
 #     values stay unhandled. Tests in tests/csi.rs (decscusr).

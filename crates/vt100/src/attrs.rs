@@ -14,18 +14,24 @@ pub enum Color {
     Rgb(u8, u8, u8),
 }
 
-const TEXT_MODE_INTENSITY: u8 = 0b0000_0011;
-const TEXT_MODE_BOLD: u8 = 0b0000_0001;
-const TEXT_MODE_DIM: u8 = 0b0000_0010;
-const TEXT_MODE_ITALIC: u8 = 0b0000_0100;
+// shellglass: widened to u16 when conceal landed — the low byte was full.
+const TEXT_MODE_INTENSITY: u16 = 0b0000_0011;
+const TEXT_MODE_BOLD: u16 = 0b0000_0001;
+const TEXT_MODE_DIM: u16 = 0b0000_0010;
+const TEXT_MODE_ITALIC: u16 = 0b0000_0100;
 // shellglass: upstream's underline bit became strikethrough; underline moved
 // to the 3-bit style field below (0 = no underline).
-const TEXT_MODE_STRIKETHROUGH: u8 = 0b0000_1000;
-const TEXT_MODE_INVERSE: u8 = 0b0001_0000;
+const TEXT_MODE_STRIKETHROUGH: u16 = 0b0000_1000;
+const TEXT_MODE_INVERSE: u16 = 0b0001_0000;
 // shellglass: underline style (SGR 4:n / 21 / 24), kitty's numbering — 0 none,
 // 1 single, 2 double, 3 curly, 4 dotted, 5 dashed.
-const TEXT_MODE_UNDERLINE_SHIFT: u8 = 5;
-const TEXT_MODE_UNDERLINE: u8 = 0b1110_0000;
+const TEXT_MODE_UNDERLINE_SHIFT: u16 = 5;
+const TEXT_MODE_UNDERLINE: u16 = 0b1110_0000;
+// shellglass: conceal (SGR 8/28) — ECMA-48 "hidden"; most terminals blank the
+// glyph (xterm, foot, alacritty, wezterm). kitty ignores SGR 8 entirely (its
+// SGR table has no case 8), a documented deviation we do NOT copy: the mirror
+// showing text a concealing terminal hides is a content leak.
+const TEXT_MODE_CONCEALED: u16 = 0b1_0000_0000;
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Attrs {
@@ -39,7 +45,7 @@ pub struct Attrs {
     // SGR 0 (hyperlinks are independent of SGR; see sgr()/decstr()), and
     // Cell::clear strips it so erased cells are never clickable.
     pub link: Option<std::num::NonZeroU32>,
-    pub mode: u8,
+    pub mode: u16,
 }
 
 impl Attrs {
@@ -51,7 +57,7 @@ impl Attrs {
         self.mode & TEXT_MODE_DIM != 0
     }
 
-    fn intensity(&self) -> u8 {
+    fn intensity(&self) -> u16 {
         self.mode & TEXT_MODE_INTENSITY
     }
 
@@ -91,14 +97,17 @@ impl Attrs {
 
     // shellglass: 0 none, 1 single, 2 double, 3 curly, 4 dotted, 5 dashed.
     pub fn underline_style(&self) -> u8 {
-        (self.mode & TEXT_MODE_UNDERLINE) >> TEXT_MODE_UNDERLINE_SHIFT
+        u8::try_from(
+            (self.mode & TEXT_MODE_UNDERLINE) >> TEXT_MODE_UNDERLINE_SHIFT,
+        )
+        .expect("3-bit field")
     }
 
     pub fn set_underline_style(&mut self, style: u8) {
         debug_assert!(style <= 5);
         self.mode &= !TEXT_MODE_UNDERLINE;
-        self.mode |=
-            (style << TEXT_MODE_UNDERLINE_SHIFT) & TEXT_MODE_UNDERLINE;
+        self.mode |= (u16::from(style) << TEXT_MODE_UNDERLINE_SHIFT)
+            & TEXT_MODE_UNDERLINE;
     }
 
     // shellglass: strikethrough (SGR 9/29).
@@ -123,6 +132,19 @@ impl Attrs {
             self.mode |= TEXT_MODE_INVERSE;
         } else {
             self.mode &= !TEXT_MODE_INVERSE;
+        }
+    }
+
+    // shellglass: conceal (SGR 8/28).
+    pub fn concealed(&self) -> bool {
+        self.mode & TEXT_MODE_CONCEALED != 0
+    }
+
+    pub fn set_concealed(&mut self, concealed: bool) {
+        if concealed {
+            self.mode |= TEXT_MODE_CONCEALED;
+        } else {
+            self.mode &= !TEXT_MODE_CONCEALED;
         }
     }
 
@@ -183,6 +205,12 @@ impl Attrs {
             attrs
         } else {
             attrs.inverse(self.inverse())
+        };
+        // shellglass: conceal
+        let attrs = if self.concealed() == other.concealed() {
+            attrs
+        } else {
+            attrs.concealed(self.concealed())
         };
 
         attrs.write_buf(contents);
