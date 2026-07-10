@@ -26,6 +26,8 @@ jobs:
   create-release:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v7
+
       - env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -33,7 +35,14 @@ jobs:
             echo "::error::Release $GITHUB_REF_NAME already exists — refusing to overwrite. Delete it and re-tag to re-release."
             exit 1
           fi
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag
+          # The tag annotation IS the release: subject → title, body → notes.
+          # Re-fetch the tag first — actions/checkout peels annotated tags to
+          # their commit, which would leave the annotation unreachable.
+          git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          title="$(git tag -l --format='%(contents:subject)' "$GITHUB_REF_NAME")"
+          git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME" > /tmp/release-notes.md
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$title" --notes-file /tmp/release-notes.md
 
   build:
     name: ${{ matrix.target }}
