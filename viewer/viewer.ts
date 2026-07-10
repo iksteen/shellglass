@@ -1012,15 +1012,15 @@ function canvasModeOn(): boolean {
     }
     renderPref = stored
       ? stored === "on"
-      : new URLSearchParams(location.search).get("render") === "canvas";
+      : new URLSearchParams(location.search).get("render") !== "dom"; // canvas is the default
   }
   return renderPref;
 }
 
 // The storm toggle: gates DOM mode's AUTO-escalation to canvas under load
-// (default on). Off = the DOM renderer never leaves the DOM — full text
-// semantics (real links, selection, find) at whatever frame rate the DOM
-// manages. Ignored in canvas mode, which pins storm explicitly.
+// (opt-in; off by default). Off = the DOM renderer never leaves the DOM —
+// full text semantics (real links, selection, find) at whatever frame rate
+// the DOM manages. Ignored in canvas mode, which pins storm explicitly.
 let stormBox: HTMLInputElement | null | undefined;
 let stormPref: boolean | undefined;
 function stormAutoOn(): boolean {
@@ -1042,7 +1042,7 @@ function stormAutoOn(): boolean {
     }
     stormPref = stored
       ? stored === "on"
-      : new URLSearchParams(location.search).get("storm") !== "off";
+      : new URLSearchParams(location.search).get("storm") === "on"; // opt-in
   }
   return stormPref;
 }

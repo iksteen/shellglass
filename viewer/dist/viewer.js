@@ -710,7 +710,7 @@ function canvasModeOn() {
         }
         renderPref = stored
             ? stored === "on"
-            : new URLSearchParams(location.search).get("render") === "canvas";
+            : new URLSearchParams(location.search).get("render") !== "dom";
     }
     return renderPref;
 }
@@ -735,7 +735,7 @@ function stormAutoOn() {
         }
         stormPref = stored
             ? stored === "on"
-            : new URLSearchParams(location.search).get("storm") !== "off";
+            : new URLSearchParams(location.search).get("storm") === "on";
     }
     return stormPref;
 }

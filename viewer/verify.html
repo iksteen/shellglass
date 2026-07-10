@@ -11,6 +11,10 @@
   .row { position:relative; height:var(--lh); contain:layout style; }
   .run { position:absolute; top:0; height:var(--lh); overflow:hidden; }
 </style></head><body>
+<!-- explicit renderer state: canvas is the viewer's default now, and the rig's
+     dom/storm split must not depend on defaults — modes force storm via benchStorm -->
+<input type="checkbox" id="render" hidden>
+<input type="checkbox" id="storm" hidden>
 <input type="checkbox" id="crt" hidden>
 <div id="screen"></div>
 <script type="module">

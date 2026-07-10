@@ -23,12 +23,13 @@ const ROWS = Number(q.get("rows") ?? 60);
 const SECONDS = Number(q.get("secs") ?? 5);
 
 setConfig({ defFg: "#d0d0d0", defBg: "#000000", fillFont: "monospace", sym: [] });
-// exercise the real toggles: the viewer reads these checkboxes
-if (MODE === "canvas" || MODE === "dom-nostorm") {
+// Exercise the real toggles: the viewer reads these checkboxes. Both are
+// explicit — canvas is the viewer's DEFAULT now, so the dom modes must opt
+// out, and 'dom' opts back into the (default-off) storm escalation it
+// benchmarks.
+for (const [id, on] of [["render", MODE === "canvas"], ["storm", MODE === "dom"]]) {
   const c = document.createElement("input");
-  c.type = "checkbox"; c.id = MODE === "canvas" ? "render" : "storm";
-  c.checked = MODE === "canvas"; // #storm unchecked = escalation off
-  c.hidden = true;
+  c.type = "checkbox"; c.id = id; c.checked = on; c.hidden = true;
   document.body.appendChild(c);
 }
 benchInit(document.getElementById("screen"));

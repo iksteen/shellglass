@@ -256,16 +256,16 @@ powerline rendering by serving kitty's bundled `Symbols Nerd Font Mono` as a fal
 The built-in page is a dark chrome with two nav toggles, each off by default and
 remembered per browser in localStorage:
 
-- **canvas** — the renderer switch (also `?render=canvas`). Off = the classic DOM
-  renderer, which still escalates to the canvas by itself under full-screen animation
-  load (the footer tags it `storm`). On = every update paints on the canvas
-  (footer tag `canvas`); the DOM stays underneath as transparent ghost text, so
-  select/copy/find keep working. Canvas mode is markedly faster under heavy,
-  fragmented output; the DOM mode remains the fidelity reference.
-- **storm** — on by default; gates DOM mode's automatic escalation to the canvas
-  under full-screen animation load (also `?storm=off`). Turn it off to keep the
-  full DOM text semantics — real links, native selection and find — at whatever
-  frame rate the DOM manages. Ignored in canvas mode.
+- **canvas** — the renderer switch, **on by default** (`?render=dom` flips a fresh
+  browser to DOM mode). On = every update paints on the canvas (footer tag
+  `canvas`), rendered by the terminal's own rules — ink seated inside the cell
+  box, decorations clamped into the cell — with the DOM underneath as transparent
+  ghost text so select/copy/find keep working. Off = the classic CSS-native DOM
+  renderer: real links, native selection and find.
+- **storm** — only shown in DOM mode; off by default (`?storm=on` opts in). Gates
+  DOM mode's automatic escalation to the canvas under full-screen animation load
+  (footer tag `storm`). Leave it off to keep full DOM text semantics at whatever
+  frame rate the DOM manages.
 - **CRT** — a CRT tube effect (scanlines, phosphor bloom, flicker, vignette; also
   `?crt`). Works in both renderer modes.
 
