@@ -3,7 +3,9 @@
 # local changes as separate commits on top of the vendor commit so the diff
 # against upstream stays reviewable. Local patches (keep this list current):
 #   - lib.rs: dropped `#![warn(clippy::cargo)]` (host-workspace metadata lints
-#     don't apply to a vendored, unpublished crate).
+#     don't apply to a vendored, unpublished crate); rust-version raised from
+#     upstream's 1.70 to the workspace toolchain — the old claim made cargo's
+#     MSRV-aware resolver downgrade the whole dependency tree.
 #   - screen.rs/perform.rs: SCOSC/SCORC (bare `CSI s` / `CSI u`) save/restore
 #     cursor — position + origin mode only, not attributes; save slot shared
 #     with DECSC like xterm. Tests in tests/csi.rs (scosc_scorc).
@@ -73,7 +75,7 @@ name = "vt100"
 version = "0.16.2"
 authors = ["Jesse Luehrs <doy@tozt.net>"]
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.85"
 publish = false
 
 description = "Library for parsing terminal data (vendored + patched for shellglass)"
