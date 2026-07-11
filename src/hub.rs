@@ -784,9 +784,16 @@ fn view_base(headers: &HeaderMap, configured: &str) -> String {
     let (def_scheme, def_host) = configured
         .split_once("://")
         .map_or(("http", configured), |(s, h)| (s, h));
-    let scheme = fwd("x-forwarded-proto")
+    let scheme = match fwd("x-forwarded-proto")
         .filter(|s| !s.is_empty())
-        .unwrap_or(def_scheme);
+        .unwrap_or(def_scheme)
+    {
+        // These headers ride the /push WebSocket upgrade, where proxies report
+        // the WS scheme — but the view link is a plain HTTP(S) page.
+        "wss" => "https",
+        "ws" => "http",
+        s => s,
+    };
     let host = fwd("x-forwarded-host")
         .or_else(|| header_str(headers, "host"))
         .filter(|s| !s.is_empty())
@@ -1441,6 +1448,17 @@ mod tests {
         );
         h.insert("host", "internal:8080".parse().unwrap());
         assert_eq!(view_base(&h, cfg), "https://hub.example.com");
+
+        // The headers ride the /push WebSocket upgrade, where a proxy reports
+        // ws/wss — the view link is an HTTP(S) page, so the scheme maps over.
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-proto", "wss".parse().unwrap());
+        h.insert("x-forwarded-host", "hub.example.com".parse().unwrap());
+        assert_eq!(view_base(&h, cfg), "https://hub.example.com");
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-proto", "ws".parse().unwrap());
+        h.insert("host", "example.com".parse().unwrap());
+        assert_eq!(view_base(&h, cfg), "http://example.com");
     }
 
     // ── management API (router-level) ─────────────────────────────────────────
