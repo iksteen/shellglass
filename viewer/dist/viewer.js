@@ -793,7 +793,7 @@ function drawBoosted(g, k, draw) {
     }
 }
 function drawRowImages(p) {
-    for (const { ref, el } of screenImages) {
+    for (const { ref, el } of heldImages.concat(screenImages)) {
         const natW = el.naturalWidth;
         const natH = el.naturalHeight;
         if (!el.complete || !natW || !natH)
@@ -1201,7 +1201,15 @@ function svgFont(cell) {
 }
 let screen = { cells: [], cur: null, sty: 0, links: {}, rowEls: [] };
 let screenImages = [];
+let heldImages = [];
 let screenEl;
+function refsOverlap(a, b) {
+    const aw = a.w ?? 1, ah = a.h ?? 1, bw = b.w ?? 1, bh = b.h ?? 1;
+    return a.r < b.r + bh && b.r < a.r + ah && a.c < b.c + bw && b.c < a.c + aw;
+}
+function pruneHeld() {
+    heldImages = heldImages.filter((o) => screenImages.some((n) => !n.el.complete && refsOverlap(o.ref, n.ref)));
+}
 export function patchCells(state, dp) {
     const dirty = new Set();
     if (dp.cur !== undefined) {
@@ -1330,11 +1338,13 @@ function paintFull(dims) {
     attachCanvas(dims.w, dims.h, screenDiv);
     blinkRows.clear();
     redrawCanvasAll();
+    const prev = screenImages.concat(heldImages);
     screenImages = (dims.i ?? []).map((ref) => {
         const anchor = screen.rowEls[Math.min(Math.max(ref.r, 0), screen.rowEls.length - 1)];
         anchor.insertAdjacentHTML(ref.r < 0 ? "beforebegin" : "afterend", renderImage(ref));
         const el = (ref.r < 0 ? anchor.previousElementSibling : anchor.nextElementSibling);
         el.addEventListener("load", () => {
+            pruneHeld();
             redrawCanvasAll();
             if (el.src.startsWith("data:"))
                 return;
@@ -1353,6 +1363,9 @@ function paintFull(dims) {
         });
         return { ref, el };
     });
+    heldImages = prev.filter((o) => o.el.complete &&
+        o.el.naturalWidth > 0 &&
+        screenImages.some((n) => !n.el.complete && refsOverlap(o.ref, n.ref)));
 }
 function renderImage(im) {
     const sized = im.w && im.h;

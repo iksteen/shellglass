@@ -142,7 +142,11 @@ pub fn start(command: &[String]) -> Result<(watch::Receiver<Arc<Frame>>, Notifie
         let _ = out.flush();
     }
     let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
-    let (frame_tx, frame_rx) = watch::channel(frame_from(&new_parser(rows, cols), &mut Vec::new()));
+    let (frame_tx, frame_rx) = watch::channel(frame_from(
+        &new_parser(rows, cols),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    ));
 
     // PTY reader → screen thread.
     {
@@ -306,6 +310,9 @@ fn screen_thread(
     let mut interceptor = Interceptor::with(intercept.0, intercept.1, intercept.2);
     let mut sync = SyncGate::new();
     let mut images: Vec<Placed> = Vec::new();
+    // Ready-but-overwritten placements held for the double-buffer swap
+    // (see resolve_images): shown until their pending successor's bytes land.
+    let mut zombies: Vec<Placed> = Vec::new();
     let mut image_seq = std::num::NonZeroU32::MIN;
     loop {
         let msg = if dirty {
@@ -428,7 +435,7 @@ fn screen_thread(
             None => {}    // frame due
         }
         if dirty && last_frame.elapsed() >= MIN_FRAME && !sync.hold(parser.screen()) {
-            let _ = frame_tx.send(frame_from(&parser, &mut images));
+            let _ = frame_tx.send(frame_from(&parser, &mut images, &mut zombies));
             dirty = false;
             last_frame = Instant::now();
         }
@@ -713,17 +720,37 @@ fn stamp_image(
 /// Snapshot the PTY screen as a [`Frame`], resolving each tracked image's tagged
 /// cells to its current position and dropping images with no covered cell left
 /// (scrolled off the top, cleared, or overwritten).
-fn frame_from(parser: &SgParser, images: &mut Vec<Placed>) -> Arc<Frame> {
+fn frame_from(
+    parser: &SgParser,
+    images: &mut Vec<Placed>,
+    zombies: &mut Vec<Placed>,
+) -> Arc<Frame> {
     let mut grid = crate::parse::grid_from_screen(parser.screen());
-    grid.images = resolve_images(parser.screen(), images);
+    grid.images = resolve_images(parser.screen(), images, zombies);
     grid.image_data = images
         .iter()
+        .chain(zombies.iter())
         .filter_map(|p| {
             let (hash, blob) = p.ready.as_ref()?;
             Some((hash.clone(), blob.clone()))
         })
         .collect();
     Arc::new(Frame::Screen(grid))
+}
+
+/// The stamped cell rectangles of two placements overlap.
+fn rects_overlap(a: &Placed, b: &Placed) -> bool {
+    let (ar, ac) = (i32::from(a.row), i32::from(a.col));
+    let (br, bc) = (i32::from(b.row), i32::from(b.col));
+    let (aw, ah) = (
+        i32::from(a.cols.unwrap_or(1)),
+        i32::from(a.rows.unwrap_or(1)),
+    );
+    let (bw, bh) = (
+        i32::from(b.cols.unwrap_or(1)),
+        i32::from(b.rows.unwrap_or(1)),
+    );
+    ar < br + bh && br < ar + ah && ac < bc + bw && bc < ac + aw
 }
 
 /// For each tracked image, find its surviving tagged cells in the parser grid and
@@ -733,9 +760,18 @@ fn frame_from(parser: &SgParser, images: &mut Vec<Placed>) -> Arc<Frame> {
 /// the viewer clips it). Drop images with no surviving cell — fully scrolled off,
 /// cleared, or wholly overwritten, which is exactly when the terminal no longer
 /// shows any part of them either.
+///
+/// EXCEPT the double-buffer case: a READY image wholly overwritten by a still-
+/// PENDING one (sixel video: frame N+1's stamp evicts frame N before its bytes
+/// arrive) becomes a ZOMBIE — emitted with frozen coordinates until a pending
+/// placement no longer overlaps its rect (the successor's bytes landed, or it
+/// died too). Without it, every video frame flashes an image-less full at
+/// viewers. A clear/overwrite with no pending successor drops the image
+/// instantly, so nothing lingers that the terminal doesn't also show.
 fn resolve_images(
     screen: &vt100::Screen<ImgCell>,
     images: &mut Vec<Placed>,
+    zombies: &mut Vec<Placed>,
 ) -> Vec<ImagePlacement> {
     if !images.is_empty() {
         // One pass over the grid (not one per image, and skipped entirely in the
@@ -758,20 +794,49 @@ fn resolve_images(
             }
         }
         let mut best = best.into_iter();
+        let mut evicted = Vec::new();
         images.retain_mut(|p| {
             let Some(Some((dr, dc, r, c))) = best.next() else {
+                evicted.push(std::mem::replace(
+                    p,
+                    Placed {
+                        id: p.id,
+                        row: 0,
+                        col: 0,
+                        cols: None,
+                        rows: None,
+                        ready: None,
+                    },
+                ));
                 return false; // every covered cell gone → evict
             };
             p.row = i16::try_from(r).unwrap_or(i16::MAX) - i16::try_from(dr).unwrap_or(i16::MAX);
             p.col = c.saturating_sub(dc);
             true
         });
+        // Evicted-but-ready placements overlapped by a pending successor keep
+        // showing (frozen where they last resolved) until the swap completes.
+        zombies.extend(evicted.into_iter().filter(|z| {
+            z.ready.is_some()
+                && images
+                    .iter()
+                    .any(|p| p.ready.is_none() && rects_overlap(z, p))
+        }));
     }
-    // Pending placements (decode worker still owes the bytes) stay tracked —
-    // their cells live in the grid — but are not emitted: a frame must never
+    // A zombie lives exactly as long as some pending placement overlaps it.
+    zombies.retain(|z| {
+        images
+            .iter()
+            .any(|p| p.ready.is_none() && rects_overlap(z, p))
+    });
+    // Emit zombies FIRST: a live placement covering the same cells must paint
+    // over its predecessor, and the viewer draws the list in order. Pending
+    // placements (decode worker still owes the bytes) stay tracked — their
+    // cells live in the grid — but are not emitted: a frame must never
     // reference a hash no server can satisfy.
-    images
+    zombies
         .iter()
+        .chain(images.iter())
         .filter_map(|p| {
             let (hash, _) = p.ready.as_ref()?;
             Some(ImagePlacement {
@@ -1168,7 +1233,7 @@ mod tests {
         let mut parser = new_parser(24, 80);
         let mut images = place(&mut parser, 4, 2);
         images[0].ready = None; // decode worker still owes the payload
-        let Frame::Screen(g) = &*frame_from(&parser, &mut images) else {
+        let Frame::Screen(g) = &*frame_from(&parser, &mut images, &mut Vec::new()) else {
             panic!("screen frame")
         };
         assert!(g.images.is_empty(), "pending placement not emitted");
@@ -1183,12 +1248,85 @@ mod tests {
                 bytes: bytes::Bytes::from_static(b"png-ish"),
             },
         ));
-        let Frame::Screen(g) = &*frame_from(&parser, &mut images) else {
+        let Frame::Screen(g) = &*frame_from(&parser, &mut images, &mut Vec::new()) else {
             panic!("screen frame")
         };
         assert_eq!(g.images.len(), 1);
         assert_eq!(g.images[0].hash, "cd".repeat(32));
         assert!(g.image_data.contains_key(&"cd".repeat(32)));
+    }
+
+    // The double-buffer swap (sixel video): a READY image overwritten by a
+    // PENDING successor keeps showing — frozen — until the successor's bytes
+    // land, then swaps atomically. Viewers never see an image-less gap
+    // between video frames. An overwrite with no pending successor (a clear)
+    // still vanishes immediately.
+    #[test]
+    fn ready_image_zombies_until_pending_successor_lands() {
+        let mut parser = new_parser(24, 80);
+        let mut zombies: Vec<Placed> = Vec::new();
+        // Frame N: ready, on screen.
+        let mut images = place(&mut parser, 4, 2);
+        images[0].ready = Some((
+            "aa".repeat(32),
+            crate::model::ImageBlob {
+                mime: "image/png".into(),
+                bytes: bytes::Bytes::from_static(b"N"),
+            },
+        ));
+        // Frame N+1: stamped over the same cells, decode pending. `place`
+        // reuses id MIN, so give the successor its own id.
+        parser.process(b"\x1b[H");
+        let id2 = std::num::NonZeroU32::new(2).unwrap();
+        parser
+            .screen_mut()
+            .place_data(4, 2, |row_off, col_off| ImgCell {
+                id: id2,
+                row_off,
+                col_off,
+            });
+        images.push(Placed {
+            id: id2,
+            row: 0,
+            col: 0,
+            cols: Some(4),
+            rows: Some(2),
+            ready: None,
+        });
+
+        // N's cells are gone, but N keeps showing (zombie) while N+1 pends.
+        let Frame::Screen(g) = &*frame_from(&parser, &mut images, &mut zombies) else {
+            panic!("screen frame")
+        };
+        assert_eq!(g.images.len(), 1, "the old frame bridges the gap");
+        assert_eq!(g.images[0].hash, "aa".repeat(32));
+        assert!(
+            g.image_data.contains_key(&"aa".repeat(32)),
+            "zombie payload still rides the frame"
+        );
+
+        // N+1's bytes land → atomic swap: N gone, N+1 shown.
+        images.iter_mut().find(|p| p.id == id2).unwrap().ready = Some((
+            "bb".repeat(32),
+            crate::model::ImageBlob {
+                mime: "image/png".into(),
+                bytes: bytes::Bytes::from_static(b"N+1"),
+            },
+        ));
+        let Frame::Screen(g) = &*frame_from(&parser, &mut images, &mut zombies) else {
+            panic!("screen frame")
+        };
+        assert_eq!(g.images.len(), 1, "swap complete");
+        assert_eq!(g.images[0].hash, "bb".repeat(32));
+        assert!(zombies.is_empty(), "zombie released");
+
+        // A plain overwrite (no pending successor) vanishes immediately.
+        parser.process(b"\x1b[2J");
+        let Frame::Screen(g) = &*frame_from(&parser, &mut images, &mut zombies) else {
+            panic!("screen frame")
+        };
+        assert!(g.images.is_empty(), "cleared image gone, no zombie");
+        assert!(zombies.is_empty());
     }
 
     /// The tagged cells ride vt100's own scrolling: the reported top row falls
@@ -1200,28 +1338,28 @@ mod tests {
         parser.process(b"\r\n\r\n"); // cursor to the last row
         // Placing a 2-row image at the bottom scrolls once mid-placement.
         let mut imgs = place(&mut parser, 2, 2);
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs) else {
+        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new()) else {
             panic!("screen")
         };
         assert_eq!((g.images[0].row, g.images[0].col), (1, 0));
 
         // One scroll lifts the image → top row 0.
         parser.process(b"\r\nx");
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs) else {
+        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new()) else {
             panic!("screen")
         };
         assert_eq!(g.images[0].row, 0);
 
         // Another: top row scrolls off → top row -1, image still shown (clipped).
         parser.process(b"\r\ny");
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs) else {
+        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new()) else {
             panic!("screen")
         };
         assert_eq!(g.images[0].row, -1);
 
         // One more: the bottom row is gone too → the image is evicted.
         parser.process(b"\r\nz");
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs) else {
+        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new()) else {
             panic!("screen")
         };
         assert!(g.images.is_empty());
@@ -1239,7 +1377,7 @@ mod tests {
 
         // A prompt repaints the bottom row, clobbering both of its image cells.
         parser.process(b"user@host$");
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs) else {
+        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new()) else {
             panic!("screen")
         };
         // Still tracked, via the top row's cells, at its true top row.
@@ -1258,7 +1396,7 @@ mod tests {
 
         // The prompt covers cols 0..11 — cells 11..20 survive.
         parser.process(b"user@host$ ");
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs) else {
+        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new()) else {
             panic!("screen")
         };
         assert_eq!(g.images.len(), 1);
@@ -1275,7 +1413,7 @@ mod tests {
         let mut imgs = place(&mut parser, 3, 1);
         // Overwrite the leftmost and rightmost image cells; the middle survives.
         parser.process(b"x\x1b[3Gy");
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs) else {
+        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new()) else {
             panic!("screen")
         };
         assert_eq!(g.images.len(), 1);
@@ -1290,7 +1428,7 @@ mod tests {
         let mut parser = new_parser(4, 30);
         parser.process("日本語 ".as_bytes()); // three wide glyphs + a space → col 7
         let mut imgs = place(&mut parser, 2, 2);
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs) else {
+        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new()) else {
             panic!("screen")
         };
         assert_eq!((g.images[0].row, g.images[0].col), (0, 7));
@@ -1307,7 +1445,7 @@ mod tests {
 
         // An 11-char prompt paints across the entire image row.
         parser.process(b"user@host$ ");
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs) else {
+        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new()) else {
             panic!("screen")
         };
         assert!(g.images.is_empty());

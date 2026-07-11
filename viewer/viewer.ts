@@ -1193,7 +1193,8 @@ function drawBoosted(g: CanvasRenderingContext2D, k: number, draw: () => void): 
 // Image slices for this band, under the glyphs. Contain-fit anchored
 // top-left (same math as the hidden <img>'s layout rule), one uniform scale.
 function drawRowImages(p: RowPaint): void {
-  for (const { ref, el } of screenImages) {
+  // Held predecessors draw first (under), current images after (over).
+  for (const { ref, el } of heldImages.concat(screenImages)) {
     const natW = el.naturalWidth;
     const natH = el.naturalHeight;
     if (!el.complete || !natW || !natH) continue;
@@ -1761,7 +1762,28 @@ let screen: ScreenState = { cells: [], cur: null, sty: 0, links: {}, rowEls: [] 
 // UNDER the glyphs, so text painted over an image wins — like a real cell
 // terminal. Rebuilt on every full frame (images ride only fulls).
 let screenImages: { ref: ImageRef; el: HTMLImageElement }[] = [];
+// The PREVIOUS frame's decoded images, held (and drawn UNDER the current
+// list) for any region whose replacement is still fetching — the client half
+// of the flicker-free swap: the wire bridges the encode gap with the old
+// placement, this bridges the fetch gap with the old bitmap. Pruned as
+// replacements load; detached from the DOM, which canvas drawImage is fine
+// with.
+let heldImages: { ref: ImageRef; el: HTMLImageElement }[] = [];
 let screenEl: HTMLElement;
+
+// Cell-rect overlap of two placements (unsized images conservatively count
+// as their anchor cell — the video path is always sized).
+function refsOverlap(a: ImageRef, b: ImageRef): boolean {
+  const aw = a.w ?? 1, ah = a.h ?? 1, bw = b.w ?? 1, bh = b.h ?? 1;
+  return a.r < b.r + bh && b.r < a.r + ah && a.c < b.c + bw && b.c < a.c + aw;
+}
+
+// Drop held images whose replacement finished loading (or vanished).
+function pruneHeld(): void {
+  heldImages = heldImages.filter((o) =>
+    screenImages.some((n) => !n.el.complete && refsOverlap(o.ref, n.ref)),
+  );
+}
 
 // Update the screen's cell buffer + cursor from decoded line patches, returning
 // the rows to re-render (changed lines plus the old and new cursor rows). The
@@ -1954,19 +1976,22 @@ function paintFull(dims: { w: number; h: number; i?: ImageRef[] }): void {
   // fragment and paste invisibly). Each is inserted as a SIBLING right after
   // its anchor row, so document order matches visual order and a selection
   // spanning the image's rows carries it into the clipboard's HTML flavor.
+  const prev = screenImages.concat(heldImages);
   screenImages = (dims.i ?? []).map((ref) => {
     const anchor =
       screen.rowEls[Math.min(Math.max(ref.r, 0), screen.rowEls.length - 1)];
     anchor.insertAdjacentHTML(ref.r < 0 ? "beforebegin" : "afterend", renderImage(ref));
     const el = (ref.r < 0 ? anchor.previousElementSibling : anchor.nextElementSibling) as HTMLImageElement;
     // The fetch resolves async (usually from cache — the URL is immutable) —
-    // a static screen would never repaint, so redraw when the image lands.
+    // a static screen would never repaint, so redraw when the image lands
+    // (and release any held predecessor covering this region).
     // Then swap the element's src to an embedded data: URL: the HTTP URL is
     // session-relative and dies with the session, so a COPIED fragment must
     // carry the actual bitmap to paste as a real picture (the swap re-fires
     // `load`; the data:-prefix guard stops the recursion, and any later
     // paint uses the browser-cached decode either way).
     el.addEventListener("load", () => {
+      pruneHeld();
       redrawCanvasAll();
       if (el.src.startsWith("data:")) return;
       const c = document.createElement("canvas");
@@ -1983,6 +2008,16 @@ function paintFull(dims: { w: number; h: number; i?: ImageRef[] }): void {
     });
     return { ref, el };
   });
+  // Hold the previous frame's DECODED images wherever the replacement is
+  // still fetching, so the swap is bitmap-to-bitmap instead of
+  // bitmap-blank-bitmap; regions with no loading replacement drop instantly
+  // (a cleared image must vanish, mirror fidelity).
+  heldImages = prev.filter(
+    (o) =>
+      o.el.complete &&
+      o.el.naturalWidth > 0 &&
+      screenImages.some((n) => !n.el.complete && refsOverlap(o.ref, n.ref)),
+  );
 }
 
 // `<img>` overlays positioned at their cell; without a size (no cols/rows)
