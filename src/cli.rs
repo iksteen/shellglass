@@ -45,8 +45,8 @@ impl Cli {
     /// Whatever the mode returns; the binary reports it and exits non-zero.
     pub async fn run(self) -> Result<()> {
         match self.action {
-            Action::GenKey => gen_key(),
-            Action::PrintId { key } => print_id(&key),
+            Action::GenKey { api } => gen_key(api),
+            Action::PrintId { key, api } => print_id(&key, api),
             #[cfg(feature = "serve")]
             Action::Serve(args) => args.run().await,
             #[cfg(feature = "push")]
@@ -62,12 +62,21 @@ impl Cli {
 #[derive(clap::Subcommand, Debug)]
 enum Action {
     /// Generate a secure random secret key, print it with its session id, and exit.
-    GenKey,
+    GenKey {
+        /// Mint a management-API key instead: print the key with its API id
+        /// (for a hub's `--api-allow`). API and session ids live in separate
+        /// salt domains — one secret is never a credential for both.
+        #[arg(long)]
+        api: bool,
+    },
 
     /// Print the session id for a key (to add to a hub's `hub --allow`).
     PrintId {
         #[command(flatten)]
         key: KeyArg,
+        /// Print the key's API id instead (for a hub's `--api-allow`).
+        #[arg(long)]
+        api: bool,
     },
 
     /// Mirror a terminal locally: serve the live HTML viewer over HTTP (self-contained).
@@ -252,12 +261,17 @@ impl Tls {
     }
 }
 
-/// Print the session id for a key (the `print-id` action).
+/// Print the session id — or with `--api`, the API id — for a key (the
+/// `print-id` action).
 ///
 /// # Errors
 /// Never; `Result` for dispatch uniformity.
-pub fn print_id(key: &KeyArg) -> Result<()> {
-    println!("{}", proto::session_id(&key.key));
+pub fn print_id(key: &KeyArg, api: bool) -> Result<()> {
+    if api {
+        println!("{}", proto::api_id(&key.key));
+    } else {
+        println!("{}", proto::session_id(&key.key));
+    }
     Ok(())
 }
 
@@ -302,19 +316,24 @@ impl HubArgs {
 }
 
 /// Mint a new secret key (32 bytes of OS randomness, URL-safe base64) and print it
-/// with its session id. The key is the write capability (keep it secret); the id is
-/// the read capability to put on the hub's `hub --allow`.
+/// with its session id — or, with `--api`, its API id. The key is the write
+/// capability (keep it secret); the id is what goes on the hub's `--allow`
+/// (sessions) or `--api-allow` (management API).
 ///
 /// # Errors
 /// Only if the OS randomness source fails.
-pub fn gen_key() -> Result<()> {
+pub fn gen_key(api: bool) -> Result<()> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes)
         .map_err(|e| anyhow::anyhow!("reading OS randomness for the new key: {e}"))?;
     let key = base64::Engine::encode(&URL_SAFE_NO_PAD, bytes);
     println!("key: {key}");
-    println!("id:  {}", proto::session_id(&key));
+    if api {
+        println!("api-id: {}", proto::api_id(&key));
+    } else {
+        println!("id:  {}", proto::session_id(&key));
+    }
     Ok(())
 }
 

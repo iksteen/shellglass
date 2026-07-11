@@ -64,20 +64,41 @@ pub const KEY_HEADER: &str = "x-shellglass-key";
 /// operators re-run `print-id` and update `--allow` + view URLs; keys stay valid.
 const SALT: &[u8] = b"shellglass/session-id/v4";
 
-/// Underivable session id for a secret key: Argon2id (memory- and compute-hard)
-/// rendered as lowercase hex. Memory-hardness makes brute-forcing a weak secret
-/// from the public id expensive; with a strong random secret it's belt-and-
-/// suspenders. Hex (never `-`) so the id is safe as a CLI value and URL path.
-/// Cost is paid once per client connection (at the `/push` upgrade), not per frame.
-pub fn session_id(key: &str) -> String {
+/// The management-API identity domain. Same derivation as [`session_id`],
+/// DIFFERENT salt: domain separation. A leaked session key can never
+/// authenticate to the hub's management API, and an API key can never push
+/// frames — the two credential spaces cannot collide even for the same
+/// underlying secret. Versioned independently of [`SALT`] (an API-breaking
+/// change bumps this one alone; session pairs are unaffected).
+const API_SALT: &[u8] = b"shellglass/api-id/v1";
+
+/// Underivable id for a secret key in the given salt domain: Argon2id
+/// (memory- and compute-hard) rendered as lowercase hex. Memory-hardness
+/// makes brute-forcing a weak secret from the public id expensive; with a
+/// strong random secret it's belt-and-suspenders. Hex (never `-`) so the id
+/// is safe as a CLI value and URL path. Cost is paid once per connection or
+/// API request, never per frame.
+fn derive_id(key: &str, salt: &[u8]) -> String {
     let mut out = [0u8; 32];
     Argon2::default()
-        .hash_password_into(key.as_bytes(), SALT, &mut out)
+        .hash_password_into(key.as_bytes(), salt, &mut out)
         .expect("argon2id with a fixed valid salt and output length cannot fail");
     out.iter().fold(String::with_capacity(64), |mut s, b| {
         let _ = write!(s, "{b:02x}");
         s
     })
+}
+
+/// The session id for a push key — the read capability in view URLs and the
+/// hub's `--allow` entries.
+pub fn session_id(key: &str) -> String {
+    derive_id(key, SALT)
+}
+
+/// The API id for a management key — the hub's `--api-allow` entries. See
+/// [`API_SALT`] for why this is its own domain.
+pub fn api_id(key: &str) -> String {
+    derive_id(key, API_SALT)
 }
 
 /// Upper bound on a single WebSocket message the hub will accept from a pusher.
@@ -106,6 +127,23 @@ mod tests {
             id.bytes()
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
             "id must be lowercase hex (no '-', CLI/URL safe): {id}"
+        );
+    }
+
+    // Domain separation: the same secret yields UNRELATED ids in the session
+    // and API domains — a leaked session key is not an API credential and
+    // vice versa.
+    #[test]
+    fn api_domain_is_separate() {
+        let key = "correct horse battery staple";
+        let api = api_id(key);
+        assert_eq!(api, api_id(key), "same key -> same api id");
+        assert_ne!(api, session_id(key), "domains must not collide");
+        assert_eq!(api.len(), 64);
+        assert!(
+            api.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "api id must be lowercase hex: {api}"
         );
     }
 }

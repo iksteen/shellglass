@@ -12,9 +12,12 @@ use clap::Parser;
 struct Cli {
     #[command(flatten)]
     key: shellglass::cli::KeyArg,
+    /// Print the key's API id instead (for a hub's `--api-allow`).
+    #[arg(long)]
+    api: bool,
 }
 
 fn main() -> anyhow::Result<()> {
-    let Cli { key } = Cli::parse();
-    shellglass::cli::print_id(&key)
+    let Cli { key, api } = Cli::parse();
+    shellglass::cli::print_id(&key, api)
 }

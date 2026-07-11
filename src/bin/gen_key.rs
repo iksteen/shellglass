@@ -9,9 +9,14 @@ use clap::Parser;
     version,
     about = "Generate a secure random secret key and print it with its session id"
 )]
-struct Cli {}
+struct Cli {
+    /// Mint a management-API key instead: print the key with its API id
+    /// (for a hub's `--api-allow`).
+    #[arg(long)]
+    api: bool,
+}
 
 fn main() -> anyhow::Result<()> {
-    let Cli {} = Cli::parse();
-    shellglass::cli::gen_key()
+    let Cli { api } = Cli::parse();
+    shellglass::cli::gen_key(api)
 }
