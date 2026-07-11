@@ -1391,18 +1391,93 @@ export function ghostText(row: Cell[]): string {
   for (const cell of row) text += cell.t && cell.t.length ? cell.t : " ";
   return text;
 }
-function ghostRow(r: number): void {
-  const el = screen.rowEls[r];
-  if (!el) return;
-  el.textContent = ghostText(screen.cells[r] ?? []);
+
+// The minimal splice turning `old` into `next`: [start, deleteCount, insert],
+// or null when equal. Applied via CharacterData.replaceData, which the DOM
+// spec defines to ADJUST Range boundary points instead of orphaning them —
+// points before the splice never move, points after shift by the length
+// delta. That is what lets a selection in a calm tmux pane survive while the
+// same row's other pane churns. (Code-unit comparison: a common prefix/suffix
+// split mid-surrogate still splices to the identical final string, and
+// replaceData offsets are code units anyway.)
+export function ghostSpan(
+  old: string,
+  next: string,
+): [number, number, string] | null {
+  if (old === next) return null;
+  let a = 0;
+  const max = Math.min(old.length, next.length);
+  while (a < max && old.charCodeAt(a) === next.charCodeAt(a)) a++;
+  let bOld = old.length;
+  let bNew = next.length;
+  while (bOld > a && bNew > a && old.charCodeAt(bOld - 1) === next.charCodeAt(bNew - 1)) {
+    bOld--;
+    bNew--;
+  }
+  return [a, bOld - a, next.slice(a, bNew)];
 }
 
-// Replacing a row's text node destroys any selection Range anchored in it — at storm
-// rates a drag-selection would die within one flush. So while a selection is live the
-// ghost layer FREEZES (the canvas on top keeps painting the true screen); the user
-// copies what was on screen when they selected — the only coherent semantics for
-// copying out of a running animation. When the selection clears, the next flush
-// resyncs every row.
+// The live selection in ghost-row coordinates: null = none (or not anchored
+// in ghost rows — then updates can't hurt it); "all" = anchored here but not
+// resolvable to rows (be conservative); else the document-order span.
+type GhostSel = { r0: number; o0: number; r1: number; o1: number } | "all" | null;
+function ghostSelection(): GhostSel {
+  if (typeof getSelection === "undefined") return null;
+  const s = getSelection();
+  if (s === null || s.isCollapsed || s.rangeCount === 0) return null;
+  const range = s.getRangeAt(0);
+  const rowOf = (node: Node): number => {
+    const el = node instanceof Text ? node.parentElement : (node as Element);
+    return el === null ? -1 : screen.rowEls.indexOf(el as HTMLElement);
+  };
+  const r0 = rowOf(range.startContainer);
+  const r1 = rowOf(range.endContainer);
+  if (r0 < 0 && r1 < 0) return null; // lives outside the ghost layer
+  if (r0 < 0 || r1 < 0) return "all"; // straddles the boundary — freeze wide
+  // element-container offsets are child indices, not chars — cover the row
+  const o0 = range.startContainer instanceof Text ? range.startOffset : 0;
+  const o1 = range.endContainer instanceof Text ? range.endOffset : Number.MAX_SAFE_INTEGER;
+  return { r0, o0, r1, o1 };
+}
+
+// Sync one ghost row. Returns false when the update would rewrite characters
+// inside the live selection (content the user is holding) — the caller keeps
+// it stale instead. Everything else patches IN PLACE via replaceData, so
+// Ranges anchored elsewhere in the row survive with adjusted offsets.
+function ghostRow(r: number, sel: GhostSel = null): boolean {
+  const el = screen.rowEls[r];
+  if (!el) return true;
+  const text = ghostText(screen.cells[r] ?? []);
+  const node = el.firstChild;
+  if (!(node instanceof Text)) {
+    if (sel === "all") return false;
+    el.textContent = text;
+    return true;
+  }
+  const span = ghostSpan(node.data, text);
+  if (span === null) return true;
+  if (sel === "all") return false;
+  if (sel !== null && r >= sel.r0 && r <= sel.r1) {
+    // the selected char range within THIS row (document order)
+    const selStart = r === sel.r0 ? sel.o0 : 0;
+    const selEnd = r === sel.r1 ? sel.o1 : Number.MAX_SAFE_INTEGER;
+    const [a, del] = span;
+    // half-open overlap; a pure insertion is zero-width at `a` (clamped to
+    // width 1 so an insert exactly at the selection start still counts —
+    // the inserted text would land inside the selection)
+    if (a < selEnd && a + Math.max(del, 1) > selStart) return false;
+  }
+  node.replaceData(span[0], span[1], span[2]);
+  return true;
+}
+
+// Rewriting characters INSIDE a live selection changes what the user is
+// holding mid-copy, so those rows stay frozen (the canvas on top keeps
+// painting the true screen): the user copies what was on screen when they
+// selected — the only coherent semantics for copying out of a running
+// animation. Rows the selection doesn't touch — and non-overlapping spans in
+// rows it does — keep updating live via the replaceData patching above. When
+// the selection clears, the next flush resyncs whatever went stale.
 let ghostStale = false;
 function selectionActive(): boolean {
   if (typeof getSelection === "undefined") return false;
@@ -1901,17 +1976,22 @@ function flushPaint(): void {
       startCurAnim(lastCurPos, cur);
     }
     lastCurPos = cur ? [cur[0], cur[1]] : null;
-    const frozen = storm && (selectionActive() || pointerHeld);
-    if (storm && !frozen && ghostStale) {
-      // Selection just cleared — the ghost layer froze while it was live; resync all.
+    // Ghost policy for this flush: with a live selection, only rows/spans that
+    // would rewrite the SELECTED characters freeze (ghostRow decides per row);
+    // a pointer held before any selection exists freezes everything — that's
+    // the anchor window where a collapsed caret can't be located yet.
+    const sel = storm ? ghostSelection() : null;
+    const holdAll = storm && pointerHeld && sel === null;
+    if (storm && sel === null && !pointerHeld && ghostStale) {
+      // Selection cleared/released — resync whatever froze while it was live.
       for (let r = 0; r < screen.cells.length; r++) ghostRow(r);
       ghostStale = false;
     }
     for (const r of dirtyRows) {
       if (storm) {
         drawRowStorm(r);
-        if (frozen) ghostStale = true;
-        else ghostRow(r); // keep the selectable backing text in sync with the picture
+        // keep the selectable backing text in sync with the picture
+        if (holdAll || !ghostRow(r, sel)) ghostStale = true;
       } else {
         const el = screen.rowEls[r];
         if (!el) continue;

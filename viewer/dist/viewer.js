@@ -1029,11 +1029,68 @@ export function ghostText(row) {
         text += cell.t && cell.t.length ? cell.t : " ";
     return text;
 }
-function ghostRow(r) {
+export function ghostSpan(old, next) {
+    if (old === next)
+        return null;
+    let a = 0;
+    const max = Math.min(old.length, next.length);
+    while (a < max && old.charCodeAt(a) === next.charCodeAt(a))
+        a++;
+    let bOld = old.length;
+    let bNew = next.length;
+    while (bOld > a && bNew > a && old.charCodeAt(bOld - 1) === next.charCodeAt(bNew - 1)) {
+        bOld--;
+        bNew--;
+    }
+    return [a, bOld - a, next.slice(a, bNew)];
+}
+function ghostSelection() {
+    if (typeof getSelection === "undefined")
+        return null;
+    const s = getSelection();
+    if (s === null || s.isCollapsed || s.rangeCount === 0)
+        return null;
+    const range = s.getRangeAt(0);
+    const rowOf = (node) => {
+        const el = node instanceof Text ? node.parentElement : node;
+        return el === null ? -1 : screen.rowEls.indexOf(el);
+    };
+    const r0 = rowOf(range.startContainer);
+    const r1 = rowOf(range.endContainer);
+    if (r0 < 0 && r1 < 0)
+        return null;
+    if (r0 < 0 || r1 < 0)
+        return "all";
+    const o0 = range.startContainer instanceof Text ? range.startOffset : 0;
+    const o1 = range.endContainer instanceof Text ? range.endOffset : Number.MAX_SAFE_INTEGER;
+    return { r0, o0, r1, o1 };
+}
+function ghostRow(r, sel = null) {
     const el = screen.rowEls[r];
     if (!el)
-        return;
-    el.textContent = ghostText(screen.cells[r] ?? []);
+        return true;
+    const text = ghostText(screen.cells[r] ?? []);
+    const node = el.firstChild;
+    if (!(node instanceof Text)) {
+        if (sel === "all")
+            return false;
+        el.textContent = text;
+        return true;
+    }
+    const span = ghostSpan(node.data, text);
+    if (span === null)
+        return true;
+    if (sel === "all")
+        return false;
+    if (sel !== null && r >= sel.r0 && r <= sel.r1) {
+        const selStart = r === sel.r0 ? sel.o0 : 0;
+        const selEnd = r === sel.r1 ? sel.o1 : Number.MAX_SAFE_INTEGER;
+        const [a, del] = span;
+        if (a < selEnd && a + Math.max(del, 1) > selStart)
+            return false;
+    }
+    node.replaceData(span[0], span[1], span[2]);
+    return true;
 }
 let ghostStale = false;
 function selectionActive() {
@@ -1360,8 +1417,9 @@ function flushPaint() {
             startCurAnim(lastCurPos, cur);
         }
         lastCurPos = cur ? [cur[0], cur[1]] : null;
-        const frozen = storm && (selectionActive() || pointerHeld);
-        if (storm && !frozen && ghostStale) {
+        const sel = storm ? ghostSelection() : null;
+        const holdAll = storm && pointerHeld && sel === null;
+        if (storm && sel === null && !pointerHeld && ghostStale) {
             for (let r = 0; r < screen.cells.length; r++)
                 ghostRow(r);
             ghostStale = false;
@@ -1369,10 +1427,8 @@ function flushPaint() {
         for (const r of dirtyRows) {
             if (storm) {
                 drawRowStorm(r);
-                if (frozen)
+                if (holdAll || !ghostRow(r, sel))
                     ghostStale = true;
-                else
-                    ghostRow(r);
             }
             else {
                 const el = screen.rowEls[r];

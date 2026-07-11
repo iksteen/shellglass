@@ -9,6 +9,7 @@ import {
   applyDefaults,
   linkHref,
   ghostText,
+  ghostSpan,
   isFillGlyph,
   isCanvasGlyph,
   glyphOps,
@@ -494,4 +495,31 @@ test("cellStyle blink animates the ink; conceal wins over blink", () => {
   assert.equal(cellStyle({ x: 1 }, false), "animation:sg-blink 1s step-end infinite;");
   // blinking a concealed cell is meaningless — conceal's transparent wins
   assert.equal(cellStyle({ x: 1, o: 1 }, false), "color:transparent;");
+});
+
+// ── ghostSpan (in-place ghost patching) ───────────────────────────────────────
+
+test("ghostSpan finds the minimal splice", () => {
+  assert.equal(ghostSpan("same", "same"), null);
+  assert.deepEqual(ghostSpan("abcdef", "abcXef"), [3, 1, "X"]);
+  assert.deepEqual(ghostSpan("abc", "abXc"), [2, 0, "X"]); // pure insert
+  assert.deepEqual(ghostSpan("abXc", "abc"), [2, 1, ""]); // pure delete
+  assert.deepEqual(ghostSpan("", "xy"), [0, 0, "xy"]);
+  assert.deepEqual(ghostSpan("aaaa", "aaa"), [3, 1, ""]); // repeats: deterministic
+  // multi-span changes collapse to one covering splice
+  assert.deepEqual(ghostSpan("aXbYc", "aPbQc"), [1, 3, "PbQ"]);
+});
+
+test("ghostSpan splices reproduce the target string", () => {
+  const cases: [string, string][] = [
+    ["left pane   right pane", "left pane   RIGHT PANE"],
+    ["𝕒bc", "𝕓bc"], // surrogate pairs at the boundary
+    ["prompt $ ", "prompt $ ls"],
+  ];
+  for (const [old, next] of cases) {
+    const s = ghostSpan(old, next);
+    assert.ok(s !== null);
+    const [a, del, ins] = s;
+    assert.equal(old.slice(0, a) + ins + old.slice(a + del), next, `${old} -> ${next}`);
+  }
 });
