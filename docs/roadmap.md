@@ -438,7 +438,7 @@ at 0 in `Parser::new`.)
     win (faster but fidelity gaps) keeps it as a third mode, which is
     probably not worth carrying.
 
-## Hub management API
+## Hub management API ✅ (landed 2026-07-11, `hub-api`: b296ff7 + 4f0baf8 + fc8f04e + 964a431)
 
 An external tool manages the hub's session registry at runtime: add a
 session (by its public id, with an optional slug) and remove one — with
@@ -446,7 +446,10 @@ removal-by-id and removal-by-slug as SEPARATE routes, because an un-aliased
 slug IS the id, so one ambiguous route could delete the wrong thing. API
 callers authenticate with the same key→argon2id-id mechanism sessions use,
 under a DIFFERENT salt: domain separation, so a leaked session key is not an
-API credential and vice versa.
+API credential and vice versa. All five items below landed as sketched; the
+placeholder transition shipped as a MutationObserver on `body[data-offline]`
+reloading when the operator comes online, and registration ADOPTS the stub's
+`Live` so placeholder viewers' SSE subscriptions survive the handover.
 
 1. **API identity: a second salt domain.** `proto.rs`: refactor the argon2id
    derivation to take the salt as a parameter; add

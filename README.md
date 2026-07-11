@@ -104,8 +104,8 @@ to the id, so `/s/<id>` keeps working as above.
 | `serve` | self-contained: render locally and serve the viewer over HTTP |
 | `push <url>` | client: render locally, stream frames to the hub at `<url>` |
 | `hub` | run as a hub: relay clients' pushes (no config needed) |
-| `gen-key` | generate a random secret key, print it with its session id, and exit |
-| `print-id` | print the session id for `--key` and exit |
+| `gen-key` | generate a random secret key, print it with its session id, and exit (`--api` for an API credential) |
+| `print-id` | print the session id for `--key` and exit (`--api` for its API id) |
 
 Flags by command:
 
@@ -118,6 +118,8 @@ Flags by command:
 | `--ssh-host-key <path>` | serve, hub | OpenSSH host key for the SSH view (generated + persisted 0600 if absent) |
 | `--key <secret>` | push, print-id | secret key (or `SHELLGLASS_KEY` env var) |
 | `--allow <id>[:<slug>]` | hub | a session id permitted to push, optionally aliased to a view-URL slug; repeat per client. Others get `403` |
+| `--api-allow <api-id>` | hub | an API id permitted to call the session-management API; repeat per caller. Without it, `/api` is off (404) |
+| `--api` | gen-key, print-id | mint/print in the API salt domain (for `--api-allow`) instead of the session domain |
 | `--tls-cert <path>` / `--tls-key <path>` | hub | serve HTTPS with your own PEM cert chain + key |
 | `--acme-domain <d>` | hub | auto-obtain a cert via ACME/Let's Encrypt (repeat per domain) |
 | `--acme-email <e>` | hub | contact email for the ACME account |
@@ -128,6 +130,49 @@ The session id is `hex(argon2id(secret))` with a fixed application salt — a
 memory-hard derivation, so a weak secret can't be cheaply brute-forced from the
 public id. It's computed once per client connection, not per frame. Use
 `print-id` to obtain the id for a secret (there's no one-line shell equivalent).
+
+## Managing hub sessions over HTTP
+
+An external tool can add and remove sessions at runtime instead of restarting
+the hub with new `--allow` flags. The API is **off by default**: it only exists
+when the hub is started with at least one `--api-allow <api-id>`.
+
+API callers authenticate like sessions do — a secret key, screened by its
+argon2id hash — but in a **separate salt domain**: mint a key with
+`gen-key --api` (or derive with `print-id --key K --api`) and put the printed
+API id on `--api-allow`. A session key is never an API credential and vice
+versa, even if the same secret were reused.
+
+```sh
+# operator: mint an API credential and start the hub with it
+shellglass gen-key --api          # key: <API_KEY>   api-id: <API_ID>
+shellglass hub --bind 0.0.0.0:8080 --api-allow <API_ID>
+
+# the managing tool (Authorization: Bearer <API_KEY>):
+curl -X POST -H "Authorization: Bearer $API_KEY" \
+     -d '{"id":"<session-id>","slug":"demo"}' https://hub/api/sessions
+curl -H "Authorization: Bearer $API_KEY" https://hub/api/sessions
+curl -X DELETE -H "Authorization: Bearer $API_KEY" https://hub/api/sessions/by-slug/demo
+```
+
+| Route | Effect |
+|-------|--------|
+| `POST /api/sessions` | register `{"id": <session-id>, "slug"?: <slug>}` — the public id from `print-id`, never a key. `201`; `409` when the id or slug is taken; `400` when malformed |
+| `DELETE /api/sessions/by-id/<id>` | remove by **session id**. `204`; `404` unknown |
+| `DELETE /api/sessions/by-slug/<slug>` | remove by **view slug**. `204`; `404` unknown |
+| `GET /api/sessions` | list `[{id, slug, live}]` — `live` means an operator is currently pushing |
+
+Removal by id and by slug are separate routes on purpose: an un-aliased
+session's slug **is** its id, so a single guessing route could delete the wrong
+thing. Deleting a session kicks its live pusher (whose next reconnect gets
+`403`) and drops everything the hub stored for it.
+
+A session added over the API is viewable immediately: until its pusher
+connects, `/s/<slug>` serves the built-in page in the operator-offline state
+(the same look as a live session whose operator dropped) and switches to the
+real session automatically when the first push arrives. Runtime-added sessions
+are **ephemeral** — a hub restart forgets them; the managing tool is the source
+of truth and re-adds them.
 
 ## How it works
 
