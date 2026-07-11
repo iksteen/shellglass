@@ -1,99 +1,68 @@
 # shellglass
 
-A live glass over your shell: mirror a terminal session as live **HTML** in your browser.
-You run an interactive command in a pseudo-terminal (the `script(1)` model) — it runs in
-your terminal, the browser watches. Rendering is always **live** — terminal state is kept
-in a long-lived vt100 parser and pushed to the browser over SSE, with no polling and no
-per-tick subprocess — and carries Kitty-style `symbol_map` font overrides (map Unicode
-codepoint ranges to specific fonts, e.g. Nerd Font glyph ranges) and **inline images**
-(kitty graphics, iTerm2, sixel — mirrored when your terminal renders them).
+A live glass over your shell: mirror a terminal session as live **HTML** in your
+browser. You run an interactive command in a pseudo-terminal (the `script(1)` model) —
+it runs in your terminal, the browser watches. Terminal state lives in a long-lived
+vt100 parser and is pushed to the browser over SSE: no polling, no per-tick
+subprocess. Inline images (kitty graphics, iTerm2, sixel) and Kitty-style
+`symbol_map` font overrides are mirrored too.
 
 Two ways to serve it:
 
 - **Standalone** — mirror to a local browser (one process).
-- **Hub + client** — a client streams its rendered frames to a remote **hub** that hosts
-  the session at a URL. Good for sharing off-box.
+- **Hub + client** — a client streams its frames to a remote **hub** that hosts the
+  session at a URL. Good for sharing off-box.
 
 ```sh
 shellglass serve                                  # mirror your $SHELL, watch at :8080
-shellglass serve -- bash -l                        # or a specific command
-shellglass push https://hub --key … -- bash        # or stream it to a hub
+shellglass serve -- bash -l                       # or a specific command
+shellglass push https://hub --key … -- bash       # or stream it to a hub
 ```
 
-Each mode is a subcommand: `serve` (self-contained local viewer), `push` (stream to a
-hub), `hub` (run a hub), plus `gen-key` / `print-id` helpers. Run `shellglass <cmd>
---help` for a command's flags. The command to mirror goes **last**, after any flags (use
-`--` to separate it); omit it to mirror your `$SHELL`. The terminal is switched to raw
-mode for the session and restored when the command exits (which also quits shellglass).
-Unix only.
+The command to mirror goes **last**, after any flags (use `--` to separate it); omit it
+to mirror your `$SHELL`. The terminal is switched to raw mode for the session and
+restored when the command exits (which also quits shellglass). Unix only.
 
-## Build
+## Build & quickstart
 
 ```sh
 cargo build --release
-# binary at ./target/release/shellglass  (examples below use it)
-```
-
-## Quickstart: standalone (one shell)
-
-```sh
-./target/release/shellglass serve --bind 127.0.0.1:8080     # mirror your $SHELL
+./target/release/shellglass serve --bind 127.0.0.1:8080
 # open http://127.0.0.1:8080/ — the browser mirrors this terminal live
 ```
 
-## Quickstart: hub + client (two shells)
+## Hub + client
 
-The **secret** is the write capability; its hash — `hex(argon2id(secret))`, a
-one-way, memory-hard derivation — is the **session id**, a read capability that
-goes in the view URL. The hub only accepts pushes for session ids you pre-register
-with `--allow`.
+The **secret key** is the write capability. Its hash — `hex(argon2id(secret))`, a
+one-way, memory-hard derivation, so a weak secret can't be cheaply brute-forced —
+is the **session id**: the read capability that goes in the view URL. The hub
+accepts pushes only for pre-registered ids; it never sees secrets.
 
-### Shell A — the hub
+Shell A — the hub:
 
 ```sh
-# 1. mint a secret and its session id (the id is needed for the hub's --allow)
 ./target/release/shellglass gen-key
 #   key: <secret>   -> keep private; the client pushes with it
-#   id:  <id>       -> public; add to the hub's --allow
-SECRET='<the printed key>'
-ID='<the printed id>'
-
-# 2. run the hub, allowing that id (repeat --allow per client)
-./target/release/shellglass hub --bind 127.0.0.1:8080 --allow "$ID"
+#   id:  <id>       -> public; register it on the hub
+./target/release/shellglass hub --bind 127.0.0.1:8080 --allow '<the id>'
 ```
 
-The hub needs no config — it just relays what clients push.
-For access from other machines, bind `0.0.0.0:8080` and use the host's address.
-
-### Shell B — the client
+Shell B — the client:
 
 ```sh
-# same secret as the hub was configured for
-export SHELLGLASS_KEY='change-me-to-a-long-random-secret'
+export SHELLGLASS_KEY='<the key>'
 ./target/release/shellglass push http://127.0.0.1:8080 -- bash -l
+# shellglass: pushing live to http://127.0.0.1:8080; view at http://127.0.0.1:8080/s/<id>
 ```
 
-The client prints its view URL on startup:
+Open the printed `/s/<id>` URL. Viewing needs only the URL; pushing needs the
+secret — a key whose id isn't registered is rejected with `403` at startup. For
+access from other machines, bind `0.0.0.0:8080` and use the host's address.
 
-```
-shellglass: pushing live to http://127.0.0.1:8080; view at http://127.0.0.1:8080/s/<id>
-```
-
-Open that `/s/<id>` URL in a browser. Viewing needs only the id (in the URL); pushing
-needs the secret. A client whose key isn't on the hub's `--allow` list is rejected with
-`403` at startup.
-
-**Friendlier view URLs.** Alias a session id to a slug with `--allow <id>:<slug>` (e.g.
-`--allow "$ID:demo"`) and the session is viewed at `/s/demo` instead of `/s/<64-hex-id>`.
-The slug becomes the *only* view route — `/s/<id>` no longer resolves for an aliased
-session — so share the slug URL with viewers. Pushing is unchanged (it still uses the
-key, which hashes to the id). Every id and every slug must be unique across `--allow`;
-a collision or a non-URL-safe slug is a startup error. With no `:slug`, the slug defaults
-to the id, so `/s/<id>` keeps working as above.
-
-> `gen-key` mints a secure 256-bit secret and prints its session id in one step;
-> use the printed key as `SHELLGLASS_KEY` on the client and the printed id in the
-> hub's `--allow`.
+**Friendlier view URLs.** `--allow <id>:<slug>` (e.g. `--allow "$ID:demo"`) serves
+the session at `/s/demo` instead of `/s/<64-hex-id>` — the slug becomes the *only*
+view route. Pushing is unchanged. Ids and slugs must be unique across `--allow`; a
+collision or a non-URL-safe slug is a startup error.
 
 ## Commands
 
@@ -104,9 +73,9 @@ to the id, so `/s/<id>` keeps working as above.
 | `serve` | self-contained: render locally and serve the viewer over HTTP |
 | `push <url>` | client: render locally, stream frames to the hub at `<url>` |
 | `hub` | run as a hub: relay clients' pushes (no config needed) |
-| `sessions` | manage a hub's sessions over its management API: list, add, remove |
-| `gen-key` | generate a random secret key, print it with its session id, and exit (`--api` for an API credential) |
-| `print-id` | print the session id for `--key` and exit (`--api` for its API id) |
+| `sessions <url>` | manage a hub's sessions over its management API: list, add, remove |
+| `gen-key` | mint a random secret and print it with its session id (`--api` for an API credential) |
+| `print-id` | print the session id for `--key` (`--api` for its API id) |
 
 Flags by command:
 
@@ -115,13 +84,13 @@ Flags by command:
 | `[CMD]…` (positional) | serve, push | interactive command to mirror in a PTY; put it last (after `--`). Omit for your `$SHELL` |
 | `--config <path>` | serve, push | TOML config (fonts, `symbol_map`, `template`); omit for defaults |
 | `--bind <addr>` | serve, hub | HTTP listen address (default `127.0.0.1:8080`) |
-| `--ssh-bind <addr>` | serve, hub | also serve a read-only ANSI view over SSH here; connect with `ssh -p <port> …` |
+| `--ssh-bind <addr>` | serve, hub | also serve a read-only ANSI view over SSH here |
 | `--ssh-host-key <path>` | serve, hub | OpenSSH host key for the SSH view (generated + persisted 0600 if absent) |
 | `--key <secret>` | push, print-id | secret key (or `SHELLGLASS_KEY` env var) |
-| `<url>` (positional) / `--key <api-key>` | sessions | hub base URL (like `push`'s) + management-API key (or `SHELLGLASS_API_KEY`) |
+| `--key <api-key>` | sessions | management-API key (or `SHELLGLASS_API_KEY` env var) |
 | `--allow <id>[:<slug>]` | hub | a session id permitted to push, optionally aliased to a view-URL slug; repeat per client. Others get `403` |
 | `--api-allow <api-id>` | hub | an API id permitted to call the session-management API; repeat per caller. Without it, `/api` is off (404) |
-| `--sessions-file <path>` | hub | persist the session registry here across restarts; when it loads, it replaces `--allow` (see [Managing hub sessions](#managing-hub-sessions-over-http)) |
+| `--sessions-file <path>` | hub | persist the session registry across restarts (see [Managing hub sessions](#managing-hub-sessions-over-http)) |
 | `--api` | gen-key, print-id | mint/print in the API salt domain (for `--api-allow`) instead of the session domain |
 | `--tls-cert <path>` / `--tls-key <path>` | hub | serve HTTPS with your own PEM cert chain + key |
 | `--acme-domain <d>` | hub | auto-obtain a cert via ACME/Let's Encrypt (repeat per domain) |
@@ -129,22 +98,16 @@ Flags by command:
 | `--acme-cache <dir>` | hub | persist ACME account + certs across restarts (recommended) |
 | `--acme-production` | hub | use Let's Encrypt production (default: staging) |
 
-The session id is `hex(argon2id(secret))` with a fixed application salt — a
-memory-hard derivation, so a weak secret can't be cheaply brute-forced from the
-public id. It's computed once per client connection, not per frame. Use
-`print-id` to obtain the id for a secret (there's no one-line shell equivalent).
-
 ## Managing hub sessions over HTTP
 
-An external tool can add and remove sessions at runtime instead of restarting
-the hub with new `--allow` flags. The API is **off by default**: it only exists
-when the hub is started with at least one `--api-allow <api-id>`.
+An external tool can add and remove sessions at runtime instead of restarting the
+hub with new `--allow` flags. The API is **off by default**: it only exists when
+the hub is started with at least one `--api-allow <api-id>`.
 
-API callers authenticate like sessions do — a secret key, screened by its
-argon2id hash — but in a **separate salt domain**: mint a key with
-`gen-key --api` (or derive with `print-id --key K --api`) and put the printed
-API id on `--api-allow`. A session key is never an API credential and vice
-versa, even if the same secret were reused.
+API callers authenticate like sessions do — a secret key, screened by its argon2id
+hash — but in a **separate salt domain**, so a session key is never an API
+credential and vice versa. Mint one with `gen-key --api` and put the printed API
+id on `--api-allow`.
 
 ```sh
 # operator: mint an API credential and start the hub with it
@@ -166,68 +129,54 @@ curl -X DELETE -H "Authorization: Bearer $SHELLGLASS_API_KEY" https://hub/api/se
 
 | Route | Effect |
 |-------|--------|
-| `POST /api/sessions` | register `{"id": <session-id>, "slug"?: <slug>}` — the public id from `print-id`, never a key. `201`; `409` when the id or slug is taken; `400` when malformed |
+| `POST /api/sessions` | register `{"id": <session-id>, "slug"?: <slug>}` — the public id from `print-id`, never a key. `201`; `409` id or slug taken; `400` malformed |
 | `DELETE /api/sessions/by-id/<id>` | remove by **session id**. `204`; `404` unknown |
 | `DELETE /api/sessions/by-slug/<slug>` | remove by **view slug**. `204`; `404` unknown |
 | `GET /api/sessions` | list `[{id, slug, live}]` — `live` means an operator is currently pushing |
 
-Removal by id and by slug are separate routes on purpose: an un-aliased
-session's slug **is** its id, so a single guessing route could delete the wrong
-thing. Deleting a session kicks its live pusher (whose next reconnect gets
-`403`) and drops everything the hub stored for it.
+Removal by id and by slug are separate routes on purpose: an un-aliased session's
+slug **is** its id, so a single guessing route could delete the wrong thing.
+Deleting a session kicks its live pusher (whose next reconnect gets `403`) and
+drops everything the hub stored for it. A newly added session is viewable
+immediately: until its pusher connects, `/s/<slug>` serves the built-in page in
+the operator-offline state and switches to the live session on the first push.
+`--allow` entries are ordinary registry entries — same placeholder, deletable
+over the API like any other.
 
-A session added over the API is viewable immediately: until its pusher
-connects, `/s/<slug>` serves the built-in page in the operator-offline state
-(the same look as a live session whose operator dropped) and switches to the
-real session automatically when the first push arrives. By default,
-runtime-added sessions are **ephemeral** — a hub restart forgets them; the
-managing tool is the source of truth and re-adds them.
-
-`--allow` entries are ordinary registry entries: they get the same
-operator-offline placeholder before their pusher connects, and the API can
-delete them like any other session. The difference is at restart — `--allow`
-is the declarative baseline, so a restart **re-seeds** flag-configured
-sessions (undoing runtime deletions of them), while API-added sessions are
-forgotten.
-
-**Persisting sessions across restarts.** Pass `--sessions-file <path>` and
-the registry survives restarts: every API mutation rewrites the file
-(atomically; it holds only public ids and slugs, no secrets). On startup, if
-the file exists it **is** the registry and `--allow` is ignored (announced on
-stderr); if it doesn't exist yet, `--allow` seeds it. So with the flag the
-asymmetry above disappears — deleting an `--allow`-seeded session sticks
-across restarts, because the file wins and `--allow` only seeds the first
-boot. A file that exists but can't be parsed is a startup error, never a
-silent fall back to `--allow` (re-seeding could resurrect sessions the API
-deleted).
+**Lifetime.** By default the registry lives in memory: a restart forgets API
+changes and re-seeds from `--allow`. Pass `--sessions-file <path>` to make it
+durable — every mutation atomically rewrites the file (public ids and slugs only,
+no secrets). On startup, a loadable file **is** the registry and `--allow` is
+ignored (announced on stderr); a missing file is seeded from `--allow`; a corrupt
+file is a startup error, never a silent fall back to `--allow` — re-seeding could
+resurrect sessions the API deleted.
 
 ## How it works
 
 ```
 command in a PTY  ── output bytes ─►  long-lived vt100 parser
-  → parser-agnostic StyledCell grid   → rectangle diffs (changed cells only)
+  → parser-agnostic StyledCell grid   → per-line diffs (changed spans only)
   → SSE deltas, encoded once per frame for all viewers
   → viewer.js renders cells → HTML in the browser
 ```
 
-The command runs in a pseudo-terminal you drive from your own terminal (the `script(1)`
-model): its output is teed to your screen immediately and, in parallel, fed to a
-long-lived vt100 parser snapshotted at up to 30fps. Each viewer gets a full frame on
-connect, then only the **changed rectangles** — a keystroke costs bytes, not a full
-screen — and a small baked-in renderer (`/viewer.js`) turns cells into HTML
-client-side. Terminal resizes (`SIGWINCH`) reflow both the PTY and the browser. In hub
-mode the client pushes frames over a **single persistent streaming connection** (not a
-request per frame), so throughput isn't gated by round-trip latency; the hub diffs them
-per session and re-serves the client's CSS, fonts, and render config. If the connection
-drops (hub restart, network blip) the client re-registers and reconnects automatically —
-and the local session pauses cleanly, showing the outage in your terminal until it's
-back.
+The command runs in a pseudo-terminal you drive from your own terminal (the
+`script(1)` model): its output is teed to your screen immediately and, in
+parallel, fed to a long-lived vt100 parser snapshotted at up to 30fps. Each
+viewer gets a full frame on connect, then only the **changed spans** — a
+keystroke costs bytes, not a full screen — and a small baked-in renderer
+(`/viewer.js`) turns cells into HTML client-side. Terminal resizes (`SIGWINCH`)
+reflow both the PTY and the browser. In hub mode the client pushes frames over a
+**single persistent WebSocket** (not a request per frame), so throughput isn't
+gated by round-trip latency; the hub relays them per session and re-serves the
+client's CSS, fonts, and render config. If the connection drops (hub restart,
+network blip) the client re-registers and reconnects automatically, showing the
+outage in your terminal until it's back.
 
 ## Inline images
 
-Terminal graphics are mirrored to the browser. When the session shows an image via any
-of the three inline-image protocols, viewers see it too — positioned at its terminal
-cell, scrolling with the content:
+When the session shows an image via any of the three inline-image protocols,
+viewers see it too — positioned at its terminal cell, scrolling with the content:
 
 | Protocol | Emitted by (e.g.) | Coverage |
 |----------|-------------------|----------|
@@ -235,117 +184,107 @@ cell, scrolling with the content:
 | **iTerm2** (`OSC 1337 File`) | `imgcat`, `wezterm imgcat`, `chafa -f iterm` | single-shot and multipart transfers; browser-native image formats (PNG, JPEG, GIF, WebP) |
 | **sixel** (`ESC P … q`) | `img2sixel`, `chafa -f sixel` | decoded and re-encoded to PNG (browsers don't render sixel) |
 
-**The mirror only shows what your terminal shows.** At startup shellglass asks the
-terminal which protocols it actually renders — kitty graphics via its query escape,
-sixel via the Primary DA feature list, iTerm2 (which has no query) by a small
-`TERM_PROGRAM` allowlist — and intercepts only those. A protocol your terminal doesn't
-render passes through untouched, so the browser stays faithful to the local screen in
-both directions: no image appears on the web that didn't appear in the terminal, and
-none is lost that did.
+**The mirror only shows what your terminal shows.** At startup shellglass asks
+the terminal which protocols it actually renders — kitty graphics via its query
+escape, sixel via the Primary DA feature list, iTerm2 (which has no query) by a
+small `TERM_PROGRAM` allowlist — and intercepts only those. A protocol your
+terminal doesn't render passes through untouched, so no image appears on the web
+that didn't appear in the terminal, and none is lost that did.
 
-Images behave like they do in a cell-based terminal: they scroll with the text, clip
-against the top edge on the way out, and disappear when the screen region they occupy is
-cleared or fully overwritten. Everything works in hub mode too — images ride the same
-frame stream, and late-joining viewers get any image currently on screen. The read-only
-SSH view is cells-only and does not show images.
+Images behave like they do in a cell-based terminal: they scroll with the text,
+clip against the top edge on the way out, and disappear when the screen region
+they occupy is cleared or overwritten. Hub mode included — images ride the same
+frame stream, and late-joining viewers get any image currently on screen. The
+read-only SSH view is cells-only and does not show images.
 
 ## Read-only SSH view
 
-Add `--ssh-bind <addr>` to `serve` or `hub` to also expose the session as a **read-only
-ANSI terminal view** over SSH — a live mirror in a plain terminal, no browser needed:
+Add `--ssh-bind <addr>` to `serve` or `hub` to also expose the session as a
+**read-only ANSI terminal view** over SSH — a live mirror in a plain terminal, no
+browser needed:
 
 ```sh
 # standalone: any username connects
 ./target/release/shellglass serve --ssh-bind 127.0.0.1:2222 -- htop
 ssh -p 2222 x@127.0.0.1
 
-# hub: the view handle (session id, or the slug if aliased) is the SSH username
+# hub: the view handle (session id, or its slug if aliased) is the SSH username
 ./target/release/shellglass hub --bind 127.0.0.1:8080 --ssh-bind 0.0.0.0:2222 --allow "$ID"
 ssh -p 2222 "$ID"@hub.example.com
 ```
 
-The **view handle is the SSH username** — the same one that goes in the `/s/<…>` URL (the
-session id, or its slug if you aliased one with `--allow <id>:<slug>`), so there's nothing
-to enter. The view is strictly
-read-only: input is dropped except `q` / Ctrl-C / Ctrl-D, which disconnect. A viewer
-terminal smaller than the session shows a top-left crop with a one-line status notice, and
-reflows on resize.
+The **view handle is the SSH username** — the same one that goes in the `/s/<…>`
+URL — so there's nothing to enter. Input is dropped except `q` / Ctrl-C / Ctrl-D,
+which disconnect. A viewer terminal smaller than the session shows a top-left
+crop with a one-line status notice, and reflows on resize.
 
-The SSH server uses its **own** ed25519 host key, kept separate from the machine's
-`/etc/ssh` identity on purpose — a shared key would extend the host's SSH trust to this
-accept-any read-only endpoint. Point `--ssh-host-key <path>` at a key to reuse across
-runs; without it a key is generated and persisted (0600) under
-`$XDG_STATE_HOME/shellglass/` so its fingerprint stays stable. The SSH view is optional
-and unsupervised: if it can't bind (e.g. a privileged port), the HTTP mirror still runs.
+The SSH server uses its **own** ed25519 host key, kept separate from the
+machine's `/etc/ssh` identity on purpose — a shared key would extend the host's
+SSH trust to this accept-any read-only endpoint. Point `--ssh-host-key <path>` at
+a key to reuse across runs; without it one is generated and persisted (0600)
+under `$XDG_STATE_HOME/shellglass/` so its fingerprint stays stable. The SSH view
+is optional and unsupervised: if it can't bind (e.g. a privileged port), the HTTP
+mirror still runs.
 
 ## Fonts
 
-`default_font` can be a single family or a **fallback stack** — `["Text Font", "Nerd
-Font"]`. The browser resolves each character against the stack in order, so a Nerd Font
-listed after your text font covers every glyph the text font lacks. That reproduces
-Kitty's fallback with no `symbol_map` ranges at all (see `config.kitty.toml`).
+`default_font` can be a single family or a **fallback stack** — `["Text Font",
+"Nerd Font"]`. The browser resolves each character against the stack in order, so
+a Nerd Font listed after your text font covers every glyph the text font lacks —
+Kitty's fallback behavior with no `symbol_map` ranges at all (see
+`config.kitty.toml`). The default is `["monospace", "Symbols Nerd Font Mono"]`,
+so Nerd-Font symbols render with **no config** if that font is installed
+system-wide.
 
-By default `default_font` is `["monospace", "Symbols Nerd Font Mono"]`, so Nerd-Font
-symbol glyphs render out of the box with **no config** if `Symbols Nerd Font Mono` is
-installed system-wide (it's part of the standard Nerd Fonts packages). Override
-`default_font` to use a different text font or symbol font.
-
-**Fonts are served, so viewers render them without a local install.** Every family
-referenced by `default_font`/`symbol_map` is located on the host running shellglass —
-via [`fontdb`] (a pure-Rust, cross-platform system font database; Linux, macOS and
-Windows, no subprocess), or an explicit `[fonts."Name"].path` — its file read once at
-startup, and served: standalone at `/fonts/<i>`, the hub **per
-session** at `/s/<slug>/fonts/<i>` (so two clients' fonts can't clash). The page's
-`@font-face` points at those URLs; responses are Brotli/gzip-compressed and sent with a
-day-long `Cache-Control` so a browser fetches each font once. A single face is extracted
-from a `.ttc` collection (e.g. macOS's `Menlo.ttc`) and served as a standalone web font.
-A font that can't be located is a soft failure (warn + skip); the browser just falls
-back. A `[fonts."Name"]` entry is optional — use `path` to serve a specific file
-(`.ttf`/`.otf`/`.ttc`/`.woff`/`.woff2`), or `system = "Other Name"` when the installed
-family name differs from the key.
+**Fonts are served, so viewers render them without a local install.** Every
+family referenced by `default_font`/`symbol_map` is located on the host — via
+[`fontdb`] (a pure-Rust system font database) or an explicit `[fonts."Name"].path`
+— read once at startup, and served: standalone at `/fonts/<i>`, the hub **per
+session** at `/s/<slug>/fonts/<i>` (so two clients' fonts can't clash). Responses
+are compressed and cached for a day. A single face is extracted from a `.ttc`
+collection; a font that can't be located is a soft failure (warn + skip, the
+browser falls back). In a `[fonts."Name"]` entry, `path` serves a specific file
+(`.ttf`/`.otf`/`.ttc`/`.woff`/`.woff2`) and `system = "Other Name"` maps to a
+differently-named installed family.
 
 [`fontdb`]: https://docs.rs/fontdb
 
-**Lines, blocks and powerline arrows are drawn, not fonted.** Box-drawing and block
-elements (`U+2500–259F`), the legacy-computing mosaics (sextants `U+1FB00–1FB3B` and
-one-eighth bars `U+1FB70–1FB7B`) and the powerline arrow separators (`U+E0B0–E0B3`) are
-synthesized as geometry on a `<canvas>` laid over the text — snapped to device pixels, so
-lines stay crisp, tile without seams, and render mixed light/heavy junctions (`┿ ╂ ┝`)
-faithfully at any zoom or display scale (including moving a window between a HiDPI and a
-regular monitor). These need **no font at all**, and the real glyph is kept underneath as
-transparent text so selection and copy/paste still work. Only the long tail — smooth-mosaic
-wedges, seven-segment and the rounded/flame powerline separators (`U+E0B4–E0D4`), plus
-anything you point `symbol_map` at — falls through to the SVG-scaled font path below.
+**Lines, blocks and powerline arrows are drawn, not fonted.** Box-drawing and
+block elements (`U+2500–259F`), the legacy-computing mosaics (sextants
+`U+1FB00–1FB3B`, one-eighth bars `U+1FB70–1FB7B`) and the powerline arrows
+(`U+E0B0–E0B3`) are synthesized as geometry on a `<canvas>` over the text —
+snapped to device pixels, so lines stay crisp, tile without seams, and junctions
+(`┿ ╂ ┝`) render faithfully at any zoom or display scale. The real glyph is kept
+underneath as transparent text so selection and copy/paste still work.
 
-`symbol_map` is still useful alongside the stack: its matched glyphs are SVG-scaled to
-lock to exactly one cell (so they tile seamlessly), which plain fallback — rendering at
-the font's own advance — doesn't do. The remaining separators (`U+E0B4–E0D4`) stretch to
-fill; other icons fit proportionally. `config.kitty.toml` reproduces kitty's zero-config
-powerline rendering by serving kitty's bundled `Symbols Nerd Font Mono` as a fallback.
+`symbol_map` is still useful alongside the stack: its matched glyphs are
+SVG-scaled to lock to exactly one cell (so they tile seamlessly), which plain
+fallback — rendering at the font's own advance — doesn't do. The long tail
+(rounded/flame powerline separators `U+E0B4–E0D4`, seven-segment, smooth
+mosaics) takes this path: separators stretch to fill, other icons fit
+proportionally.
 
 ## Templating
 
-The built-in page is a dark chrome with two nav toggles, each off by default and
-remembered per browser in localStorage:
+The built-in page is a dark chrome with nav toggles, each remembered per browser
+in localStorage:
 
 - **canvas** — the renderer switch, **on by default** (`?render=dom` flips a fresh
-  browser to DOM mode). On = every update paints on the canvas (footer tag
-  `canvas`), rendered by the terminal's own rules — ink seated inside the cell
-  box, decorations clamped into the cell — with the DOM underneath as transparent
-  ghost text so select/copy/find keep working. Off = the classic CSS-native DOM
-  renderer: real links, native selection and find.
+  browser to DOM mode). On = every update paints on a canvas, rendered by the
+  terminal's own rules — ink seated inside the cell box, decorations clamped into
+  the cell — with the DOM underneath as transparent ghost text so
+  select/copy/find keep working. Off = the classic CSS-native DOM renderer: real
+  links, native selection and find.
 - **storm** — only shown in DOM mode; off by default (`?storm=on` opts in). Gates
-  DOM mode's automatic escalation to the canvas under full-screen animation load
-  (footer tag `storm`). Leave it off to keep full DOM text semantics at whatever
-  frame rate the DOM manages.
-- **CRT** — a CRT tube effect (scanlines, phosphor bloom, flicker, vignette; also
-  `?crt`). Works in both renderer modes.
+  DOM mode's automatic escalation to the canvas under full-screen animation load.
+- **CRT** — a CRT tube effect (scanlines, phosphor bloom, flicker, vignette;
+  also `?crt`). Works in both renderer modes.
 
-`?cursor=smooth` (opt-in, canvas rendering only) makes the cursor glide between
-cells over ~80ms instead of teleporting.
+`?cursor=smooth` (canvas rendering only) makes the cursor glide between cells
+over ~80ms instead of teleporting.
 
-For a fully custom page, point `template` at a full HTML document with three tokens
-the renderer fills at serve time:
+For a fully custom page, point `template` at a full HTML document with three
+tokens the renderer fills at serve time:
 
 | Token | Filled with |
 |-------|-------------|
@@ -358,19 +297,17 @@ the renderer fills at serve time:
 template = "my-viewer.html"
 ```
 
-Everything around those tokens is yours — nav, wrapper, footer, extra `<style>`. Only
-`{{screen}}`'s `#screen` id is load-bearing (the updater targets it); the others can be
-placed anywhere in the document. Terminal content that happens to contain a literal
-token string is left intact. In hub mode the client pushes its template to the hub, so
-custom pages work off-box too.
+Everything around those tokens is yours — nav, wrapper, footer, extra `<style>`.
+Only `{{screen}}`'s `#screen` id is load-bearing (the updater targets it). In hub
+mode the client pushes its template to the hub, so custom pages work off-box too.
 
 ## Security notes
 
-- The **secret** is a bearer capability. Anyone who has it can push to that session;
-  anyone with the **view URL** can watch. Use a long random secret and share the URL
-  only with people who should see the session.
-- The secret travels in a header on the `/push` WebSocket upgrade. Terminate TLS so it
-  isn't sent in the clear. The hub can do this itself:
+- The **secret** is a bearer capability. Anyone who has it can push to that
+  session; anyone with the **view URL** can watch. Use a long random secret
+  (`gen-key`) and share the URL only with people who should see the session.
+- The secret travels in a header on the `/push` WebSocket upgrade. Terminate TLS
+  so it isn't sent in the clear. The hub can do this itself:
 
   ```sh
   # your own certificate
@@ -384,39 +321,36 @@ custom pages work off-box too.
     --acme-cache /var/lib/shellglass/acme --acme-production
   ```
 
-  ACME defaults to Let's Encrypt **staging** (untrusted certs, generous rate limits)
-  so you can test the plumbing; add `--acme-production` for real certs. Always set
-  `--acme-cache` or the account + certificate are re-issued on every restart.
-  Otherwise, run behind a TLS-terminating reverse proxy (Traefik, nginx, …). The
+  ACME defaults to Let's Encrypt **staging** (untrusted certs, generous rate
+  limits) so you can test the plumbing; add `--acme-production` for real certs,
+  and always set `--acme-cache` or the account + certificate are re-issued on
+  every restart.
+- Behind a TLS-terminating reverse proxy (Traefik, nginx, …) instead: the
   client's `push` URL just needs to be `https://…`, and the hub honors
-  `X-Forwarded-Proto`/`X-Forwarded-Host` so the view URL it prints on connect
-  matches the proxy's public address, not the hub's internal bind. The push is a
-  WebSocket (`/push`), so forward the `Upgrade`/`Connection` headers — nginx then
-  tunnels it without buffering (its default `proxy_request_buffering on` would
-  otherwise stall the stream). Viewer streams (`/s/<id>/events`, SSE) send
-  `X-Accel-Buffering: no`, so nginx won't buffer those either.
-- The hub trusts allowed clients: it caps a single pushed WebSocket message at 16 MB
-  (a full frame with fonts is smaller) but does not otherwise rate-limit the content.
-  A bad-key flood is bounded (concurrent auth hashes are capped and each rejection is
-  logged for fail2ban), but don't expose an open hub to the internet.
-- The read-only SSH view (`--ssh-bind`) authorizes by the **session id in the username** —
-  the same read capability as the view URL. It accepts any connection and shows the session
-  read-only, so treat exposing it like sharing the view URL. It uses a dedicated ed25519
-  host key, never the machine's `/etc/ssh` key.
+  `X-Forwarded-Proto`/`X-Forwarded-Host` so the view URL it prints matches the
+  proxy's public address. The push is a WebSocket (`/push`), so forward the
+  `Upgrade`/`Connection` headers — nginx then tunnels it without buffering.
+  Viewer streams (`/s/<id>/events`, SSE) send `X-Accel-Buffering: no`, so nginx
+  won't buffer those either.
+- The hub trusts allowed clients: it caps a pushed WebSocket message at 16 MB but
+  does not otherwise rate-limit the content. A bad-key flood is bounded
+  (concurrent auth hashes are capped, each rejection logged for fail2ban), but
+  don't expose an open hub to the internet.
+- The read-only SSH view authorizes by the **session id in the username** — the
+  same read capability as the view URL. Treat exposing it like sharing the view
+  URL.
 
 ## Status
 
-Mirror an interactive command in a PTY (the `script(1)` model, one screen) with live
-rendering, inline images (kitty graphics / iTerm2 / sixel, gated on what the terminal
-renders), standalone + client/hub push, an optional read-only SSH view (`--ssh-bind`),
-viewer templating (built-in page with a CRT toggle, or a custom template), and optional
-hub TLS (own cert or ACME/Let's Encrypt). Modes are cargo features: the default build
-is the full multi-call `shellglass`, and `cargo build --no-default-features --features
-hub` (or `serve`, `push`) yields a slim build; per-mode binaries (`shellglass-hub`,
-`shellglass-serve`, `shellglass-push`, `shellglass-gen-key`, `shellglass-print-id`)
-wrap the same CLI code. Not yet: multiple sessions/panes in one view.
-Not planned: scrollback — the mirror shows the live screen, like a glance over the
-operator's shoulder; your own terminal already has history.
+Everything above works today; the terminal emulation (a vendored vt100 with
+local fidelity fixes), inline images, and both renderers are exercised by CI.
+Modes are cargo features: the default build is the full multi-call `shellglass`;
+`cargo build --no-default-features --features hub` (or `serve`, `push`,
+`sessions`) yields a slim build, and per-mode binaries
+(`shellglass-{serve,push,hub,sessions,gen-key,print-id}`) wrap the same CLI.
+Not yet: multiple sessions/panes in one view. Not planned: scrollback — the
+mirror shows the live screen, like a glance over the operator's shoulder; your
+own terminal already has history.
 
 ## License
 
