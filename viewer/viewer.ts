@@ -610,7 +610,11 @@ function sizeCanvas(): void {
   if (!rect.width || !rect.height) return;
   cellW = rect.width / gCols;
   cellH = rect.height / gRows;
-  dpr = window.devicePixelRatio || 1;
+  // vvScale folds pinch (visual-viewport) zoom into the backing density —
+  // the compositor magnifies the layer by the same factor, so drawing at
+  // dpr·scale keeps the final on-screen density 1:1 instead of blurring the
+  // raster (canvas track D.5).
+  dpr = (window.devicePixelRatio || 1) * vvScale;
   canvasEl.width = Math.round(rect.width * dpr);
   canvasEl.height = Math.round(rect.height * dpr);
   // Storm mode draws text on the canvas with the same face the DOM uses; capture it
@@ -626,6 +630,25 @@ function sizeCanvas(): void {
   const z = localW > 0 ? rect.width / localW : 1;
   fontPx = parseFloat(cs.fontSize) * z * dpr;
   fontFam = cs.fontFamily;
+}
+
+// Pinch (visual-viewport) zoom scales the composited layer with no resize or
+// dpr event — the canvas raster would just blur while DOM text re-rasterizes
+// crisp. visualViewport fires `resize` on exactly that gesture: fold its
+// scale (capped 3× to bound backing-store memory) into the density and
+// repaint (canvas track D.5).
+let vvScale = 1;
+let vvHooked = false;
+function watchPinch(): void {
+  if (vvHooked || typeof visualViewport === "undefined" || visualViewport === null) return;
+  vvHooked = true;
+  visualViewport.addEventListener("resize", () => {
+    const s = Math.min(3, Math.max(1, visualViewport?.scale ?? 1));
+    if (Math.abs(s - vvScale) < 0.01) return;
+    vvScale = s;
+    sizeCanvas();
+    redrawCanvasAll();
+  });
 }
 
 // devicePixelRatio can change with NO .screen resize when a window moves between a
@@ -671,6 +694,7 @@ function attachCanvas(cols: number, rows: number, screenDiv: HTMLElement): void 
   gRows = rows;
   sizeCanvas();
   watchZoom();
+  watchPinch();
   if (typeof ResizeObserver !== "undefined") {
     if (!ro) ro = new ResizeObserver(() => { sizeCanvas(); redrawCanvasAll(); });
     ro.disconnect();
@@ -2519,6 +2543,12 @@ export function benchWeight(on: boolean): void {
 // per-cell rendering — a formed ligature makes the bands differ).
 export function benchRuns(on: boolean): void {
   runsOn = on;
+  redrawCanvasAll();
+}
+// Simulate a pinch (visual-viewport) scale — headless can't gesture.
+export function benchPinch(s: number): void {
+  vvScale = Math.min(3, Math.max(1, s));
+  sizeCanvas();
   redrawCanvasAll();
 }
 

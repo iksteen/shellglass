@@ -18,7 +18,7 @@
 <input type="checkbox" id="crt" hidden>
 <div id="screen"></div>
 <script type="module">
-import { setConfig, apply, benchInit, benchStorm, benchFlush, benchCursorStep, benchBlinkPhase, benchWeight, benchRuns, weightBoost } from "./viewer.js";
+import { setConfig, apply, benchInit, benchStorm, benchFlush, benchCursorStep, benchBlinkPhase, benchWeight, benchRuns, benchPinch, weightBoost } from "./viewer.js";
 
 const PARAMS = new URLSearchParams(location.search);
 const MODE = PARAMS.get("mode") ?? "dom";
@@ -406,6 +406,36 @@ if (MODE === "stems") {
   benchFlush();
   benchStorm(true);
   if (PARAMS.get("runs") === "off") benchRuns(false);
+}
+
+// ?mode=pinch: visual-viewport zoom re-rasterization — simulating a 1.5×
+// pinch must grow the backing store by 1.5× in each dimension and re-render
+// the text at the higher density (more device-pixel ink), and releasing the
+// pinch must restore the original store. Green/red convention.
+if (MODE === "pinch") {
+  const dp = [];
+  for (let i = 0; i < ROWS; i++) dp.push([[pad(`row ${i} pinch probe text`)]]);
+  apply({ d: dp, w: COLS, h: ROWS });
+  benchFlush();
+  benchStorm(true);
+  const canvas = document.querySelector("#screen canvas");
+  const g = canvas.getContext("2d");
+  const ink = () => {
+    const px = g.getImageData(0, 0, canvas.width, canvas.height).data;
+    let t = 0;
+    for (let i = 3; i < px.length; i += 4) if (px[i] > 0) t++;
+    return t;
+  };
+  const w0 = canvas.width, h0 = canvas.height, ink0 = ink();
+  benchPinch(1.5);
+  const scaled = Math.abs(canvas.width - Math.round(w0 * 1.5)) <= 2
+    && Math.abs(canvas.height - Math.round(h0 * 1.5)) <= 2
+    && ink() > ink0 * 1.7; // ~1.5² denser ink, minus AA slack
+  benchPinch(1);
+  const restored = canvas.width === w0 && canvas.height === h0;
+  const pass = scaled && restored;
+  document.getElementById("screen").style.display = "none";
+  document.body.style.background = pass ? "#00ff00" : "#ff0000";
 }
 
 // ?mode=crt: canvas phosphor self-check — flipping the #crt toggle on must

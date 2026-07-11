@@ -338,7 +338,7 @@ function sizeCanvas() {
         return;
     cellW = rect.width / gCols;
     cellH = rect.height / gRows;
-    dpr = window.devicePixelRatio || 1;
+    dpr = (window.devicePixelRatio || 1) * vvScale;
     canvasEl.width = Math.round(rect.width * dpr);
     canvasEl.height = Math.round(rect.height * dpr);
     const cs = getComputedStyle(obsScreen);
@@ -346,6 +346,21 @@ function sizeCanvas() {
     const z = localW > 0 ? rect.width / localW : 1;
     fontPx = parseFloat(cs.fontSize) * z * dpr;
     fontFam = cs.fontFamily;
+}
+let vvScale = 1;
+let vvHooked = false;
+function watchPinch() {
+    if (vvHooked || typeof visualViewport === "undefined" || visualViewport === null)
+        return;
+    vvHooked = true;
+    visualViewport.addEventListener("resize", () => {
+        const s = Math.min(3, Math.max(1, visualViewport?.scale ?? 1));
+        if (Math.abs(s - vvScale) < 0.01)
+            return;
+        vvScale = s;
+        sizeCanvas();
+        redrawCanvasAll();
+    });
 }
 function onDprChange() {
     sizeCanvas();
@@ -380,6 +395,7 @@ function attachCanvas(cols, rows, screenDiv) {
     gRows = rows;
     sizeCanvas();
     watchZoom();
+    watchPinch();
     if (typeof ResizeObserver !== "undefined") {
         if (!ro)
             ro = new ResizeObserver(() => { sizeCanvas(); redrawCanvasAll(); });
@@ -1813,6 +1829,11 @@ export function benchWeight(on) {
 }
 export function benchRuns(on) {
     runsOn = on;
+    redrawCanvasAll();
+}
+export function benchPinch(s) {
+    vvScale = Math.min(3, Math.max(1, s));
+    sizeCanvas();
     redrawCanvasAll();
 }
 function main() {
