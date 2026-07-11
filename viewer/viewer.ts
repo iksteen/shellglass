@@ -2352,14 +2352,22 @@ function paintFull(dims: { w: number; h: number; i?: ImageRef[] }): void {
   });
 }
 
-// `<img>` overlays positioned at their cell. Given cols/rows, the image is fit into
-// that cell box preserving its own aspect (`contain`, anchored top-left) rather than
-// stretched — the emitter (e.g. chafa) sizes the cell box for the *local* terminal's
-// cell ratio, which needn't match the browser's, so stretching would distort.
-// Without a size it renders at natural pixel size.
+// `<img>` overlays positioned at their cell; without a size (no cols/rows)
+// they render at natural pixel size, with one contain-fitted into the cell
+// box (see the injected .sized rule).
+// The inline style carries ONLY custom properties (grid coordinates); all
+// actual layout lives in the viewer-injected stylesheet rules keyed on them.
+// Inline styles are intrinsic to the element and ride every copied fragment —
+// exporting ch/var()/object-fit inline is what squished pasted images in
+// paste targets that half-parse them (LibreOffice). Custom properties mean
+// nothing outside our page, so a pasted image falls back to its natural
+// dimensions: the true bitmap, correct aspect.
 function renderImage(im: ImageRef): string {
-  const size = im.w && im.h ? `width:${im.w}ch;height:calc(${im.h} * var(--lh));object-fit:contain;object-position:left top;` : "";
-  return `<img class="inline-img" alt="" src="data:${im.m};base64,${im.d}" style="position:absolute;left:${im.c}ch;top:calc(${im.r} * var(--lh));${size}z-index:3;pointer-events:none;">`;
+  const sized = im.w && im.h;
+  const vars =
+    `--sg-c:${im.c};--sg-r:${im.r}` +
+    (sized ? `;--sg-w:${im.w};--sg-h:${im.h}` : "");
+  return `<img class="inline-img${sized ? " sized" : ""}" style="${vars}" alt="" src="data:${im.m};base64,${im.d}">`;
 }
 
 function decodeRow([r, l, text, style]: WireRow): { r: number; l: number; cells: Cell[] } {
@@ -2511,7 +2519,19 @@ function injectViewerCss(): void {
     "#screen a.run{color:inherit;text-decoration:none}" +
     "#screen a.run:hover{text-decoration:underline}" +
     // SGR 5 blink, DOM path: ink transparent for the cycle's second half
-    "@keyframes sg-blink{50%,100%{color:transparent}}";
+    "@keyframes sg-blink{50%,100%{color:transparent}}" +
+    // Inline-image layout, sourced from the per-element custom properties —
+    // deliberately NOT inline styles, so copied fragments paste at natural
+    // size instead of dragging half-parseable ch/var() sizing along (see
+    // renderImage). The .sized box is contain-fitted, anchored top-left: the
+    // emitter sized the cell box for the LOCAL terminal's cell ratio, which
+    // needn't match the browser's, so stretching would distort.
+    "#screen img.inline-img{position:absolute;" +
+    "left:calc(var(--sg-c)*1ch);top:calc(var(--sg-r)*var(--lh));" +
+    "z-index:3;pointer-events:none}" +
+    "#screen img.inline-img.sized{width:calc(var(--sg-w)*1ch);" +
+    "height:calc(var(--sg-h)*var(--lh));" +
+    "object-fit:contain;object-position:left top}";
   document.head.appendChild(linkCss);
 }
 

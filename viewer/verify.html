@@ -121,9 +121,13 @@ if (MODE === "image") {
     const imgPx = px(3.5 * cw, 3.5 * lh); // row 3 col 3: image, no text
     const txtPx = px(5 * cw + 1, 2 * lh + 1); // row 2 col 5: text cell corner → bg
     const hidden = getComputedStyle(img).visibility === "hidden";
-    // hidden via the stylesheet CLASS, never inline — an inline style would
-    // ride the copied fragment and paste the image invisibly
-    const noInline = img.style.visibility === "";
+    // the inline style must carry NOTHING but --sg-* custom properties —
+    // real layout properties ride the copied fragment and squish/hide the
+    // pasted image in targets that half-parse ch/var() (LibreOffice)
+    const noInline = [...img.style].every((p) => p.startsWith("--sg-"));
+    // and the page must still lay it out (through the injected rules)
+    const cs = getComputedStyle(img);
+    const laidOut = cs.position === "absolute" && cs.objectFit === "contain";
     // copy semantics: the image sits in document order between the rows it
     // spans, so a selection over those rows carries it (clipboard HTML)
     const rows = document.querySelectorAll("#screen .row");
@@ -133,7 +137,7 @@ if (MODE === "image") {
     const copied = range.cloneContents().querySelector("img.inline-img") !== null;
     benchStorm(false);
     const shown = getComputedStyle(img).visibility !== "hidden";
-    const pass = hidden && noInline && copied && shown
+    const pass = hidden && noInline && laidOut && copied && shown
       && imgPx[0] > 180 && imgPx[1] < 60 // red image under blank cells
       && txtPx[0] < 60 && txtPx[1] < 60 && txtPx[2] < 60; // painted bg under text
     document.getElementById("screen").style.display = "none";

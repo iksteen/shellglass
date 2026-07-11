@@ -1667,8 +1667,10 @@ function paintFull(dims) {
     });
 }
 function renderImage(im) {
-    const size = im.w && im.h ? `width:${im.w}ch;height:calc(${im.h} * var(--lh));object-fit:contain;object-position:left top;` : "";
-    return `<img class="inline-img" alt="" src="data:${im.m};base64,${im.d}" style="position:absolute;left:${im.c}ch;top:calc(${im.r} * var(--lh));${size}z-index:3;pointer-events:none;">`;
+    const sized = im.w && im.h;
+    const vars = `--sg-c:${im.c};--sg-r:${im.r}` +
+        (sized ? `;--sg-w:${im.w};--sg-h:${im.h}` : "");
+    return `<img class="inline-img${sized ? " sized" : ""}" style="${vars}" alt="" src="data:${im.m};base64,${im.d}">`;
 }
 function decodeRow([r, l, text, style]) {
     if (typeof text === "string") {
@@ -1792,7 +1794,13 @@ function injectViewerCss() {
     linkCss.textContent =
         "#screen a.run{color:inherit;text-decoration:none}" +
             "#screen a.run:hover{text-decoration:underline}" +
-            "@keyframes sg-blink{50%,100%{color:transparent}}";
+            "@keyframes sg-blink{50%,100%{color:transparent}}" +
+            "#screen img.inline-img{position:absolute;" +
+            "left:calc(var(--sg-c)*1ch);top:calc(var(--sg-r)*var(--lh));" +
+            "z-index:3;pointer-events:none}" +
+            "#screen img.inline-img.sized{width:calc(var(--sg-w)*1ch);" +
+            "height:calc(var(--sg-h)*var(--lh));" +
+            "object-fit:contain;object-position:left top}";
     document.head.appendChild(linkCss);
 }
 export function benchInit(el) {
