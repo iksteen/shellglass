@@ -286,6 +286,7 @@ export function weightCurve(fgLum: number, bgLum: number, a: number): number {
 // ponytail: a corrected-alpha glyph sprite atlas (kitty's architecture) is
 // the exact-per-pixel upgrade path if the midtone fit ever shows.
 let weightOn = true;
+let runsOn = true; // run-shaped text (D.2); bench hook can force per-cell
 const weightBoosts = new Map<string, number>(); // luminance bucket → k
 export function weightBoost(fg: RGB, bg: RGB): number {
   if (!weightOn) return 0;
@@ -1275,6 +1276,50 @@ function drawRowStorm(r: number): void {
   // Block cursors reverse the cell, like a terminal's; underline/bar cursors
   // draw their shape and leave the colors alone.
   const blocky = screen.sty <= 2;
+  // Run-shaped text (D.2): the pending same-style run. Flushed as one
+  // fillText when the grid guard holds — a terminal ligature font designs
+  // its multi-cell glyphs to span exactly their cells, so the shaped width
+  // must equal the grid width; a proportional fallback that would break the
+  // grid falls back to per-cell draws with the maxWidth clamp.
+  let runBuf: {
+    cells: { t: string; x0: number; x1: number }[];
+    text: string;
+    x0: number;
+    xEnd: number;
+    font: string;
+    fg: string;
+    k: number;
+  } | null = null;
+  const flushRun = (): void => {
+    if (!ctx || runBuf === null) return;
+    const b = runBuf;
+    runBuf = null;
+    if (b.font !== curFont) {
+      ctx.font = b.font;
+      curFont = b.font;
+    }
+    ctx.fillStyle = b.fg;
+    const expected = b.xEnd - b.x0;
+    // single cells can't shape — skip the measure, keep the old clamp path
+    const gridSafe =
+      b.cells.length > 1 &&
+      Math.abs(ctx.measureText(b.text).width - expected) <= Math.max(dpr, expected * 0.005);
+    const drawText = (): void => {
+      if (!ctx) return;
+      if (gridSafe) {
+        ctx.fillText(b.text, b.x0, baseY);
+      } else {
+        for (const cc of b.cells) ctx.fillText(cc.t, cc.x0, baseY, cc.x1 - cc.x0);
+      }
+    };
+    drawText();
+    // kitty-parity composition (D.1): boost AA midtones — see weightBoost
+    if (b.k > 0) {
+      ctx.globalAlpha = b.k;
+      drawText();
+      ctx.globalAlpha = 1;
+    }
+  };
   let hasBlink = false;
   let c = 0;
   for (const cell of row) {
@@ -1307,50 +1352,73 @@ function drawRowStorm(r: number): void {
     const hidden = !!cell.o || (!!cell.x && blinkPhase); // conceal / blink-off phase
     const cp = hidden ? 0 : cell.t ? cell.t.codePointAt(0)! : 0;
     if (cp && isCanvasGlyph(cp) && !(cp >= 0xe000 && symbolFamily(cp))) {
+      flushRun();
       drawGlyph(r, c, cp, cell, curBlock);
     } else if (!hidden && cell.t && cell.t !== " ") {
       // symbol_map / fill-glyph cells draw with their mapped family — canvas
       // uses the served webfonts once loaded, same faces as the DOM path.
-      const fam = svgFont(cell) ?? fontFam;
+      const mapped = svgFont(cell);
+      const fam = mapped ?? fontFam;
       const font = `${cell.i ? "italic " : ""}${cell.b ? "bold " : ""}${fontPx}px ${fam}`;
-      if (font !== curFont) {
-        ctx.font = font;
-        curFont = font;
-      }
       const fgRgb = cellFg(cell, curBlock);
       const fg = hex(fgRgb);
-      ctx.fillStyle = fg;
-      const ink = isFillGlyph(cp) ? inkBox(font, cell.t) : null;
-      const drawText = (): void => {
-        if (!ctx) return;
-        if (ink !== null) {
-          // Fill glyphs tile the cell like the DOM's stretched SVG: map the
-          // glyph's ink box onto the exact cell rect, so separators and block
-          // fills leave no hairline gaps.
-          const sx = (x1 - x0) / (ink.l + ink.r);
-          const sy = (y1 - y0) / (ink.a + ink.d);
-          ctx.save();
-          ctx.translate(x0 + ink.l * sx, y0 + ink.a * sy);
-          ctx.scale(sx, sy);
-          ctx.fillText(cell.t!, 0, 0);
-          ctx.restore();
-        } else if (cp && glyphOverflowsCell(cell.t!, w) && !symbolFamily(cp)) {
-          // Over-wide fallback glyphs overflow their cell, like the DOM's
-          // own-cell quarantine with overflow:visible — no maxWidth squeeze.
-          ctx.fillText(cell.t!, x0, baseY);
-        } else {
-          ctx.fillText(cell.t!, x0, baseY, x1 - x0);
-        }
-      };
-      drawText();
-      // kitty-parity composition (D.1): second pass boosts AA midtones toward
-      // the linear-blend weight — see weightBoost.
       const k = weightBoost(fgRgb, bg ?? defBgRgb);
-      if (k > 0) {
-        ctx.globalAlpha = k;
+      const ink = isFillGlyph(cp) ? inkBox(font, cell.t) : null;
+      const overflow = ink === null && glyphOverflowsCell(cell.t, w) && !symbolFamily(cp);
+      if (ink !== null || overflow || mapped !== null || !runsOn) {
+        // fit-to-cell / overflow / symbol_map cells keep their per-cell
+        // geometry — shaping across them makes no sense
+        flushRun();
+        if (font !== curFont) {
+          ctx.font = font;
+          curFont = font;
+        }
+        ctx.fillStyle = fg;
+        const drawText = (): void => {
+          if (!ctx) return;
+          if (ink !== null) {
+            // Fill glyphs tile the cell like the DOM's stretched SVG: map the
+            // glyph's ink box onto the exact cell rect, so separators and
+            // block fills leave no hairline gaps.
+            const sx = (x1 - x0) / (ink.l + ink.r);
+            const sy = (y1 - y0) / (ink.a + ink.d);
+            ctx.save();
+            ctx.translate(x0 + ink.l * sx, y0 + ink.a * sy);
+            ctx.scale(sx, sy);
+            ctx.fillText(cell.t!, 0, 0);
+            ctx.restore();
+          } else if (overflow) {
+            // Over-wide fallback glyphs overflow their cell, like the DOM's
+            // own-cell quarantine with overflow:visible — no maxWidth squeeze.
+            ctx.fillText(cell.t!, x0, baseY);
+          } else {
+            ctx.fillText(cell.t!, x0, baseY, x1 - x0);
+          }
+        };
         drawText();
-        ctx.globalAlpha = 1;
+        // kitty-parity composition (D.1): boost AA midtones — see weightBoost
+        if (k > 0) {
+          ctx.globalAlpha = k;
+          drawText();
+          ctx.globalAlpha = 1;
+        }
+      } else {
+        // Run-shaped text (D.2): contiguous same-style cells accumulate and
+        // draw as ONE fillText so the browser's shaper forms ligatures and
+        // joins scripts, exactly as the DOM path's coalesced spans do.
+        if (
+          runBuf !== null &&
+          (runBuf.font !== font || runBuf.fg !== fg || runBuf.k !== k || runBuf.xEnd !== x0)
+        ) {
+          flushRun();
+        }
+        if (runBuf === null) runBuf = { cells: [], text: "", x0, xEnd: x0, font, fg, k };
+        runBuf.cells.push({ t: cell.t, x0, x1 });
+        runBuf.text += cell.t;
+        runBuf.xEnd = x1;
       }
+    } else {
+      flushRun(); // blanks, spaces and hidden cells end the shaping run
     }
     // Decorations: underline in the cell's style and SGR 58 color,
     // strikethrough through the x-height. Cell-level, not inside the text
@@ -1381,6 +1449,7 @@ function drawRowStorm(r: number): void {
     }
     c += w;
   }
+  flushRun();
   noteBlinkRow(r, hasBlink);
   if (crtOn()) {
     // Phosphor bloom: blurred lighter self-composite of the row band, glowing
@@ -2345,6 +2414,12 @@ export function benchBlinkPhase(on: boolean): void {
 // with the filter off against the weightCurve prediction with it on).
 export function benchWeight(on: boolean): void {
   weightOn = on;
+  redrawCanvasAll();
+}
+// Toggle run-shaped text (verify.py compares shaped runs against forced
+// per-cell rendering — a formed ligature makes the bands differ).
+export function benchRuns(on: boolean): void {
+  runsOn = on;
   redrawCanvasAll();
 }
 

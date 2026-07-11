@@ -568,7 +568,17 @@ rasterizer at terminal sizes).
    prediction within ε, and eyeball on the dogfood session. DOM mode
    cannot be fixed (CSS exposes no text blend math) — document as a
    canvas-mode advantage.
-2. **Run-shaped text: ligatures, kerning, joined scripts.** In
+2. ✅ **Run-shaped text: ligatures, kerning, joined scripts** (landed
+   2026-07-11, `canvas-track-d`): `drawRowStorm` accumulates contiguous
+   same-style cells (same font/fg/weight-bucket, plain glyphs only —
+   fill/overflow/symbol/hidden cells and spaces break the run) and draws
+   ONE `fillText`, guarded by `measureText` against the grid width (±1
+   device px / 0.5%); mismatches fall back to per-cell with the maxWidth
+   clamp. Canvas fillText DOES apply calt — verified: `?mode=liga` renders
+   JetBrainsMono NF `=> != === ->` materially differently from forced
+   per-cell (benchRuns hook) with equal ink extent. Bench unchanged
+   (26fps ceiling / 59fps at 200×60). Original sketch below.
+   In
    `drawRowStorm`, coalesce contiguous same-style text cells (same resolved
    font + fg, no geometric/fill/overwide/cursor cells) into ONE
    `fillText(run, x0, baseY)` — the browser shapes whole runs (FiraCode

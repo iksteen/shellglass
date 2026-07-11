@@ -18,7 +18,7 @@
 <input type="checkbox" id="crt" hidden>
 <div id="screen"></div>
 <script type="module">
-import { setConfig, apply, benchInit, benchStorm, benchFlush, benchCursorStep, benchBlinkPhase, benchWeight, weightBoost } from "./viewer.js";
+import { setConfig, apply, benchInit, benchStorm, benchFlush, benchCursorStep, benchBlinkPhase, benchWeight, benchRuns, weightBoost } from "./viewer.js";
 
 const PARAMS = new URLSearchParams(location.search);
 const MODE = PARAMS.get("mode") ?? "dom";
@@ -351,6 +351,48 @@ if (MODE === "weight") {
   document.getElementById("screen").style.display = "none";
   document.body.style.background = pass ? "#00ff00"
     : `rgb(${Math.min(255, Math.round(p95 * 1000))}, ${Math.min(255, Math.round(p50 * 1000))}, ${Math.min(255, solidBad)})`;
+}
+
+// ?mode=liga: run-shaped text — under a ligature font (JetBrainsMono NF's
+// calt: => != === ->), the shaped run must render DIFFERENT glyphs than
+// forced per-cell drawing, while keeping the same ink extent (the grid
+// guard). Skips green when the font isn't installed. Green/red convention.
+if (MODE === "liga") {
+  const fam = '"JetBrainsMono Nerd Font"';
+  document.getElementById("screen").style.fontFamily = `${fam}, monospace`;
+  if (!document.fonts.check(`14px ${fam}`)) {
+    document.getElementById("screen").style.display = "none";
+    document.body.style.background = "#00ff00"; // not installed: skip
+  } else {
+    const dl = [];
+    for (let i = 0; i < ROWS; i++) dl.push([[pad("")]]);
+    dl[2] = [[pad("a => b != c === d -> e")]];
+    apply({ d: dl, w: COLS, h: ROWS });
+    benchFlush();
+    benchStorm(true);
+    const canvas = document.querySelector("#screen canvas");
+    const g = canvas.getContext("2d");
+    const lh = 17 * devicePixelRatio;
+    const band = () =>
+      g.getImageData(0, Math.round(2 * lh), canvas.width, Math.round(lh)).data;
+    const shaped = band(); // runs on (default)
+    benchRuns(false);
+    const percell = band();
+    benchRuns(true);
+    let diff = 0, inkShaped = 0, inkCell = 0;
+    for (let i = 3; i < shaped.length; i += 4) {
+      if (shaped[i] > 0) inkShaped++;
+      if (percell[i] > 0) inkCell++;
+      if (Math.abs(shaped[i] - percell[i]) > 32) diff++;
+    }
+    // ligatures formed = materially different pixels; similar total ink =
+    // the grid guard held (no smeared/shifted run)
+    const pass = inkShaped > 400 && diff > 50
+      && Math.abs(inkShaped - inkCell) < inkShaped * 0.25;
+    document.getElementById("screen").style.display = "none";
+    document.body.style.background = pass ? "#00ff00"
+      : `rgb(${Math.min(255, diff)}, ${Math.min(255, Math.round(inkShaped / 10))}, ${Math.min(255, Math.round(inkCell / 10))})`;
+  }
 }
 
 // ?mode=crt: canvas phosphor self-check — flipping the #crt toggle on must

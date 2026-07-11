@@ -102,6 +102,7 @@ export function weightCurve(fgLum, bgLum, a) {
     return Math.min(1, Math.max(0, (t - bgLum) / (fgLum - bgLum)));
 }
 let weightOn = true;
+let runsOn = true;
 const weightBoosts = new Map();
 export function weightBoost(fg, bg) {
     if (!weightOn)
@@ -910,6 +911,38 @@ function drawRowStorm(r) {
     };
     let curFont = "";
     const blocky = screen.sty <= 2;
+    let runBuf = null;
+    const flushRun = () => {
+        if (!ctx || runBuf === null)
+            return;
+        const b = runBuf;
+        runBuf = null;
+        if (b.font !== curFont) {
+            ctx.font = b.font;
+            curFont = b.font;
+        }
+        ctx.fillStyle = b.fg;
+        const expected = b.xEnd - b.x0;
+        const gridSafe = b.cells.length > 1 &&
+            Math.abs(ctx.measureText(b.text).width - expected) <= Math.max(dpr, expected * 0.005);
+        const drawText = () => {
+            if (!ctx)
+                return;
+            if (gridSafe) {
+                ctx.fillText(b.text, b.x0, baseY);
+            }
+            else {
+                for (const cc of b.cells)
+                    ctx.fillText(cc.t, cc.x0, baseY, cc.x1 - cc.x0);
+            }
+        };
+        drawText();
+        if (b.k > 0) {
+            ctx.globalAlpha = b.k;
+            drawText();
+            ctx.globalAlpha = 1;
+        }
+    };
     let hasBlink = false;
     let c = 0;
     for (const cell of row) {
@@ -934,45 +967,65 @@ function drawRowStorm(r) {
         const hidden = !!cell.o || (!!cell.x && blinkPhase);
         const cp = hidden ? 0 : cell.t ? cell.t.codePointAt(0) : 0;
         if (cp && isCanvasGlyph(cp) && !(cp >= 0xe000 && symbolFamily(cp))) {
+            flushRun();
             drawGlyph(r, c, cp, cell, curBlock);
         }
         else if (!hidden && cell.t && cell.t !== " ") {
-            const fam = svgFont(cell) ?? fontFam;
+            const mapped = svgFont(cell);
+            const fam = mapped ?? fontFam;
             const font = `${cell.i ? "italic " : ""}${cell.b ? "bold " : ""}${fontPx}px ${fam}`;
-            if (font !== curFont) {
-                ctx.font = font;
-                curFont = font;
-            }
             const fgRgb = cellFg(cell, curBlock);
             const fg = hex(fgRgb);
-            ctx.fillStyle = fg;
-            const ink = isFillGlyph(cp) ? inkBox(font, cell.t) : null;
-            const drawText = () => {
-                if (!ctx)
-                    return;
-                if (ink !== null) {
-                    const sx = (x1 - x0) / (ink.l + ink.r);
-                    const sy = (y1 - y0) / (ink.a + ink.d);
-                    ctx.save();
-                    ctx.translate(x0 + ink.l * sx, y0 + ink.a * sy);
-                    ctx.scale(sx, sy);
-                    ctx.fillText(cell.t, 0, 0);
-                    ctx.restore();
-                }
-                else if (cp && glyphOverflowsCell(cell.t, w) && !symbolFamily(cp)) {
-                    ctx.fillText(cell.t, x0, baseY);
-                }
-                else {
-                    ctx.fillText(cell.t, x0, baseY, x1 - x0);
-                }
-            };
-            drawText();
             const k = weightBoost(fgRgb, bg ?? defBgRgb);
-            if (k > 0) {
-                ctx.globalAlpha = k;
+            const ink = isFillGlyph(cp) ? inkBox(font, cell.t) : null;
+            const overflow = ink === null && glyphOverflowsCell(cell.t, w) && !symbolFamily(cp);
+            if (ink !== null || overflow || mapped !== null || !runsOn) {
+                flushRun();
+                if (font !== curFont) {
+                    ctx.font = font;
+                    curFont = font;
+                }
+                ctx.fillStyle = fg;
+                const drawText = () => {
+                    if (!ctx)
+                        return;
+                    if (ink !== null) {
+                        const sx = (x1 - x0) / (ink.l + ink.r);
+                        const sy = (y1 - y0) / (ink.a + ink.d);
+                        ctx.save();
+                        ctx.translate(x0 + ink.l * sx, y0 + ink.a * sy);
+                        ctx.scale(sx, sy);
+                        ctx.fillText(cell.t, 0, 0);
+                        ctx.restore();
+                    }
+                    else if (overflow) {
+                        ctx.fillText(cell.t, x0, baseY);
+                    }
+                    else {
+                        ctx.fillText(cell.t, x0, baseY, x1 - x0);
+                    }
+                };
                 drawText();
-                ctx.globalAlpha = 1;
+                if (k > 0) {
+                    ctx.globalAlpha = k;
+                    drawText();
+                    ctx.globalAlpha = 1;
+                }
             }
+            else {
+                if (runBuf !== null &&
+                    (runBuf.font !== font || runBuf.fg !== fg || runBuf.k !== k || runBuf.xEnd !== x0)) {
+                    flushRun();
+                }
+                if (runBuf === null)
+                    runBuf = { cells: [], text: "", x0, xEnd: x0, font, fg, k };
+                runBuf.cells.push({ t: cell.t, x0, x1 });
+                runBuf.text += cell.t;
+                runBuf.xEnd = x1;
+            }
+        }
+        else {
+            flushRun();
         }
         if (cell.u || cell.s) {
             const fg = hex(cellFg(cell, curBlock));
@@ -998,6 +1051,7 @@ function drawRowStorm(r) {
         }
         c += w;
     }
+    flushRun();
     noteBlinkRow(r, hasBlink);
     if (crtOn()) {
         ctx.save();
@@ -1688,6 +1742,10 @@ export function benchBlinkPhase(on) {
 }
 export function benchWeight(on) {
     weightOn = on;
+    redrawCanvasAll();
+}
+export function benchRuns(on) {
+    runsOn = on;
     redrawCanvasAll();
 }
 function main() {

@@ -68,6 +68,8 @@ def main():
         shot(port, "hold", p2)
         q2 = "/tmp/sg-verify-weight.png"
         shot(port, "weight", q2)
+        r2 = "/tmp/sg-verify-liga.png"
+        shot(port, "liga", r2)
         za, zb = "/tmp/sg-verify-zdom.png", "/tmp/sg-verify-zstorm.png"
         shot(port, "dom&zoom=1.5", za)
         shot(port, "storm&zoom=1.5", zb)
@@ -158,7 +160,7 @@ def main():
               f"{'PASS' if not gaps else f'FAIL ({len(gaps)} empty cols, first {gaps[0]})'}")
     for name, path in (("links", c), ("crt", e), ("image", f), ("cursor", h),
                        ("bleed", j), ("blink", m), ("freeze", n),
-                       ("hold", p2), ("weight", q2)):
+                       ("hold", p2), ("weight", q2), ("liga", r2)):
         lr, lg, lb = Image.open(path).convert("RGB").load()[20, 20]
         print(f"{name} self-check: {'PASS' if lg > 200 and lr < 60 else 'FAIL'}")
 
