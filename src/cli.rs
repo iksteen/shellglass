@@ -45,8 +45,8 @@ impl Cli {
     /// Whatever the mode returns; the binary reports it and exits non-zero.
     pub async fn run(self) -> Result<()> {
         match self.action {
-            Action::GenKey { api } => gen_key(api),
-            Action::PrintId { key, api } => print_id(&key, api),
+            Action::GenKey { api, id_salt } => gen_key(api, &id_salt),
+            Action::PrintId { key, api, id_salt } => print_id(&key, api, &id_salt),
             #[cfg(feature = "serve")]
             Action::Serve(args) => args.run().await,
             #[cfg(feature = "push")]
@@ -146,6 +146,8 @@ enum Action {
         /// salt domains — one secret is never a credential for both.
         #[arg(long)]
         api: bool,
+        #[command(flatten)]
+        id_salt: IdSaltArg,
     },
 
     /// Print the session id for a key (to add to a hub's `hub --allow`).
@@ -155,6 +157,8 @@ enum Action {
         /// Print the key's API id instead (for a hub's `--api-allow`).
         #[arg(long)]
         api: bool,
+        #[command(flatten)]
+        id_salt: IdSaltArg,
     },
 
     /// Mirror a terminal locally: serve the live HTML viewer over HTTP (self-contained).
@@ -206,6 +210,11 @@ pub struct PushArgs {
     #[command(flatten)]
     key: KeyArg,
 
+    /// Must match the hub's `--id-salt` (only used to derive the view URL this
+    /// command prints — authorization sends the key itself).
+    #[command(flatten)]
+    id_salt: IdSaltArg,
+
     #[command(flatten)]
     source: SourceArgs,
 }
@@ -249,6 +258,26 @@ pub struct KeyArg {
     key: String,
 }
 
+/// The optional per-system salt extension, shared by every command that
+/// derives ids (`hub`, `gen-key`, `print-id`, `push`). One value per id
+/// ecosystem: the hub and everyone deriving ids for it must agree, or pushes
+/// are rejected (403) and printed view URLs are wrong. Empty (the default) is
+/// the un-extended derivation — existing ids stay exactly as they are.
+#[derive(clap::Args, Debug, Default)]
+pub struct IdSaltArg {
+    /// Per-system salt extension mixed into session/API id derivation, so the
+    /// same secret yields different ids on differently-salted systems. Not a
+    /// secret; set it once and keep it — changing it invalidates every
+    /// registered id.
+    #[arg(
+        long = "id-salt",
+        env = "SHELLGLASS_ID_SALT",
+        default_value = "",
+        hide_default_value = true
+    )]
+    id_salt: String,
+}
+
 #[cfg(feature = "hub")]
 #[derive(clap::Args, Debug)]
 pub struct HubArgs {
@@ -277,6 +306,11 @@ pub struct HubArgs {
     /// each start.
     #[arg(long = "sessions-file", value_name = "PATH")]
     sessions_file: Option<PathBuf>,
+
+    /// The ids on `--allow`/`--api-allow` must then come from `gen-key`/
+    /// `print-id` run with the SAME `--id-salt`.
+    #[command(flatten)]
+    id_salt: IdSaltArg,
 
     /// Serve HTTPS with this certificate chain (PEM). Requires --tls-key.
     #[arg(long, requires = "tls_key")]
@@ -363,11 +397,11 @@ impl Tls {
 ///
 /// # Errors
 /// Never; `Result` for dispatch uniformity.
-pub fn print_id(key: &KeyArg, api: bool) -> Result<()> {
+pub fn print_id(key: &KeyArg, api: bool, id_salt: &IdSaltArg) -> Result<()> {
     if api {
-        println!("{}", proto::api_id(&key.key));
+        println!("{}", proto::api_id_ext(&key.key, &id_salt.id_salt));
     } else {
-        println!("{}", proto::session_id(&key.key));
+        println!("{}", proto::session_id_ext(&key.key, &id_salt.id_salt));
     }
     Ok(())
 }
@@ -390,7 +424,7 @@ impl PushArgs {
     /// # Errors
     /// Config/font failures before registration; the client loop's after.
     pub async fn run(self) -> Result<()> {
-        run_push(self.url, self.key.key, self.source).await
+        run_push(self.url, self.key.key, &self.id_salt, self.source).await
     }
 }
 
@@ -434,9 +468,12 @@ impl HubArgs {
             );
         }
         serve_hub(
-            allow,
-            api_allow,
-            self.sessions_file,
+            HubSetup {
+                allow,
+                api_allow,
+                id_salt: self.id_salt.id_salt,
+                sessions_file: self.sessions_file,
+            },
             &self.bind,
             tls,
             self.ssh_bind,
@@ -453,7 +490,7 @@ impl HubArgs {
 ///
 /// # Errors
 /// Only if the OS randomness source fails.
-pub fn gen_key(api: bool) -> Result<()> {
+pub fn gen_key(api: bool, id_salt: &IdSaltArg) -> Result<()> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes)
@@ -461,10 +498,10 @@ pub fn gen_key(api: bool) -> Result<()> {
     let key = base64::Engine::encode(&URL_SAFE_NO_PAD, bytes);
     if api {
         println!("key:    {key}");
-        println!("api-id: {}", proto::api_id(&key));
+        println!("api-id: {}", proto::api_id_ext(&key, &id_salt.id_salt));
     } else {
         println!("key: {key}");
-        println!("id:  {}", proto::session_id(&key));
+        println!("id:  {}", proto::session_id_ext(&key, &id_salt.id_salt));
     }
     Ok(())
 }
@@ -568,8 +605,8 @@ async fn run_serve(
 /// command) start only once the hub has accepted a registration — `client::run`
 /// invokes the closure after the first successful register.
 #[cfg(feature = "push")]
-async fn run_push(url: String, key: String, source: SourceArgs) -> Result<()> {
-    let id = proto::session_id(&key);
+async fn run_push(url: String, key: String, id_salt: &IdSaltArg, source: SourceArgs) -> Result<()> {
+    let id = proto::session_id_ext(&key, &id_salt.id_salt);
     let base = url.trim_end_matches('/');
     // Print the view URL before the backend can take the terminal (PTY raw mode).
     println!("shellglass: pushing live to {base}; view at {base}/s/{id}");
@@ -593,14 +630,23 @@ fn describe_source(source: &SourceArgs) -> String {
     format!("`{}`", source.command().join(" "))
 }
 
+/// The hub's authorization/registry setup, grouped out of `serve_hub`'s
+/// signature: everything `HubState` is built from except the base URL (which
+/// depends on the TLS mode resolved inside).
+#[cfg(feature = "hub")]
+struct HubSetup {
+    allow: hub::AllowConfig,
+    api_allow: std::collections::HashSet<String>,
+    id_salt: String,
+    sessions_file: Option<PathBuf>,
+}
+
 /// Serve the hub, terminating TLS per `tls`. Plain HTTP keeps the `SO_REUSEADDR`
 /// listener via `axum::serve`; the TLS paths hand the same reuseaddr listener to
 /// `axum-server`. ACME drives certificate issuance/renewal on a background task.
 #[cfg(feature = "hub")]
 async fn serve_hub(
-    allow: hub::AllowConfig,
-    api_allow: std::collections::HashSet<String>,
-    sessions_file: Option<PathBuf>,
+    setup: HubSetup,
     addr: &str,
     tls: Tls,
     ssh_bind: Option<String>,
@@ -620,8 +666,10 @@ async fn serve_hub(
             )
         }
     };
-    let mut hub_state = hub::HubState::new(allow, base).with_api_allowed(api_allow);
-    if let Some(path) = sessions_file {
+    let mut hub_state = hub::HubState::new(setup.allow, base)
+        .with_api_allowed(setup.api_allow)
+        .with_id_salt(setup.id_salt);
+    if let Some(path) = setup.sessions_file {
         hub_state = hub_state.with_persistence(path);
         // Materialize the seed (file absent) / normalize the loaded file now,
         // so a crash before the first API call still leaves a valid store.

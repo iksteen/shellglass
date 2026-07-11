@@ -21,7 +21,7 @@
 use crate::diff;
 use crate::fonts::CACHE_CONTROL_FONT;
 use crate::model::Frame;
-use crate::proto::{self, KEY_HEADER, session_id};
+use crate::proto::{self, KEY_HEADER};
 use crate::render;
 use anyhow::{Context, Result, bail};
 use axum::Router;
@@ -242,6 +242,10 @@ pub struct HubState {
     /// Public base URL (`scheme://host:port`, no trailing slash) for logging the
     /// view URL when a new session connects.
     base: Arc<str>,
+    /// Per-system salt extension (`--id-salt`) applied when hashing pushed
+    /// keys and API keys — must match what the operator's `gen-key`/`print-id`
+    /// used. Empty = the un-extended derivation.
+    id_salt: Arc<str>,
     /// Permits gating concurrent argon2 hashes (see [`HASH_SLOTS`]).
     hash_slots: Arc<Semaphore>,
     /// Fires once on SIGTERM: each open `/push` WebSocket sends a Close and returns
@@ -258,6 +262,7 @@ impl HubState {
             api_allowed: Arc::new(std::collections::HashSet::new()),
             persist_path: None,
             base: base.into(),
+            id_salt: "".into(),
             hash_slots: Arc::new(Semaphore::new(HASH_SLOTS)),
             shutdown,
         };
@@ -304,6 +309,14 @@ impl HubState {
     #[must_use]
     pub fn with_api_allowed(mut self, ids: impl IntoIterator<Item = String>) -> Self {
         self.api_allowed = Arc::new(ids.into_iter().collect());
+        self
+    }
+
+    /// Set the per-system salt extension (`--id-salt`) used when hashing
+    /// pushed/API keys. Builder style; call before the state is cloned.
+    #[must_use]
+    pub fn with_id_salt(mut self, ext: String) -> Self {
+        self.id_salt = ext.into();
         self
     }
 
@@ -504,7 +517,8 @@ async fn authorize(
     // semaphore is never closed, so acquire can't error.
     let id = {
         let _permit = st.hash_slots.acquire().await.expect("hash_slots open");
-        tokio::task::spawn_blocking(move || session_id(&key))
+        let ext = Arc::clone(&st.id_salt);
+        tokio::task::spawn_blocking(move || proto::session_id_ext(&key, &ext))
             .await
             .expect("hash task")
     };
@@ -565,7 +579,8 @@ async fn authorize_api(
     };
     let id = {
         let _permit = st.hash_slots.acquire().await.expect("hash_slots open");
-        tokio::task::spawn_blocking(move || proto::api_id(&key))
+        let ext = Arc::clone(&st.id_salt);
+        tokio::task::spawn_blocking(move || proto::api_id_ext(&key, &ext))
             .await
             .expect("hash task")
     };
@@ -1792,6 +1807,36 @@ mod tests {
             res.status(),
             StatusCode::FORBIDDEN,
             "a session key must never authorize the management API"
+        );
+    }
+
+    // --id-salt: a salted hub authorizes keys against EXT-derived ids only.
+    // The same key's un-extended id must not pass — the extension is part of
+    // the id ecosystem, not a cosmetic.
+    #[tokio::test]
+    async fn id_salt_extension_gates_api_auth() {
+        let key = "api-secret";
+        let st = HubState::new(AllowConfig::default(), String::new())
+            .with_api_allowed([proto::api_id_ext(key, "hub-a")])
+            .with_id_salt("hub-a".into());
+        let res = app(st)
+            .oneshot(api_req("GET", "/api/sessions", Some(key), None))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "ext-derived id authorizes");
+
+        // Same key, but the allow-list holds the UN-extended id: rejected.
+        let st = HubState::new(AllowConfig::default(), String::new())
+            .with_api_allowed([proto::api_id(key)])
+            .with_id_salt("hub-a".into());
+        let res = app(st)
+            .oneshot(api_req("GET", "/api/sessions", Some(key), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::FORBIDDEN,
+            "un-extended id must not pass on a salted hub"
         );
     }
 }

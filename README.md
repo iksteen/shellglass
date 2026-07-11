@@ -92,6 +92,7 @@ Flags by command:
 | `--api-allow <api-id>` | hub | an API id permitted to call the session-management API; repeat per caller. Without it, `/api` is off (404) |
 | `--sessions-file <path>` | hub | persist the session registry across restarts (see [Managing hub sessions](#managing-hub-sessions-over-http)) |
 | `--api` | gen-key, print-id | mint/print in the API salt domain (for `--api-allow`) instead of the session domain |
+| `--id-salt <ext>` | hub, gen-key, print-id, push | optional per-system salt extension (or `SHELLGLASS_ID_SALT`); one value per hub, used by every command deriving ids for it — see [security notes](#security-notes) |
 | `--tls-cert <path>` / `--tls-key <path>` | hub | serve HTTPS with your own PEM cert chain + key |
 | `--acme-domain <d>` | hub | auto-obtain a cert via ACME/Let's Encrypt (repeat per domain) |
 | `--acme-email <e>` | hub | contact email for the ACME account |
@@ -335,6 +336,16 @@ as its view URL — see the security notes below.
 - The **secret** is a bearer capability. Anyone who has it can push to that
   session; anyone with the **view URL** can watch. Use a long random secret
   (`gen-key`) and share the URL only with people who should see the session.
+- Ids derive from a fixed application salt, so the same secret yields the same
+  public id on every hub: a reused key is linkable across hubs, and a
+  precomputed dictionary over weak human-chosen keys works against all
+  deployments at once. `--id-salt <ext>` (optional) extends the salt
+  per-system, closing both — with `gen-key`'s random keys neither attack
+  applies and the flag adds nothing. One value per hub, used by `hub`,
+  `gen-key`, `print-id` **and** `push` (push auth sends the key itself, but a
+  mismatched pusher prints a wrong view URL). It is not a secret; set it once
+  and keep it — changing it invalidates every registered id, which doubles as
+  a deliberate mass-revocation lever.
 - The secret travels in a header on the `/push` WebSocket upgrade. Terminate TLS
   so it isn't sent in the clear. The hub can do this itself:
 

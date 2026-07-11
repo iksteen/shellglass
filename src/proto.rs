@@ -78,7 +78,24 @@ const API_SALT: &[u8] = b"shellglass/api-id/v1";
 /// strong random secret it's belt-and-suspenders. Hex (never `-`) so the id
 /// is safe as a CLI value and URL path. Cost is paid once per connection or
 /// API request, never per frame.
-fn derive_id(key: &str, salt: &[u8]) -> String {
+///
+/// `ext` is the optional per-system salt extension (`--id-salt`): appended to
+/// the domain salt as `<domain>/<ext>`, it makes the same secret yield
+/// different ids on differently-salted systems — de-amortizing precomputed
+/// dictionaries over weak keys and unlinking a reused key across hubs. An
+/// EMPTY extension appends nothing, so ids derived before the option existed
+/// are byte-identical. Like the domain constants, the extension is a
+/// must-match parameter of the id ecosystem, not a secret; changing a hub's
+/// extension invalidates every registered id (a deliberate revocation lever,
+/// same blast radius as a salt version bump).
+fn derive_id(key: &str, salt: &[u8], ext: &str) -> String {
+    let salted;
+    let salt = if ext.is_empty() {
+        salt
+    } else {
+        salted = [salt, b"/", ext.as_bytes()].concat();
+        &salted
+    };
     let mut out = [0u8; 32];
     Argon2::default()
         .hash_password_into(key.as_bytes(), salt, &mut out)
@@ -90,15 +107,26 @@ fn derive_id(key: &str, salt: &[u8]) -> String {
 }
 
 /// The session id for a push key — the read capability in view URLs and the
-/// hub's `--allow` entries.
+/// hub's `--allow` entries. No salt extension; see [`session_id_ext`].
 pub fn session_id(key: &str) -> String {
-    derive_id(key, SALT)
+    session_id_ext(key, "")
+}
+
+/// [`session_id`] with a per-system salt extension (see [`derive_id`]).
+pub fn session_id_ext(key: &str, ext: &str) -> String {
+    derive_id(key, SALT, ext)
 }
 
 /// The API id for a management key — the hub's `--api-allow` entries. See
-/// [`API_SALT`] for why this is its own domain.
+/// [`API_SALT`] for why this is its own domain. No salt extension; see
+/// [`api_id_ext`].
 pub fn api_id(key: &str) -> String {
-    derive_id(key, API_SALT)
+    api_id_ext(key, "")
+}
+
+/// [`api_id`] with a per-system salt extension (see [`derive_id`]).
+pub fn api_id_ext(key: &str, ext: &str) -> String {
+    derive_id(key, API_SALT, ext)
 }
 
 /// Upper bound on a single WebSocket message the hub will accept from a pusher.
@@ -128,6 +156,35 @@ mod tests {
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
             "id must be lowercase hex (no '-', CLI/URL safe): {id}"
         );
+    }
+
+    // The per-system salt extension: "" must be byte-identical to the
+    // un-extended derivation (existing deployments keep their ids), a set
+    // extension must diverge in both domains, and domain separation must
+    // hold under the same extension.
+    #[test]
+    fn id_salt_extension_extends_both_domains() {
+        let key = "correct horse battery staple";
+        assert_eq!(
+            session_id_ext(key, ""),
+            session_id(key),
+            "empty ext = stable ids"
+        );
+        assert_eq!(
+            api_id_ext(key, ""),
+            api_id(key),
+            "empty ext = stable api ids"
+        );
+        let (s, a) = (session_id_ext(key, "hub-a"), api_id_ext(key, "hub-a"));
+        assert_ne!(s, session_id(key), "ext diverges session ids");
+        assert_ne!(a, api_id(key), "ext diverges api ids");
+        assert_ne!(s, a, "domains stay separate under one ext");
+        assert_ne!(
+            s,
+            session_id_ext(key, "hub-b"),
+            "different systems, different ids"
+        );
+        assert_eq!(s.len(), 64, "same shape as un-extended ids");
     }
 
     // Domain separation: the same secret yields UNRELATED ids in the session

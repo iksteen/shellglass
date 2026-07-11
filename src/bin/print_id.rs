@@ -15,9 +15,11 @@ struct Cli {
     /// Print the key's API id instead (for a hub's `--api-allow`).
     #[arg(long)]
     api: bool,
+    #[command(flatten)]
+    id_salt: shellglass::cli::IdSaltArg,
 }
 
 fn main() -> anyhow::Result<()> {
-    let Cli { key, api } = Cli::parse();
-    shellglass::cli::print_id(&key, api)
+    let Cli { key, api, id_salt } = Cli::parse();
+    shellglass::cli::print_id(&key, api, &id_salt)
 }
