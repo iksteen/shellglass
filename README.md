@@ -121,6 +121,7 @@ Flags by command:
 | `<url>` (positional) / `--key <api-key>` | sessions | hub base URL (like `push`'s) + management-API key (or `SHELLGLASS_API_KEY`) |
 | `--allow <id>[:<slug>]` | hub | a session id permitted to push, optionally aliased to a view-URL slug; repeat per client. Others get `403` |
 | `--api-allow <api-id>` | hub | an API id permitted to call the session-management API; repeat per caller. Without it, `/api` is off (404) |
+| `--sessions-file <path>` | hub | persist the session registry here across restarts; when it loads, it replaces `--allow` (see [Managing hub sessions](#managing-hub-sessions-over-http)) |
 | `--api` | gen-key, print-id | mint/print in the API salt domain (for `--api-allow`) instead of the session domain |
 | `--tls-cert <path>` / `--tls-key <path>` | hub | serve HTTPS with your own PEM cert chain + key |
 | `--acme-domain <d>` | hub | auto-obtain a cert via ACME/Let's Encrypt (repeat per domain) |
@@ -178,9 +179,9 @@ thing. Deleting a session kicks its live pusher (whose next reconnect gets
 A session added over the API is viewable immediately: until its pusher
 connects, `/s/<slug>` serves the built-in page in the operator-offline state
 (the same look as a live session whose operator dropped) and switches to the
-real session automatically when the first push arrives. Runtime-added sessions
-are **ephemeral** — a hub restart forgets them; the managing tool is the source
-of truth and re-adds them.
+real session automatically when the first push arrives. By default,
+runtime-added sessions are **ephemeral** — a hub restart forgets them; the
+managing tool is the source of truth and re-adds them.
 
 `--allow` entries are ordinary registry entries: they get the same
 operator-offline placeholder before their pusher connects, and the API can
@@ -188,6 +189,17 @@ delete them like any other session. The difference is at restart — `--allow`
 is the declarative baseline, so a restart **re-seeds** flag-configured
 sessions (undoing runtime deletions of them), while API-added sessions are
 forgotten.
+
+**Persisting sessions across restarts.** Pass `--sessions-file <path>` and
+the registry survives restarts: every API mutation rewrites the file
+(atomically; it holds only public ids and slugs, no secrets). On startup, if
+the file exists it **is** the registry and `--allow` is ignored (announced on
+stderr); if it doesn't exist yet, `--allow` seeds it. So with the flag the
+asymmetry above disappears — deleting an `--allow`-seeded session sticks
+across restarts, because the file wins and `--allow` only seeds the first
+boot. A file that exists but can't be parsed is a startup error, never a
+silent fall back to `--allow` (re-seeding could resurrect sessions the API
+deleted).
 
 ## How it works
 

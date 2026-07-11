@@ -128,6 +128,56 @@ pub fn parse_allow(entries: &[String]) -> Result<AllowConfig> {
     Ok(cfg)
 }
 
+/// The session registry's on-disk form (`--sessions-file`): public ids and
+/// slugs only — no secrets, no session content. Versioned envelope so a
+/// future shape change fails loudly instead of misreading.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistFile {
+    version: u32,
+    sessions: Vec<PersistEntry>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistEntry {
+    id: String,
+    slug: String,
+}
+
+/// Load the persisted registry. `Ok(None)` = the file doesn't exist yet
+/// (first boot: the caller seeds from `--allow` and writes it). A file that
+/// exists but can't be read/parsed/validated is a HARD error, deliberately
+/// not a fallback to `--allow` — re-seeding over a corrupt store could
+/// resurrect sessions the API deleted.
+pub fn load_sessions(path: &std::path::Path) -> Result<Option<AllowConfig>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading sessions file {path:?}")),
+    };
+    let file: PersistFile =
+        serde_json::from_str(&text).with_context(|| format!("parsing sessions file {path:?}"))?;
+    if file.version != 1 {
+        bail!(
+            "sessions file {path:?} has unsupported version {}",
+            file.version
+        );
+    }
+    let mut cfg = AllowConfig::default();
+    for e in &file.sessions {
+        validate_id(&e.id).with_context(|| format!("sessions file {path:?}"))?;
+        validate_slug(&e.slug).with_context(|| format!("sessions file {path:?}"))?;
+        if cfg.by_id.contains_key(&e.id) || cfg.by_view.contains_key(&e.slug) {
+            bail!(
+                "sessions file {path:?} has a duplicate id or slug ({})",
+                e.id
+            );
+        }
+        cfg.by_view.insert(e.slug.clone(), e.id.clone());
+        cfg.by_id.insert(e.id.clone(), e.slug.clone());
+    }
+    Ok(Some(cfg))
+}
+
 /// Parse `--api-allow` entries (API ids from `print-id --api`) into the set
 /// [`HubState::with_api_allowed`] takes. Ids have the same 64-hex shape as
 /// session ids (same derivation, different salt domain); duplicates are a
@@ -185,6 +235,10 @@ pub struct HubState {
     /// management API. CLI-configured (`--api-allow`), not runtime-mutable.
     /// Empty = the API is off and the whole `/api` namespace 404s.
     api_allowed: Arc<std::collections::HashSet<String>>,
+    /// Where the registry persists (`--sessions-file`), if the operator opted
+    /// in. `None` = memory-only: runtime changes die with the process and
+    /// `--allow` re-seeds every start.
+    persist_path: Option<Arc<std::path::PathBuf>>,
     /// Public base URL (`scheme://host:port`, no trailing slash) for logging the
     /// view URL when a new session connects.
     base: Arc<str>,
@@ -202,6 +256,7 @@ impl HubState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             registry: Arc::new(std::sync::RwLock::new(allow)),
             api_allowed: Arc::new(std::collections::HashSet::new()),
+            persist_path: None,
             base: base.into(),
             hash_slots: Arc::new(Semaphore::new(HASH_SLOTS)),
             shutdown,
@@ -250,6 +305,52 @@ impl HubState {
     pub fn with_api_allowed(mut self, ids: impl IntoIterator<Item = String>) -> Self {
         self.api_allowed = Arc::new(ids.into_iter().collect());
         self
+    }
+
+    /// Persist the registry to `path` on every mutation (`--sessions-file`).
+    /// Builder style; call before the state is cloned into the router.
+    #[must_use]
+    pub fn with_persistence(mut self, path: std::path::PathBuf) -> Self {
+        self.persist_path = Some(Arc::new(path));
+        self
+    }
+
+    /// Write the registry to the sessions file (atomic: temp + rename). A
+    /// no-op without `--sessions-file`. Entries are sorted for a stable,
+    /// diffable file.
+    ///
+    /// # Errors
+    /// Filesystem failures; the in-memory registry is authoritative either
+    /// way — the API surfaces the error so the operator knows disk diverged.
+    pub fn persist(&self) -> Result<()> {
+        let Some(path) = &self.persist_path else {
+            return Ok(());
+        };
+        let mut sessions: Vec<PersistEntry> = {
+            let reg = self.registry.read().unwrap();
+            reg.by_id
+                .iter()
+                .map(|(id, slug)| PersistEntry {
+                    id: id.clone(),
+                    slug: slug.clone(),
+                })
+                .collect()
+        };
+        sessions.sort_by(|a, b| a.slug.cmp(&b.slug));
+        let file = PersistFile {
+            version: 1,
+            sessions,
+        };
+        let text = serde_json::to_string_pretty(&file).context("serializing the registry")?;
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("creating sessions-file directory {dir:?}"))?;
+        }
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, text).with_context(|| format!("writing {tmp:?}"))?;
+        std::fs::rename(&tmp, path.as_ref())
+            .with_context(|| format!("moving {tmp:?} into place"))?;
+        Ok(())
     }
 
     /// The public slug for an allowed session id; `None` = not (or no longer)
@@ -532,6 +633,25 @@ fn api_json(code: StatusCode, body: &serde_json::Value) -> Response {
     (code, [(CONTENT_TYPE, "application/json")], body.to_string()).into_response()
 }
 
+/// Persist after a successful mutation. The in-memory registry is
+/// authoritative and stays mutated either way; a write failure surfaces as a
+/// 500 so the managing tool knows disk diverged (the next successful
+/// mutation re-writes the full registry and heals it).
+fn persist_after(st: &HubState) -> Option<Response> {
+    match st.persist() {
+        Ok(()) => None,
+        Err(e) => {
+            eprintln!("shellglass: sessions-file write failed: {e:#}");
+            Some(api_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({
+                    "error": format!("applied in memory, but persisting failed: {e:#}")
+                }),
+            ))
+        }
+    }
+}
+
 /// `POST /api/sessions` — register a session at runtime. The body is taken
 /// raw and parsed AFTER authorization, so an unauthorized caller learns
 /// nothing (not even that its JSON was malformed) and the unconfigured
@@ -556,6 +676,9 @@ async fn api_add(
     };
     match st.add_session(&body.id, body.slug.as_deref()) {
         Ok(()) => {
+            if let Some(err) = persist_after(&st) {
+                return err;
+            }
             let slug = body.slug.unwrap_or_else(|| body.id.clone());
             println!("shellglass: api added session {} (slug {slug})", body.id);
             api_json(
@@ -588,6 +711,9 @@ async fn api_delete_by_id(
         return code.into_response();
     }
     if st.remove_by_id(&id) {
+        if let Some(err) = persist_after(&st) {
+            return err;
+        }
         println!("shellglass: api removed session {id} (by id)");
         StatusCode::NO_CONTENT.into_response()
     } else {
@@ -610,6 +736,9 @@ async fn api_delete_by_slug(
     }
     match st.remove_by_slug(&slug) {
         Some(id) => {
+            if let Some(err) = persist_after(&st) {
+                return err;
+            }
             println!("shellglass: api removed session {id} (by slug {slug})");
             StatusCode::NO_CONTENT.into_response()
         }
@@ -1080,6 +1209,67 @@ mod tests {
         assert_eq!(st.remove_by_slug("alpha").as_deref(), Some(a.as_str()));
         assert!(!st.is_allowed(&a), "seeded session removed like any other");
         assert!(st.live("alpha").is_none(), "stub gone with it");
+    }
+
+    /// A unique scratch path per test (same pid ⇒ name must differ per call site).
+    fn scratch(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "shellglass-test-{}-{name}.json",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn sessions_file_missing_means_seed() {
+        assert!(
+            load_sessions(&scratch("missing")).unwrap().is_none(),
+            "no file yet → Ok(None), caller seeds from --allow"
+        );
+    }
+
+    #[test]
+    fn sessions_file_corrupt_is_a_hard_error() {
+        let path = scratch("corrupt");
+        std::fs::write(&path, "not json").unwrap();
+        assert!(load_sessions(&path).is_err(), "garbage must not parse");
+        std::fs::write(&path, r#"{"version":2,"sessions":[]}"#).unwrap();
+        assert!(load_sessions(&path).is_err(), "unknown version rejected");
+        let a = session_id("a");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"sessions":[{{"id":"{a}","slug":"x"}},{{"id":"{a}","slug":"y"}}]}}"#
+            ),
+        )
+        .unwrap();
+        assert!(load_sessions(&path).is_err(), "duplicate id rejected");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    // The full persistence loop: mutate → file written → a fresh load matches
+    // memory, including a deletion of an --allow-seeded session surviving.
+    #[test]
+    fn sessions_file_roundtrips_mutations() {
+        let path = scratch("roundtrip");
+        let _ = std::fs::remove_file(&path);
+        let a = session_id("a");
+        let b = session_id("b");
+        let st = HubState::new(parse_allow(&[format!("{a}:alpha")]).unwrap(), String::new())
+            .with_persistence(path.clone());
+        st.persist().unwrap(); // the startup seed write
+
+        st.add_session(&b, Some("beta")).unwrap();
+        st.persist().unwrap();
+        st.remove_by_slug("alpha").unwrap();
+        st.persist().unwrap();
+
+        let loaded = load_sessions(&path).unwrap().expect("file exists");
+        assert_eq!(loaded.by_id.get(&b).map(String::as_str), Some("beta"));
+        assert!(
+            !loaded.by_id.contains_key(&a),
+            "deleting a seeded session sticks across a reload"
+        );
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

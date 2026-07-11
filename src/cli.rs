@@ -270,6 +270,14 @@ pub struct HubArgs {
     #[arg(long = "api-allow", value_name = "API_ID")]
     api_allow: Vec<String>,
 
+    /// Persist the session registry here, surviving restarts. When the file
+    /// loads, it IS the registry and --allow is ignored (announced at startup);
+    /// when it doesn't exist yet, --allow seeds it. Every API change writes it.
+    /// Without this flag, runtime changes are memory-only and --allow re-seeds
+    /// each start.
+    #[arg(long = "sessions-file", value_name = "PATH")]
+    sessions_file: Option<PathBuf>,
+
     /// Serve HTTPS with this certificate chain (PEM). Requires --tls-key.
     #[arg(long, requires = "tls_key")]
     tls_cert: Option<PathBuf>,
@@ -394,16 +402,41 @@ impl HubArgs {
     /// Bad `--allow`/TLS flags or bind failures; server errors after.
     pub async fn run(self) -> Result<()> {
         let tls = Tls::from_args(&self)?;
-        let allow = hub::parse_allow(&self.allow).context("parsing --allow")?;
         let api_allow = hub::parse_api_allow(&self.api_allow).context("parsing --api-allow")?;
+        // The registry source of truth: a loadable --sessions-file wins over
+        // --allow (announced); a missing one gets seeded FROM --allow; a
+        // corrupt one is a hard error (load_sessions), never a silent re-seed.
+        let allow = match &self.sessions_file {
+            Some(path) => match hub::load_sessions(path)? {
+                Some(loaded) => {
+                    if !self.allow.is_empty() {
+                        eprintln!(
+                            "shellglass: --allow ignored — session registry loaded from {}",
+                            path.display()
+                        );
+                    }
+                    loaded
+                }
+                None => {
+                    let seed = hub::parse_allow(&self.allow).context("parsing --allow")?;
+                    eprintln!(
+                        "shellglass: seeding new sessions file {} from --allow",
+                        path.display()
+                    );
+                    seed
+                }
+            },
+            None => hub::parse_allow(&self.allow).context("parsing --allow")?,
+        };
         if allow.is_empty() && api_allow.is_empty() {
             eprintln!(
-                "shellglass: warning — no --allow session ids and no --api-allow; the hub will reject all pushes (403)"
+                "shellglass: warning — no sessions registered and no --api-allow; the hub will reject all pushes (403)"
             );
         }
         serve_hub(
             allow,
             api_allow,
+            self.sessions_file,
             &self.bind,
             tls,
             self.ssh_bind,
@@ -567,6 +600,7 @@ fn describe_source(source: &SourceArgs) -> String {
 async fn serve_hub(
     allow: hub::AllowConfig,
     api_allow: std::collections::HashSet<String>,
+    sessions_file: Option<PathBuf>,
     addr: &str,
     tls: Tls,
     ssh_bind: Option<String>,
@@ -586,7 +620,13 @@ async fn serve_hub(
             )
         }
     };
-    let hub_state = hub::HubState::new(allow, base).with_api_allowed(api_allow);
+    let mut hub_state = hub::HubState::new(allow, base).with_api_allowed(api_allow);
+    if let Some(path) = sessions_file {
+        hub_state = hub_state.with_persistence(path);
+        // Materialize the seed (file absent) / normalize the loaded file now,
+        // so a crash before the first API call still leaves a valid store.
+        hub_state.persist().context("writing the sessions file")?;
+    }
     // Optional read-only SSH view: the session id is the SSH username. A setup failure
     // must not abort the hub's HTTP service — log and continue without the SSH view.
     if let Some(ssh_addr) = &ssh_bind {
