@@ -56,6 +56,10 @@ struct Session {
     /// Fonts the client uploaded, keyed as the CSS references them (`key` → (mime,
     /// bytes)). Scoped to this session so different clients' fonts never clash.
     fonts: HashMap<String, (String, Vec<u8>)>,
+    /// Per-session kick: the management API's DELETE fires this so the live
+    /// `/push` WebSocket Closes immediately (the pusher's next reconnect then
+    /// 403s — its id is gone from the registry).
+    kick: broadcast::Sender<()>,
 }
 
 /// Cap on concurrent `session_id` (argon2id) hashes. The hash is memory-hard
@@ -151,13 +155,12 @@ fn validate_slug(slug: &str) -> Result<()> {
 #[derive(Clone)]
 pub struct HubState {
     sessions: Arc<Mutex<HashMap<String, Session>>>,
-    /// Pre-registered session ids (`session_id(secret)`) permitted to push, each mapped
-    /// to its public view slug. The operator adds ids, never secrets — the hub screens
-    /// by hash. Registration logs (and rewrites font URLs to) the id's slug.
-    allowed: Arc<HashMap<String, String>>,
-    /// The view namespace: slug → session_id. Viewers resolve `/s/<slug>` through here;
-    /// a session id that isn't a slug is not viewable (see [`AllowConfig`]).
-    by_view: Arc<HashMap<String, String>>,
+    /// The session registry: which ids (`session_id(secret)`) may push and the
+    /// public view slug each maps to. Seeded from `--allow`, mutable at runtime
+    /// through the management API — every lookup takes a short read lock; the
+    /// only writers are the API's add/remove handlers. The operator/API adds
+    /// ids, never secrets — the hub screens by hash.
+    registry: Arc<std::sync::RwLock<AllowConfig>>,
     /// Public base URL (`scheme://host:port`, no trailing slash) for logging the
     /// view URL when a new session connects.
     base: Arc<str>,
@@ -173,11 +176,105 @@ impl HubState {
         let (shutdown, _) = broadcast::channel(1);
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            allowed: Arc::new(allow.by_id),
-            by_view: Arc::new(allow.by_view),
+            registry: Arc::new(std::sync::RwLock::new(allow)),
             base: base.into(),
             hash_slots: Arc::new(Semaphore::new(HASH_SLOTS)),
             shutdown,
+        }
+    }
+
+    /// The public slug for an allowed session id; `None` = not (or no longer)
+    /// registered.
+    fn slug_of(&self, id: &str) -> Option<String> {
+        self.registry.read().unwrap().by_id.get(id).cloned()
+    }
+
+    /// The session id a view slug resolves to; `None` = unknown slug.
+    fn id_of_view(&self, slug: &str) -> Option<String> {
+        self.registry.read().unwrap().by_view.get(slug).cloned()
+    }
+
+    /// Whether `id` may push (the `/push` authorization check).
+    fn is_allowed(&self, id: &str) -> bool {
+        self.registry.read().unwrap().by_id.contains_key(id)
+    }
+
+    /// Register a session at runtime (the management API's POST). Same
+    /// validation and uniqueness rules as `--allow`, as results instead of
+    /// startup errors.
+    pub fn add_session(&self, id: &str, slug: Option<&str>) -> Result<(), AddError> {
+        validate_id(id).map_err(|e| AddError::Invalid(e.to_string()))?;
+        let slug = slug.unwrap_or(id);
+        validate_slug(slug).map_err(|e| AddError::Invalid(e.to_string()))?;
+        let mut reg = self.registry.write().unwrap();
+        if reg.by_id.contains_key(id) {
+            return Err(AddError::IdTaken);
+        }
+        if reg.by_view.contains_key(slug) {
+            return Err(AddError::SlugTaken);
+        }
+        reg.by_view.insert(slug.to_string(), id.to_string());
+        reg.by_id.insert(id.to_string(), slug.to_string());
+        Ok(())
+    }
+
+    /// Remove a session BY ITS SESSION ID (the management API is explicit
+    /// about the two namespaces — see `remove_by_slug`). Returns false when
+    /// the id isn't registered.
+    pub fn remove_by_id(&self, id: &str) -> bool {
+        let removed = {
+            let mut reg = self.registry.write().unwrap();
+            match reg.by_id.remove(id) {
+                Some(slug) => {
+                    reg.by_view.remove(&slug);
+                    true
+                }
+                None => false,
+            }
+        };
+        if removed {
+            self.drop_session_state(id);
+        }
+        removed
+    }
+
+    /// Remove a session BY ITS VIEW SLUG. Returns the removed session's id,
+    /// `None` when the slug isn't registered. A separate method (and API
+    /// route) from `remove_by_id` by design: an un-aliased slug IS the id,
+    /// so one ambiguous lookup could target the wrong namespace.
+    pub fn remove_by_slug(&self, slug: &str) -> Option<String> {
+        let id = {
+            let mut reg = self.registry.write().unwrap();
+            let id = reg.by_view.remove(slug)?;
+            reg.by_id.remove(&id);
+            id
+        };
+        self.drop_session_state(&id);
+        Some(id)
+    }
+
+    /// Every registered session as `(id, slug, live)` — `live` meaning an
+    /// operator is currently pushing. For the management API's reconciliation
+    /// listing.
+    pub fn list_sessions(&self) -> Vec<(String, String, bool)> {
+        let reg = self.registry.read().unwrap();
+        let map = self.sessions.lock().unwrap();
+        reg.by_id
+            .iter()
+            .map(|(id, slug)| {
+                let live = map.get(id).is_some_and(|s| s.live.is_online());
+                (id.clone(), slug.clone(), live)
+            })
+            .collect()
+    }
+
+    /// Drop a removed session's stored state (CSS/fonts/render-config/matrix)
+    /// and kick its live pusher, if any. Viewer SSE streams end when the
+    /// `Live` drops with them.
+    fn drop_session_state(&self, id: &str) {
+        let session = self.sessions.lock().unwrap().remove(id);
+        if let Some(s) = session {
+            let _ = s.kick.send(());
         }
     }
 
@@ -186,9 +283,9 @@ impl HubState {
     /// session's frames (an un-aliased session's slug is its own id, so
     /// `ssh <id>@hub` still works).
     pub(crate) fn live(&self, slug: &str) -> Option<Arc<diff::Live>> {
-        let id = self.by_view.get(slug)?;
+        let id = self.id_of_view(slug)?;
         let map = self.sessions.lock().unwrap();
-        map.get(id).map(|s| Arc::clone(&s.live))
+        map.get(&id).map(|s| Arc::clone(&s.live))
     }
 
     /// Signal every open `/push` WebSocket to close (graceful shutdown). Called from
@@ -196,6 +293,18 @@ impl HubState {
     pub fn trigger_shutdown(&self) {
         let _ = self.shutdown.send(());
     }
+}
+
+/// Why a runtime session registration was refused — the management API maps
+/// these onto 409 (taken) and 400 (invalid).
+#[derive(Debug, PartialEq, Eq)]
+pub enum AddError {
+    /// The session id is already registered.
+    IdTaken,
+    /// The slug is claimed by another session.
+    SlugTaken,
+    /// Malformed id or non-URL-safe slug (the message names the rule).
+    Invalid(String),
 }
 
 /// Resolve a request's key to its (allowed) session id, or the status to reject
@@ -226,7 +335,7 @@ async fn authorize(
             .await
             .expect("hash task")
     };
-    if st.allowed.contains_key(&id) {
+    if st.is_allowed(&id) {
         Ok(id)
     } else {
         log_reject(headers, peer, route, StatusCode::FORBIDDEN);
@@ -346,10 +455,26 @@ async fn push_session(st: HubState, id: String, base: String, mut socket: WebSoc
     let mut shutdown = st.shutdown.subscribe();
     // None until the register message arrives; the state machine is "have we a Live".
     let mut live: Option<Arc<diff::Live>> = None;
+    // The session's kick channel (management-API delete), armed at register.
+    let mut kick: Option<broadcast::Receiver<()>> = None;
     loop {
         tokio::select! {
             _ = shutdown.recv() => {
                 let _ = socket.send(Message::Close(None)).await;
+                break;
+            }
+            _ = async {
+                match kick.as_mut() {
+                    Some(k) => { let _ = k.recv().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                // Deleted by the management API: Close so the pusher notices at
+                // once; its reconnect then 403s (the id is gone). The session
+                // state was already dropped — don't touch the orphaned Live.
+                eprintln!("shellglass: push {id} removed by the management API — closing");
+                let _ = socket.send(Message::Close(None)).await;
+                live = None;
                 break;
             }
             msg = socket.recv() => {
@@ -391,7 +516,21 @@ async fn push_session(st: HubState, id: String, base: String, mut socket: WebSoc
                         // AwaitingRegister: the first message must parse as a
                         // RegisterBody; anything else is a protocol error → close.
                         None => match serde_json::from_str::<proto::RegisterBody>(t.as_str()) {
-                            Ok(reg) => live = Some(register_session(&st, &id, &base, reg)),
+                            Ok(reg) => match register_session(&st, &id, &base, reg) {
+                                Some((l, k)) => {
+                                    live = Some(l);
+                                    kick = Some(k);
+                                }
+                                // Deleted between the upgrade's authorize and this
+                                // register — the API raced the connect; close.
+                                None => {
+                                    eprintln!(
+                                        "shellglass: push {id} was removed before it registered — closing"
+                                    );
+                                    let _ = socket.send(Message::Close(None)).await;
+                                    break;
+                                }
+                            },
                             Err(e) => {
                                 eprintln!(
                                     "shellglass: push {id} sent an invalid register message ({e}) — closing"
@@ -422,15 +561,19 @@ async fn push_session(st: HubState, id: String, base: String, mut socket: WebSoc
     }
 }
 
-/// Create or refresh the session for `id` from a register message and return its
-/// `Live`. New sessions get a "waiting…" banner (replaced by the first pushed frame)
-/// and announce their view URL once — reconnects hit the refresh branch, so no spam.
+/// Create or refresh the session for `id` from a register message; returns its
+/// `Live` plus a receiver for the session's kick channel (fired when the
+/// management API deletes the session). New sessions get a "waiting…" banner
+/// (replaced by the first pushed frame) and announce their view URL once —
+/// reconnects hit the refresh branch, so no spam. `None` = the session was
+/// deleted between the upgrade's authorize and this register (the API raced
+/// the connect); the caller closes.
 fn register_session(
     st: &HubState,
     id: &str,
     base: &str,
     reg: proto::RegisterBody,
-) -> Arc<diff::Live> {
+) -> Option<(Arc<diff::Live>, broadcast::Receiver<()>)> {
     // Decode uploaded fonts; silently drop any with bad base64 (the family just
     // falls back in the browser rather than failing the whole registration).
     let fonts: HashMap<String, (String, Vec<u8>)> = reg
@@ -438,12 +581,12 @@ fn register_session(
         .into_iter()
         .filter_map(|f| Some((f.key, (f.mime, B64.decode(f.b64).ok()?))))
         .collect();
-    // The id's public slug (always present: we just authorized it). Views live under
-    // the slug only, but the client baked its `@font-face` URLs as `/s/<id>/fonts/…`
-    // (it can't know the hub's slug), so rewrite them to the slug — otherwise fonts
-    // would 404 on an aliased session. A no-op when slug == id (no alias). ponytail:
-    // coupled to client.rs building exactly that prefix; the font route matches it too.
-    let slug = st.allowed.get(id).map_or(id, String::as_str);
+    // The id's public slug. Views live under the slug only, but the client baked
+    // its `@font-face` URLs as `/s/<id>/fonts/…` (it can't know the hub's slug),
+    // so rewrite them to the slug — otherwise fonts would 404 on an aliased
+    // session. A no-op when slug == id (no alias). ponytail: coupled to client.rs
+    // building exactly that prefix; the font route matches it too.
+    let slug = st.slug_of(id)?;
     let css = reg
         .css
         .replace(&format!("/s/{id}/fonts/"), &format!("/s/{slug}/fonts/"));
@@ -456,11 +599,12 @@ fn register_session(
         // A reconnect: the operator is back (push_session marked it offline on the
         // previous drop). New sessions start online, so only this branch needs it.
         s.live.set_online(true);
-        Arc::clone(&s.live)
+        Some((Arc::clone(&s.live), s.kick.subscribe()))
     } else {
         let live = diff::Live::new(Arc::new(Frame::Banner(render::banner(
             "waiting for client…",
         ))));
+        let (kick, kick_rx) = broadcast::channel(1);
         map.insert(
             id.to_string(),
             Session {
@@ -469,18 +613,20 @@ fn register_session(
                 render_cfg: reg.render_cfg,
                 live: Arc::clone(&live),
                 fonts,
+                kick,
             },
         );
         println!("shellglass: session connected — view at {base}/s/{slug}");
-        live
+        Some((live, kick_rx))
     }
 }
 
 /// Serve a session's uploaded font bytes (the page's `@font-face` points here).
 /// Public like `view`/`events` — the slug in the path is the read capability.
 async fn font(State(st): State<HubState>, Path((slug, key)): Path<(String, String)>) -> Response {
+    let id = st.id_of_view(&slug);
     let map = st.sessions.lock().unwrap();
-    let Some(s) = st.by_view.get(&slug).and_then(|id| map.get(id)) else {
+    let Some(s) = id.and_then(|id| map.get(&id)) else {
         return (StatusCode::NOT_FOUND, "unknown session").into_response();
     };
     match s.fonts.get(&key) {
@@ -500,8 +646,9 @@ async fn font(State(st): State<HubState>, Path((slug, key)): Path<(String, Strin
 }
 
 async fn view(State(st): State<HubState>, Path(slug): Path<String>) -> Response {
+    let id = st.id_of_view(&slug);
     let map = st.sessions.lock().unwrap();
-    let Some(s) = st.by_view.get(&slug).and_then(|id| map.get(id)) else {
+    let Some(s) = id.and_then(|id| map.get(&id)) else {
         return (StatusCode::NOT_FOUND, "unknown session").into_response();
     };
     let script = render::sse_script(&format!("/s/{slug}/events"), &s.render_cfg);
@@ -522,12 +669,8 @@ async fn view(State(st): State<HubState>, Path(slug): Path<String>) -> Response 
 }
 
 async fn events(State(st): State<HubState>, Path(slug): Path<String>) -> Response {
-    let live = {
-        let map = st.sessions.lock().unwrap();
-        match st.by_view.get(&slug).and_then(|id| map.get(id)) {
-            Some(s) => Arc::clone(&s.live),
-            None => return (StatusCode::NOT_FOUND, "unknown session").into_response(),
-        }
+    let Some(live) = st.live(&slug) else {
+        return (StatusCode::NOT_FOUND, "unknown session").into_response();
     };
     live.connect()
 }
@@ -572,17 +715,85 @@ mod tests {
             String::new(),
         );
         assert!(
-            st.allowed.contains_key(&session_id("good-secret")),
+            st.is_allowed(&session_id("good-secret")),
             "registered key allowed"
         );
         assert!(
-            !st.allowed.contains_key(&session_id("other-secret")),
+            !st.is_allowed(&session_id("other-secret")),
             "unregistered key rejected"
         );
         // An empty allowlist rejects everything (no implicit open hub).
         let empty = HubState::new(AllowConfig::default(), String::new());
-        assert!(empty.allowed.is_empty());
-        assert!(!empty.allowed.contains_key(&session_id("good-secret")));
+        assert!(!empty.is_allowed(&session_id("good-secret")));
+    }
+
+    // The management API's runtime mutations: --allow semantics as results.
+    #[test]
+    fn runtime_add_and_remove() {
+        let a = session_id("a");
+        let b = session_id("b");
+        let st = HubState::new(AllowConfig::default(), String::new());
+
+        // add: un-aliased (slug = id) and aliased
+        st.add_session(&a, None).unwrap();
+        st.add_session(&b, Some("beta")).unwrap();
+        assert!(st.is_allowed(&a) && st.is_allowed(&b));
+        assert_eq!(st.id_of_view(&a).as_deref(), Some(a.as_str()));
+        assert_eq!(st.id_of_view("beta").as_deref(), Some(b.as_str()));
+        assert_eq!(st.id_of_view(&b), None, "aliased id is not a view route");
+
+        // uniqueness rules, as results not panics
+        assert_eq!(st.add_session(&a, None), Err(AddError::IdTaken));
+        assert_eq!(
+            st.add_session(&session_id("c"), Some("beta")),
+            Err(AddError::SlugTaken)
+        );
+        assert!(matches!(
+            st.add_session("not-hex", None),
+            Err(AddError::Invalid(_))
+        ));
+        assert!(matches!(
+            st.add_session(&session_id("c"), Some("bad slug")),
+            Err(AddError::Invalid(_))
+        ));
+
+        // remove BY SLUG: resolves through the view namespace only
+        assert_eq!(st.remove_by_slug("beta").as_deref(), Some(b.as_str()));
+        assert!(!st.is_allowed(&b), "removed session may not push");
+        assert_eq!(st.id_of_view("beta"), None);
+        assert_eq!(st.remove_by_slug("beta"), None, "second delete: gone");
+
+        // remove BY ID: works regardless of aliasing
+        assert!(st.remove_by_id(&a));
+        assert!(!st.is_allowed(&a));
+        assert!(!st.remove_by_id(&a), "second delete: gone");
+
+        // the two namespaces stay distinct: removing an ALIASED session by
+        // its id-shaped SLUG string must not touch the id namespace
+        let d = session_id("d");
+        st.add_session(&d, Some("delta")).unwrap();
+        assert_eq!(
+            st.remove_by_slug(&d),
+            None,
+            "id is not a slug for an aliased session"
+        );
+        assert!(
+            st.is_allowed(&d),
+            "session survives the wrong-namespace call"
+        );
+    }
+
+    #[test]
+    fn list_sessions_reports_registry() {
+        let a = session_id("a");
+        let st = HubState::new(AllowConfig::default(), String::new());
+        st.add_session(&a, Some("alpha")).unwrap();
+        let list = st.list_sessions();
+        assert_eq!(list.len(), 1);
+        let (id, slug, live) = &list[0];
+        assert_eq!(id, &a);
+        assert_eq!(slug, "alpha");
+        assert!(!live, "no pusher has registered");
     }
 
     #[test]
@@ -680,12 +891,12 @@ mod tests {
         );
 
         // First register (the WS's first message) creates the session + its Live.
-        let live1 = register_session(&st, &id, "http://h", reg("a{}"));
+        let (live1, _kick1) = register_session(&st, &id, "http://h", reg("a{}")).unwrap();
         assert!(st.live(&id).is_some(), "session exists after register");
 
         // A reconnect re-registers: the CSS refreshes but the same Live is reused, so
         // viewers already subscribed don't get orphaned.
-        let live2 = register_session(&st, &id, "http://h", reg("b{}"));
+        let (live2, _kick2) = register_session(&st, &id, "http://h", reg("b{}")).unwrap();
         assert!(
             Arc::ptr_eq(&live1, &live2),
             "reconnect must reuse the session's Live, not replace it"
@@ -707,7 +918,7 @@ mod tests {
         // The client bakes `/s/<id>/fonts/…`; the hub must rewrite it to the slug so
         // the sub-resource stays reachable under the slug-only view namespace.
         let css = format!("@font-face{{src:url(/s/{id}/fonts/0)}}");
-        register_session(&st, &id, "http://h", reg(&css));
+        register_session(&st, &id, "http://h", reg(&css)).unwrap();
         assert_eq!(
             st.sessions.lock().unwrap().get(&id).unwrap().css,
             "@font-face{src:url(/s/pretty/fonts/0)}",

@@ -231,6 +231,11 @@ impl Live {
         self.online.send_replace(on);
     }
 
+    /// Whether the operator is currently online (the management API's `live` flag).
+    pub fn is_online(&self) -> bool {
+        *self.online.borrow()
+    }
+
     /// Subscribe a viewer: an SSE response that emits a full snapshot first, then
     /// each broadcast delta. **Takes no locks** — subscribe first, snapshot second,
     /// and skip deltas the snapshot already covers (seq ≤ snapshot's). On `Lagged`
