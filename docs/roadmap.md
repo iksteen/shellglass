@@ -481,7 +481,23 @@ API credential and vice versa.
    rejection logging as push auth. Verify: router integration tests
    (add → push authorized; delete-by-slug ≠ delete-by-id; wrong-domain key
    rejected; no `--api-allow` → 404) plus a curl e2e against a dev hub.
-4. **Semantics + docs.** Runtime-added sessions are EPHEMERAL — a hub
+4. **Unseeded sessions render the default template, operator-offline.** An
+   allowed session whose pusher has never registered (no stored
+   CSS/fonts/render-config) currently has nothing to serve — after this, a
+   registered-but-unseeded slug serves `render_page` with the built-in
+   `DEFAULT_TEMPLATE` and default config (NO `@font-face` — custom fonts
+   are deliberately ignored until the pusher provides them) and the page
+   shows the existing operator-offline state (`data-offline="operator"`,
+   the same visual as a live session whose pusher dropped). The page's SSE
+   connects and waits. When the pusher's first registration lands, its
+   pushed CSS/fonts replace the defaults — placeholder viewers must pick
+   that up: either end their SSE streams so the reconnect path reloads the
+   page, or lean on the existing version-hello mismatch reload; decide at
+   implementation and test the transition (placeholder open → pusher
+   registers → viewer shows the real session with its fonts). Verify:
+   route test (allowed-unseeded = 200 + offline marker, unknown slug =
+   404) and the transition test.
+5. **Semantics + docs.** Runtime-added sessions are EPHEMERAL — a hub
    restart forgets them and the managing tool re-adds (it is the source of
    truth; a persistence file is explicitly out of scope). Document the API,
    `--api-allow`, and `gen-key --api` in the README hub section and flag
