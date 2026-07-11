@@ -1,4 +1,4 @@
-export function decodeCells(text, runs) {
+function decodeCells(text, runs) {
     const cells = [];
     for (const v of text) {
         if (typeof v === "number")
@@ -88,16 +88,29 @@ export function resolveRgb(c) {
         return palette(c);
     return c;
 }
-export function srgb2lin(c) {
+export function cellFg(cell, isCursor) {
+    let fg = resolveRgb(cell.f) ?? parseHex(cfg.defFg);
+    if (!!cell.n !== isCursor)
+        fg = resolveRgb(cell.g) ?? parseHex(cfg.defBg);
+    if (cell.d)
+        fg = [Math.floor(fg[0] / 10) * 6, Math.floor(fg[1] / 10) * 6, Math.floor(fg[2] / 10) * 6];
+    return fg;
+}
+export function cellBgRgb(cell, isCursor) {
+    if (!!cell.n !== isCursor)
+        return resolveRgb(cell.f) ?? parseHex(cfg.defFg);
+    return resolveRgb(cell.g);
+}
+function srgb2lin(c) {
     return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
 }
-export function lin2srgb(c) {
+function lin2srgb(c) {
     return c <= 0.0031308 ? c * 12.92 : 1.055 * c ** (1 / 2.4) - 0.055;
 }
 function lum(c) {
     return (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]) / 255;
 }
-export function weightCurve(fgLum, bgLum, a) {
+function weightCurve(fgLum, bgLum, a) {
     const t = lin2srgb(srgb2lin(fgLum) * a + srgb2lin(bgLum) * (1 - a));
     return Math.min(1, Math.max(0, (t - bgLum) / (fgLum - bgLum)));
 }
@@ -169,14 +182,6 @@ export function isCanvasGlyph(cp) {
         (cp >= 0x1fb00 && cp <= 0x1fb3b) ||
         (cp >= 0x1fb70 && cp <= 0x1fb7b) ||
         (cp >= 0xe0b0 && cp <= 0xe0b3));
-}
-export function cellFg(cell, isCursor) {
-    let fg = resolveRgb(cell.f) ?? parseHex(cfg.defFg);
-    if (!!cell.n !== isCursor)
-        fg = resolveRgb(cell.g) ?? parseHex(cfg.defBg);
-    if (cell.d)
-        fg = [Math.floor(fg[0] / 10) * 6, Math.floor(fg[1] / 10) * 6, Math.floor(fg[2] / 10) * 6];
-    return fg;
 }
 let canvasEl = null;
 let ctx = null;
@@ -653,11 +658,6 @@ function redrawCanvasAll() {
     for (let r = 0; r < screen.cells.length; r++)
         redrawCanvasRow(r);
 }
-export function cellBgRgb(cell, isCursor) {
-    if (!!cell.n !== isCursor)
-        return resolveRgb(cell.f) ?? parseHex(cfg.defFg);
-    return resolveRgb(cell.g);
-}
 let smoothCursor;
 function smoothCursorOn() {
     if (smoothCursor === undefined)
@@ -1015,6 +1015,14 @@ function redrawCanvasRow(r) {
     }
     ctx.restore();
 }
+export function linkHref(links, id) {
+    if (id === undefined)
+        return null;
+    const uri = links[id];
+    if (!uri)
+        return null;
+    return /^(https?|ftp|mailto|file):/i.test(uri) ? uri : null;
+}
 let hoverA;
 let hoverRow = -1;
 function cellAt(ev) {
@@ -1105,16 +1113,10 @@ export function ghostSpan(old, next) {
     return [a, bOld - a, next.slice(a, bNew)];
 }
 function ghostRow(r) {
-    const el = screen.rowEls[r];
-    if (!el)
+    const node = screen.rowEls[r]?.firstChild;
+    if (!node)
         return;
-    const text = ghostText(screen.cells[r] ?? []);
-    const node = el.firstChild;
-    if (!(node instanceof Text)) {
-        el.textContent = text;
-        return;
-    }
-    const span = ghostSpan(node.data, text);
+    const span = ghostSpan(node.data, ghostText(screen.cells[r] ?? []));
     if (span !== null)
         node.replaceData(span[0], span[1], span[2]);
 }
@@ -1177,17 +1179,6 @@ function svgFont(cell) {
     if (fam)
         return fam;
     return isFillGlyph(cp) ? cfg.fillFont : null;
-}
-function esc(s) {
-    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-export function linkHref(links, id) {
-    if (id === undefined)
-        return null;
-    const uri = links[id];
-    if (!uri)
-        return null;
-    return /^(https?|ftp|mailto|file):/i.test(uri) ? uri : null;
 }
 let screen = { cells: [], cur: null, sty: 0, links: {}, rowEls: [] };
 let screenImages = [];
@@ -1304,15 +1295,21 @@ function setTitle(t) {
 function paintFull(dims) {
     screenEl.style.color = defaultsCss.fg;
     screenEl.style.backgroundColor = defaultsCss.bg;
-    let html = `<div class="screen" style="width:${dims.w}ch;height:calc(${dims.h} * var(--lh));">`;
+    const screenDiv = document.createElement("div");
+    screenDiv.className = "screen";
+    screenDiv.style.width = `${dims.w}ch`;
+    screenDiv.style.height = `calc(${dims.h} * var(--lh))`;
+    screen.rowEls = [];
     for (let r = 0; r < screen.cells.length; r++) {
-        html += `<div class="row ghost">${esc(ghostText(screen.cells[r]))}</div>`;
+        const row = document.createElement("div");
+        row.className = "row ghost";
+        row.appendChild(document.createTextNode(ghostText(screen.cells[r])));
+        screenDiv.appendChild(row);
+        screen.rowEls.push(row);
     }
-    html += "</div>";
-    screenEl.innerHTML = html;
-    const screenDiv = screenEl.firstElementChild;
-    screen.rowEls = Array.from(screenDiv.children);
+    screenEl.replaceChildren(screenDiv);
     attachCanvas(dims.w, dims.h, screenDiv);
+    blinkRows.clear();
     redrawCanvasAll();
     screenImages = (dims.i ?? []).map((ref) => {
         const anchor = screen.rowEls[Math.min(Math.max(ref.r, 0), screen.rowEls.length - 1)];

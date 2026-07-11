@@ -119,7 +119,7 @@ interface LineMsg {
 // Materialize text entries + style runs into per-cell objects (the grid's cell
 // form). for..of on a string iterates CODEPOINTS (unlike split(""), which
 // would shred surrogate pairs), matching the encoder's merge rule exactly.
-export function decodeCells(text: TextEntry[], runs?: StyleRun[]): Cell[] {
+function decodeCells(text: TextEntry[], runs?: StyleRun[]): Cell[] {
   const cells: Cell[] = [];
   for (const v of text) {
     if (typeof v === "number") cells.push({ t: "" });
@@ -247,6 +247,23 @@ export function resolveRgb(c: Color | undefined): RGB | null {
   return c;
 }
 
+// The cell's ink color: fg after reverse video (inverse XOR cursor, which swaps
+// in the materialized defaults) and dim (the Rust f/10*6 floor formula —
+// render.rs:cell_box_style is the reference for this math).
+export function cellFg(cell: Cell, isCursor: boolean): RGB {
+  let fg = resolveRgb(cell.f) ?? parseHex(cfg.defFg);
+  if (!!cell.n !== isCursor) fg = resolveRgb(cell.g) ?? parseHex(cfg.defBg);
+  if (cell.d) fg = [Math.floor(fg[0] / 10) * 6, Math.floor(fg[1] / 10) * 6, Math.floor(fg[2] / 10) * 6];
+  return fg;
+}
+
+// The cell's fill color — bg after reverse video (null = the default bg, which
+// #screen already shows; the fg side of the same math is cellFg above).
+export function cellBgRgb(cell: Cell, isCursor: boolean): RGB | null {
+  if (!!cell.n !== isCursor) return resolveRgb(cell.f) ?? parseHex(cfg.defFg);
+  return resolveRgb(cell.g);
+}
+
 // ── kitty-parity text composition (canvas track D.1) ──────────────────────────
 //
 // Browsers composite glyph coverage in sRGB space; kitty composites in linear
@@ -262,19 +279,19 @@ export function resolveRgb(c: Color | undefined): RGB | null {
 // luminance approximation for colored text. Applied per draw as an SVG
 // feComponentTransfer alpha table — identity at a=0 and a=1, so solid fills
 // (backgrounds, bars, straight underlines) pass through untouched and the
-// filter can stay set across a row. DOM mode cannot express this at all (CSS
-// has no text blend math) — canvas-mode only by nature.
-export function srgb2lin(c: number): number {
+// filter can stay set across a row. (CSS has no text blend math — one reason
+// the canvas replaced the CSS renderer.)
+function srgb2lin(c: number): number {
   return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
 }
-export function lin2srgb(c: number): number {
+function lin2srgb(c: number): number {
   return c <= 0.003_130_8 ? c * 12.92 : 1.055 * c ** (1 / 2.4) - 0.055;
 }
 function lum(c: RGB): number {
   return (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]) / 255;
 }
 // The remap itself, exported for the verify rig's numeric check.
-export function weightCurve(fgLum: number, bgLum: number, a: number): number {
+function weightCurve(fgLum: number, bgLum: number, a: number): number {
   const t = lin2srgb(srgb2lin(fgLum) * a + srgb2lin(bgLum) * (1 - a));
   return Math.min(1, Math.max(0, (t - bgLum) / (fgLum - bgLum)));
 }
@@ -311,14 +328,14 @@ export function weightBoost(fg: RGB, bg: RGB): number {
   return k;
 }
 
-// ── canvas line overlay (exp) ─────────────────────────────────────────────────
+// ── glyph geometry: box/block/legacy/powerline as device-pixel ops ────────────
 //
-// Box-drawing lines/junctions render on one <canvas> laid over #screen, drawn crisp at
-// device pixels: adjacent cells share ROUNDED pixel boundaries, so a vertical divider
-// tiles across rows with no seam and no font-hinting fight — the thing stretched SVG
-// couldn't do. The DOM keeps the real glyph as transparent text, so selection/copy still
-// work. Scope: the arms-coverable subset (lines, corners, tees, crosses, half-lines);
-// dashes/doubles/arcs/blocks stay on the font path for now.
+// Box-drawing lines/junctions/blocks are drawn as crisp device-pixel geometry,
+// not font glyphs: adjacent cells share ROUNDED pixel boundaries, so a vertical
+// divider tiles across rows with no seam and no font-hinting fight — the thing
+// stretched SVG couldn't do (see exp/procedural-glyph-geometry). The ghost row
+// keeps the real character as transparent text, so selection/copy still work.
+// Everything through paintOps is pure (unit-tested via glyphOps).
 
 let cellW = 8;
 let cellH = 17;
@@ -383,16 +400,6 @@ export function isCanvasGlyph(cp: number): boolean {
     (cp >= 0x1fb70 && cp <= 0x1fb7b) || // one-eighth vertical/horizontal bars
     (cp >= 0xe0b0 && cp <= 0xe0b3) // powerline triangle separators
   );
-}
-
-// The cell's ink color: fg after reverse video (inverse XOR cursor, which swaps
-// in the materialized defaults) and dim (the Rust f/10*6 floor formula —
-// render.rs:cell_box_style is the reference for this math).
-export function cellFg(cell: Cell, isCursor: boolean): RGB {
-  let fg = resolveRgb(cell.f) ?? parseHex(cfg.defFg);
-  if (!!cell.n !== isCursor) fg = resolveRgb(cell.g) ?? parseHex(cfg.defBg);
-  if (cell.d) fg = [Math.floor(fg[0] / 10) * 6, Math.floor(fg[1] / 10) * 6, Math.floor(fg[2] / 10) * 6];
-  return fg;
 }
 
 let canvasEl: HTMLCanvasElement | null = null;
@@ -955,19 +962,6 @@ function paintOps(g: CanvasRenderingContext2D, color: string, ops: Op[]): void {
   }
 }
 
-function drawGlyph(r: number, c: number, cp: number, cell: Cell, isCursor: boolean): void {
-  if (!ctx) return;
-  const [x0, y0, x1, y1] = cellRect(r, c);
-  const light = Math.max(1, Math.round(dpr));
-  paintOps(ctx, hex(cellFg(cell, isCursor)), glyphOps(cp, x0, y0, x1, y1, light));
-}
-
-function redrawCanvasAll(): void {
-  if (!ctx || !canvasEl) return;
-  ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
-  for (let r = 0; r < screen.cells.length; r++) redrawCanvasRow(r);
-}
-
 // ── full-canvas cell rendering ────────────────────────────────────────────────
 //
 // The whole picture paints on the (cell-exact, dpr-aware) canvas — backgrounds,
@@ -986,18 +980,19 @@ function redrawCanvasAll(): void {
 // text-shadow is forced off on ghost rows (shadows have explicit colors and would
 // render even for transparent text).
 
-// The cell's fill color — bg after reverse video (null = the default bg, which
-// #screen already shows; see cellFg for the fg side of the same math).
-export function cellBgRgb(cell: Cell, isCursor: boolean): RGB | null {
-  if (!!cell.n !== isCursor) return resolveRgb(cell.f) ?? parseHex(cfg.defFg);
-  return resolveRgb(cell.g);
+function drawGlyph(r: number, c: number, cp: number, cell: Cell, isCursor: boolean): void {
+  if (!ctx) return;
+  const [x0, y0, x1, y1] = cellRect(r, c);
+  const light = Math.max(1, Math.round(dpr));
+  paintOps(ctx, hex(cellFg(cell, isCursor)), glyphOps(cp, x0, y0, x1, y1, light));
 }
 
-// Paint one row band entirely on the canvas: clear to transparent (the ghost text
-// below is invisible, #screen supplies the backdrop, and a selection highlight must
-// show through), per-cell backgrounds, then ink — crisp geometry for canvas glyphs,
-// fillText for everything else. maxWidth pins a glyph into its cell box like the
-// DOM's .run overflow:hidden does.
+function redrawCanvasAll(): void {
+  if (!ctx || !canvasEl) return;
+  ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+  for (let r = 0; r < screen.cells.length; r++) redrawCanvasRow(r);
+}
+
 // Smooth cursor travel (opt-in, ?cursor=smooth): in canvas mode the cursor
 // glides between cells over ~80ms instead of teleporting. The traveling shape
 // is drawn on the canvas each animation frame after repainting the rows it
@@ -1065,10 +1060,10 @@ function stepCurAnim(): void {
   requestAnimationFrame(stepCurAnim);
 }
 
-// Blink (SGR 5) on the canvas: rows holding blink cells register here while
-// painted; a lazy 500ms timer flips the phase and repaints exactly those rows
-// (the DOM path animates via CSS instead). In the off phase the glyph is
-// skipped like conceal — bg and decorations stay, matching kitty's ink blink.
+// Blink (SGR 5): rows holding blink cells register here while painted; a lazy
+// 500ms timer flips the phase and repaints exactly those rows. In the off
+// phase the glyph is skipped like conceal — bg and decorations stay, matching
+// kitty's ink blink.
 let blinkPhase = false;
 const blinkRows = new Set<number>();
 let blinkTimer: ReturnType<typeof setInterval> | null = null;
@@ -1098,7 +1093,7 @@ let crtBox: HTMLInputElement | null | undefined;
 function crtOn(): boolean {
   if (crtBox === undefined) {
     crtBox = document.getElementById("crt") as HTMLInputElement | null;
-    // repaint canvas rows when the toggle flips (CSS handles the DOM side)
+    // repaint when the toggle flips (the overlay layers are pure CSS)
     crtBox?.addEventListener("change", () => {
       if (!pictureHeld()) redrawCanvasAll();
     });
@@ -1106,19 +1101,23 @@ function crtOn(): boolean {
   return crtBox !== null && crtBox.checked;
 }
 
-// Redraw one row's band of the canvas from screen.cells. Self-contained: all
-// ink is clipped to the band, so a per-row redraw never disturbs neighbours.
+// Redraw one row's band of the canvas from screen.cells: clear to transparent
+// (the ghost text below is invisible, #screen supplies the backdrop, and a
+// selection highlight must show through), image slices, per-cell backgrounds,
+// then ink — crisp geometry for canvas glyphs, fillText for everything else
+// (maxWidth pins a glyph into its cell box). Self-contained: all ink is
+// clipped to the band, so a per-row redraw never disturbs neighbours.
 function redrawCanvasRow(r: number): void {
   if (!ctx || !canvasEl) return;
   const y0 = Math.round(r * cellH * dpr);
   const y1 = Math.round((r + 1) * cellH * dpr);
   ctx.clearRect(0, y0, canvasEl.width, y1 - y0);
-  // Clip all ink to the band — the DOM's .run{height:--lh;overflow:hidden}
-  // in canvas form. Without it, fonts whose bounding box is taller than the
-  // line height (Nerd Fonts, typically) paint descenders and low-riding
-  // decorations into the NEXT row's band, where the next repaint of either
-  // row wipes or restores them by turns — visible jitter on p/g/y tails and
-  // double underlines. Horizontal overflow (over-wide glyphs) stays free.
+  // Clip all ink to the band — the cell-box model: a row owns its box.
+  // Without it, fonts whose bounding box is taller than the line height
+  // (Nerd Fonts, typically) paint descenders and low-riding decorations
+  // into the NEXT row's band, where the next repaint of either row wipes
+  // or restores them by turns — visible jitter on p/g/y tails and double
+  // underlines. Horizontal overflow (over-wide glyphs) stays free.
   ctx.save();
   ctx.beginPath();
   ctx.rect(0, y0, canvasEl.width, y1 - y0);
@@ -1153,8 +1152,8 @@ function redrawCanvasRow(r: number): void {
   const baseY = rowBaseline(r);
   const defBg = cfg.defBg.toLowerCase();
   const defBgRgb = parseHex(defBg);
-  // Decoration metrics, sized like the DOM's text-decoration: thickness ~6%
-  // of the em, underline just below the baseline, strike through the x-height.
+  // Decoration metrics, CSS-text-decoration-sized: thickness ~6% of the em,
+  // underline just below the baseline, strike through the x-height.
   const th = Math.max(1, Math.round(fontPx * 0.06));
   const ulOff = Math.max(th, Math.round(fontPx * 0.065));
   const amp = Math.max(1, Math.round(fontPx * 0.045));
@@ -1308,8 +1307,8 @@ function redrawCanvasRow(r: number): void {
       flushRun();
       drawGlyph(r, c, cp, cell, curBlock);
     } else if (!hidden && cell.t && cell.t !== " ") {
-      // symbol_map / fill-glyph cells draw with their mapped family — canvas
-      // uses the served webfonts once loaded, same faces as the DOM path.
+      // symbol_map / fill-glyph cells draw with their mapped family — the
+      // served webfonts, once loaded, exactly as the page's CSS stack resolves.
       const mapped = svgFont(cell);
       const fam = mapped ?? fontFam;
       const font = `${cell.i ? "italic " : ""}${cell.b ? "bold " : ""}${fontPx}px ${fam}`;
@@ -1341,8 +1340,9 @@ function redrawCanvasRow(r: number): void {
             ctx.fillText(cell.t!, 0, 0);
             ctx.restore();
           } else if (overflow) {
-            // Over-wide fallback glyphs overflow their cell, like the DOM's
-            // own-cell quarantine with overflow:visible — no maxWidth squeeze.
+            // Over-wide fallback glyphs overflow their cell visibly (the
+            // neighbour is near-always blank) — no maxWidth squeeze, which
+            // would distort the glyph into 1ch.
             ctx.fillText(cell.t!, x0, baseY);
           } else {
             ctx.fillText(cell.t!, x0, baseY, x1 - x0);
@@ -1358,7 +1358,7 @@ function redrawCanvasRow(r: number): void {
       } else {
         // Run-shaped text (D.2): contiguous same-style cells accumulate and
         // draw as ONE fillText so the browser's shaper forms ligatures and
-        // joins scripts, exactly as the DOM path's coalesced spans do.
+        // joins scripts — per-cell draws can't.
         if (
           runBuf !== null &&
           (runBuf.font !== font || runBuf.fg !== fg || runBuf.k !== k || runBuf.xEnd !== x0)
@@ -1409,8 +1409,8 @@ function redrawCanvasRow(r: number): void {
       drawUnderline(x0, x1, 1, hex(cellFg(cell, curBlock)));
     }
     if (isCursor && !blocky) {
-      // DECSCUSR underline (3/4) or bar (5/6) cursor, 0.14em like the DOM's
-      // inset box-shadow, in the cell's un-reversed fg.
+      // DECSCUSR underline (3/4) or bar (5/6) cursor, 0.14em thick, in the
+      // cell's un-reversed fg.
       const cw = Math.max(1, Math.round(fontPx * 0.14));
       ctx.fillStyle = hex(cellFg(cell, false));
       if (screen.sty >= 5) ctx.fillRect(x0, y0, cw, y1 - y0);
@@ -1434,16 +1434,25 @@ function redrawCanvasRow(r: number): void {
   ctx.restore(); // the band clip
 }
 
-// The ghost backing for one row: the grid's plain characters as a single text node.
-// textContent (not innerHTML) — no parsing, no spans, no styles; wide cells emit
-// their grapheme once and monospace CJK advances 2ch, matching the styled path's
-// column math, so a selection maps to the picture the canvas paints on top.
 // ── OSC 8 links ───────────────────────────────────────────────────────────────
 //
-// The ghost text has no anchors, so pointer
-// events map back to cells by grid arithmetic. Hover shows the kitty
-// affordance (pointer cursor + underline on the link's cells in that row) and
-// click opens the same linkHref-vetted URI a DOM anchor would.
+// The ghost text has no anchors, so pointer events map back to cells by grid
+// arithmetic. Hover shows the kitty affordance (pointer cursor + underline on
+// the link's cells in that row) and click opens the linkHref-vetted URI.
+
+// OSC 8 comes from whatever program runs in the mirrored session, so treat the
+// URI as hostile: only schemes that can't execute in the page open on click
+// (javascript:/data:/vbscript: would be viewer XSS one click away).
+// file: is allowed — `ls --hyperlink` emits it for every entry, and while the
+// browser itself refuses file: navigation from web content, the hover
+// affordance still mirrors what the terminal shows.
+export function linkHref(links: Record<number, string>, id: number | undefined): string | null {
+  if (id === undefined) return null;
+  const uri = links[id];
+  if (!uri) return null; // pruned table entry: render unlinked
+  return /^(https?|ftp|mailto|file):/i.test(uri) ? uri : null;
+}
+
 let hoverA: number | undefined;
 let hoverRow = -1;
 function cellAt(ev: MouseEvent): { cell: Cell; r: number } | null {
@@ -1510,6 +1519,16 @@ function attachLinkHandlers(): void {
   });
 }
 
+// ── ghost layer + selection hold ──────────────────────────────────────────────
+//
+// The DOM under the canvas: one transparent text node per row (the copy/find/
+// a11y surface), patched in place so selections survive, and frozen — together
+// with the canvas — for as long as the user holds or has a selection.
+
+// The ghost backing for one row: the grid's plain characters as one string.
+// Wide cells emit their grapheme once (monospace CJK advances 2ch, matching
+// the canvas's column math), blanks become spaces, trailing blanks kept so
+// the row spans the full grid width.
 export function ghostText(row: Cell[]): string {
   let text = "";
   for (const cell of row) text += cell.t && cell.t.length ? cell.t : " ";
@@ -1544,16 +1563,11 @@ export function ghostSpan(
 // Sync one ghost row, patching the text node IN PLACE via replaceData —
 // the node identity survives, and any Range boundary points adjust across
 // the splice instead of orphaning (belt-and-suspenders under the freeze).
+// paintFull guarantees a Text firstChild on every row.
 function ghostRow(r: number): void {
-  const el = screen.rowEls[r];
-  if (!el) return;
-  const text = ghostText(screen.cells[r] ?? []);
-  const node = el.firstChild;
-  if (!(node instanceof Text)) {
-    el.textContent = text;
-    return;
-  }
-  const span = ghostSpan(node.data, text);
+  const node = screen.rowEls[r]?.firstChild as Text | undefined;
+  if (!node) return;
+  const span = ghostSpan(node.data, ghostText(screen.cells[r] ?? []));
   if (span !== null) node.replaceData(span[0], span[1], span[2]);
 }
 
@@ -1648,23 +1662,6 @@ function svgFont(cell: Cell): string | null {
   const fam = symbolFamily(cp);
   if (fam) return fam;
   return isFillGlyph(cp) ? cfg.fillFont : null;
-}
-
-function esc(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-// OSC 8 comes from whatever program runs in the mirrored session, so treat the
-// URI as hostile: only schemes that can't execute in the page open on click
-// (javascript:/data:/vbscript: would be viewer XSS one click away).
-// file: is allowed — `ls --hyperlink` emits it for every entry, and while the
-// browser itself refuses file: navigation from web content, the hover
-// affordance still mirrors what the terminal shows.
-export function linkHref(links: Record<number, string>, id: number | undefined): string | null {
-  if (id === undefined) return null;
-  const uri = links[id];
-  if (!uri) return null; // pruned table entry: render unlinked
-  return /^(https?|ftp|mailto|file):/i.test(uri) ? uri : null;
 }
 
 // ── screen state + message application ────────────────────────────────────────
@@ -1846,19 +1843,27 @@ function paintFull(dims: { w: number; h: number; i?: ImageRef[] }): void {
   screenEl.style.color = defaultsCss.fg;
   screenEl.style.backgroundColor = defaultsCss.bg;
   // Rows are GHOST TEXT from the start: one text node per row, transparent ink
-  // (the injected .row.ghost rule), the canvas above paints the picture.
-  let html = `<div class="screen" style="width:${dims.w}ch;height:calc(${dims.h} * var(--lh));">`;
+  // (the injected .row.ghost rule), the canvas above paints the picture. Built
+  // with the DOM API, so every row is GUARANTEED a Text firstChild (ghostRow
+  // patches it via replaceData without a fallback).
+  const screenDiv = document.createElement("div");
+  screenDiv.className = "screen";
+  screenDiv.style.width = `${dims.w}ch`;
+  screenDiv.style.height = `calc(${dims.h} * var(--lh))`;
+  screen.rowEls = [];
   for (let r = 0; r < screen.cells.length; r++) {
-    html += `<div class="row ghost">${esc(ghostText(screen.cells[r]))}</div>`;
+    const row = document.createElement("div");
+    row.className = "row ghost";
+    row.appendChild(document.createTextNode(ghostText(screen.cells[r])));
+    screenDiv.appendChild(row);
+    screen.rowEls.push(row);
   }
-  html += "</div>";
-  screenEl.innerHTML = html;
-
-  const screenDiv = screenEl.firstElementChild as HTMLElement;
-  screen.rowEls = Array.from(screenDiv.children) as HTMLElement[];
+  screenEl.replaceChildren(screenDiv);
   // The canvas lives inside .screen (rebuilt each full frame), sized to the grid, and
-  // repainted from the fresh cells.
+  // repainted from the fresh cells. A shrunk grid may strand out-of-range rows
+  // in the blink registry — drop them; redrawCanvasAll re-registers the live ones.
   attachCanvas(dims.w, dims.h, screenDiv);
+  blinkRows.clear();
   redrawCanvasAll();
 
   // Inline images ride only in full frames (an image add/remove/move forces
@@ -2134,8 +2139,8 @@ function main(): void {
   const reflowGlyphs = (): void => {
     resetGlyphMeasure();
     // Canvas metrics can go stale even when .screen's box doesn't move (a
-    // same-advance font-face swap never fires the ResizeObserver), so re-derive
-    // them and repaint the canvas alongside the DOM rows.
+    // same-advance font-face swap never fires the ResizeObserver), so
+    // re-derive them and repaint everything.
     sizeCanvas();
     redrawCanvasAll();
     for (let r = 0; r < screen.cells.length; r++) dirtyRows.add(r);
