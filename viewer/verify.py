@@ -140,6 +140,19 @@ def main():
             if sum(px[x, y][:3]) > 60
         )
         print(f"conceal check ({label}): {'PASS' if ink == 0 else f'FAIL ({ink} lit px)'}")
+    # Underline skip-ink (D.4): row 5's underline must PART around the
+    # descenders of "Mgjq" (cols 14-17) — kitty's exclusion zones; the DOM
+    # does the same via text-decoration-skip-ink. Gap = a column in the
+    # underline band with no ink below the x-height region.
+    for label, img in (("dom", dom), ("storm", storm)):
+        px = img.load()
+        y0, y1 = 5 * LH + 12, 6 * LH  # the underline band (below the baseline)
+        gaps = sum(
+            1
+            for x in range(int(14 * 8.4), int(18 * 8.4))
+            if all(sum(px[x, y][:3]) <= 60 for y in range(y0, y1))
+        )
+        print(f"skip-ink check ({label}): {'PASS' if gaps >= 2 else f'FAIL ({gaps} gap cols)'}")
     # Decoration continuity at SPACES: rows 5 (underline) and 9 (strike)
     # style their first 18 cells including the spaces between words — the
     # line must run through the space cells (text-decoration doesn't break

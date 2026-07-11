@@ -255,6 +255,52 @@ function rowBaseline(r) {
     }
     return Math.round(r * cellH * dpr + base);
 }
+let descCanvas = null;
+const descSpanCache = new Map();
+function descSpan(font, glyph, top, h) {
+    const key = `${font}\0${glyph}\0${top}:${h}`;
+    const hit = descSpanCache.get(key);
+    if (hit !== undefined)
+        return hit;
+    if (typeof document === "undefined")
+        return null;
+    if (descCanvas === null)
+        descCanvas = document.createElement("canvas");
+    const ox = Math.ceil(fontPx);
+    const oy = 2;
+    const wpx = Math.ceil(fontPx * 4);
+    const hpx = Math.ceil(oy + top + h + 2);
+    if (descCanvas.width < wpx || descCanvas.height < hpx) {
+        descCanvas.width = wpx;
+        descCanvas.height = hpx;
+    }
+    const g = descCanvas.getContext("2d", { willReadFrequently: true });
+    if (!g)
+        return null;
+    g.clearRect(0, 0, descCanvas.width, descCanvas.height);
+    g.font = font;
+    g.textBaseline = "alphabetic";
+    g.fillStyle = "#fff";
+    g.fillText(glyph, ox, oy);
+    const band = g.getImageData(0, Math.max(0, Math.round(oy + top) - 1), descCanvas.width, Math.max(1, Math.round(h) + 2)).data;
+    let lo = -1;
+    let hi = -1;
+    const cols = descCanvas.width;
+    const rows = band.length / 4 / cols;
+    for (let x = 0; x < cols; x++) {
+        for (let y = 0; y < rows; y++) {
+            if (band[(y * cols + x) * 4 + 3] > 0) {
+                if (lo < 0)
+                    lo = x;
+                hi = x;
+                break;
+            }
+        }
+    }
+    const span = lo < 0 ? null : [lo - ox, hi + 1 - ox];
+    descSpanCache.set(key, span);
+    return span;
+}
 const inkBoxCache = new Map();
 function inkBox(font, glyph) {
     const key = `${font}\0${glyph}`;
@@ -284,6 +330,7 @@ let dprMedia = null;
 function sizeCanvas() {
     fontMetricsCache.clear();
     inkBoxCache.clear();
+    descSpanCache.clear();
     if (!canvasEl || !obsScreen || !gCols || !gRows)
         return;
     const rect = obsScreen.getBoundingClientRect();
@@ -864,49 +911,57 @@ function drawRowStorm(r) {
     const amp = Math.max(1, Math.round(fontPx * 0.045));
     const ulY = baseY + ulOff;
     const strikeY = baseY - Math.round(fontPx * 0.36);
-    const drawUnderline = (x0, x1, style, color, atY = ulY) => {
+    const drawUnderline = (x0, x1, style, color, atY = ulY, gap = null) => {
         if (!ctx)
             return;
         const depth = style === 2 ? 3 * th : style === 3 ? amp + th : th;
         atY = Math.min(atY, y1 - depth);
         ctx.fillStyle = color;
-        switch (style) {
-            case 2:
-                ctx.fillRect(x0, atY, x1 - x0, th);
-                ctx.fillRect(x0, atY + 2 * th, x1 - x0, th);
-                break;
-            case 3: {
-                const period = Math.max(6, Math.round(fontPx * 0.5));
-                ctx.strokeStyle = color;
-                ctx.lineWidth = th;
-                ctx.beginPath();
-                const step = Math.max(1, Math.round(dpr));
-                for (let x = x0; x <= x1; x += step) {
-                    const y = atY + Math.sin((x * 2 * Math.PI) / period) * amp;
-                    if (x === x0)
-                        ctx.moveTo(x, y);
-                    else
-                        ctx.lineTo(x, y);
+        const segs = gap !== null && gap[0] < x1 && gap[1] > x0
+            ? [
+                [x0, Math.max(x0, gap[0])],
+                [Math.min(x1, gap[1]), x1],
+            ].filter(([a, b]) => b > a)
+            : [[x0, x1]];
+        for (const [s0, s1] of segs) {
+            switch (style) {
+                case 2:
+                    ctx.fillRect(s0, atY, s1 - s0, th);
+                    ctx.fillRect(s0, atY + 2 * th, s1 - s0, th);
+                    break;
+                case 3: {
+                    const period = Math.max(6, Math.round(fontPx * 0.5));
+                    ctx.strokeStyle = color;
+                    ctx.lineWidth = th;
+                    ctx.beginPath();
+                    const step = Math.max(1, Math.round(dpr));
+                    for (let x = s0; x <= s1; x += step) {
+                        const y = atY + Math.sin((x * 2 * Math.PI) / period) * amp;
+                        if (x === s0)
+                            ctx.moveTo(x, y);
+                        else
+                            ctx.lineTo(x, y);
+                    }
+                    ctx.stroke();
+                    break;
                 }
-                ctx.stroke();
-                break;
+                case 4:
+                    for (let x = s0 - (s0 % (2 * th)); x < s1; x += 2 * th) {
+                        if (x >= s0)
+                            ctx.fillRect(x, atY, th, th);
+                    }
+                    break;
+                case 5:
+                    for (let x = s0 - (s0 % (5 * th)); x < s1; x += 5 * th) {
+                        const lo = Math.max(x, s0);
+                        const hi = Math.min(x + 3 * th, s1);
+                        if (hi > lo)
+                            ctx.fillRect(lo, atY, hi - lo, th);
+                    }
+                    break;
+                default:
+                    ctx.fillRect(s0, atY, s1 - s0, th);
             }
-            case 4:
-                for (let x = x0 - (x0 % (2 * th)); x < x1; x += 2 * th) {
-                    if (x >= x0)
-                        ctx.fillRect(x, atY, th, th);
-                }
-                break;
-            case 5:
-                for (let x = x0 - (x0 % (5 * th)); x < x1; x += 5 * th) {
-                    const lo = Math.max(x, x0);
-                    const hi = Math.min(x + 3 * th, x1);
-                    if (hi > lo)
-                        ctx.fillRect(lo, atY, hi - lo, th);
-                }
-                break;
-            default:
-                ctx.fillRect(x0, atY, x1 - x0, th);
         }
     };
     let curFont = "";
@@ -1030,8 +1085,20 @@ function drawRowStorm(r) {
         if (cell.u || cell.s) {
             const fg = hex(cellFg(cell, curBlock));
             if (cell.u) {
+                const style = typeof cell.u === "number" ? cell.u : 1;
+                let gap = null;
+                if (style !== 3 && !hidden && cell.t && cell.t !== " ") {
+                    const fam = svgFont(cell) ?? fontFam;
+                    const font = `${cell.i ? "italic " : ""}${cell.b ? "bold " : ""}${fontPx}px ${fam}`;
+                    const depth = style === 2 ? 3 * th : th;
+                    const atY = Math.min(ulY, y1 - depth);
+                    const span = descSpan(font, cell.t, atY - baseY, depth);
+                    if (span !== null) {
+                        gap = [x0 + span[0] - th, x0 + span[1] + th];
+                    }
+                }
                 const ulColor = resolveRgb(cell.k);
-                drawUnderline(x0, x1, typeof cell.u === "number" ? cell.u : 1, ulColor ? hex(ulColor) : fg);
+                drawUnderline(x0, x1, style, ulColor ? hex(ulColor) : fg, ulY, gap);
             }
             if (cell.s) {
                 ctx.fillStyle = fg;

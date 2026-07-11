@@ -507,6 +507,67 @@ function rowBaseline(r: number): number {
   return Math.round(r * cellH * dpr + base);
 }
 
+// Underline exclusion (canvas track D.4): kitty parts the underline around
+// descender ink — calculate_underline_exclusion_zones in kitty/fonts.c scans
+// each column of the glyph for rendered pixels inside the decoration band and
+// masks hit columns padded by one underline thickness. Same algorithm here,
+// amortized per (font, glyph, band): one offscreen raster + column scan,
+// returning the ink's horizontal extent within the band relative to the draw
+// origin (null = nothing descends that far).
+let descCanvas: HTMLCanvasElement | null = null;
+const descSpanCache = new Map<string, [number, number] | null>();
+function descSpan(
+  font: string,
+  glyph: string,
+  top: number,
+  h: number,
+): [number, number] | null {
+  const key = `${font}\0${glyph}\0${top}:${h}`;
+  const hit = descSpanCache.get(key);
+  if (hit !== undefined) return hit;
+  if (typeof document === "undefined") return null;
+  if (descCanvas === null) descCanvas = document.createElement("canvas");
+  const ox = Math.ceil(fontPx); // room for left bearings
+  const oy = 2; // headroom so AA straddling the band top isn't edge-clipped
+  const wpx = Math.ceil(fontPx * 4);
+  const hpx = Math.ceil(oy + top + h + 2);
+  if (descCanvas.width < wpx || descCanvas.height < hpx) {
+    descCanvas.width = wpx;
+    descCanvas.height = hpx;
+  }
+  const g = descCanvas.getContext("2d", { willReadFrequently: true });
+  if (!g) return null;
+  g.clearRect(0, 0, descCanvas.width, descCanvas.height);
+  g.font = font;
+  g.textBaseline = "alphabetic";
+  g.fillStyle = "#fff";
+  g.fillText(glyph, ox, oy); // baseline at y=oy: the band rows are oy+[top, top+h)
+  // scan one pixel beyond each band edge — AA rows count as ink, like
+  // kitty's is_rendered() on the full-resolution glyph raster
+  const band = g.getImageData(
+    0,
+    Math.max(0, Math.round(oy + top) - 1),
+    descCanvas.width,
+    Math.max(1, Math.round(h) + 2),
+  ).data;
+  let lo = -1;
+  let hi = -1;
+  const cols = descCanvas.width;
+  const rows = band.length / 4 / cols;
+  for (let x = 0; x < cols; x++) {
+    for (let y = 0; y < rows; y++) {
+      if (band[(y * cols + x) * 4 + 3] > 0) {
+        if (lo < 0) lo = x;
+        hi = x;
+        break;
+      }
+    }
+  }
+  const span: [number, number] | null = lo < 0 ? null : [lo - ox, hi + 1 - ox];
+  descSpanCache.set(key, span);
+  return span;
+}
+
 // Ink boxes for fill-glyph stretching, cached per (font, glyph).
 const inkBoxCache = new Map<string, { l: number; r: number; a: number; d: number }>();
 function inkBox(font: string, glyph: string): { l: number; r: number; a: number; d: number } | null {
@@ -543,6 +604,7 @@ let dprMedia: MediaQueryList | null = null;
 function sizeCanvas(): void {
   fontMetricsCache.clear();
   inkBoxCache.clear();
+  descSpanCache.clear();
   if (!canvasEl || !obsScreen || !gCols || !gRows) return;
   const rect = obsScreen.getBoundingClientRect();
   if (!rect.width || !rect.height) return;
@@ -1229,47 +1291,68 @@ function drawRowStorm(r: number): void {
   const ulY = baseY + ulOff;
   const strikeY = baseY - Math.round(fontPx * 0.36);
   // Underline in the cell's style (kitty numbering), honoring SGR 58 color.
-  const drawUnderline = (x0: number, x1: number, style: number, color: string, atY = ulY) => {
+  // `gap` (device px, absolute) parts the line around descender ink — the
+  // exclusion zone from descSpan. Curly keeps drawing through: it is a
+  // stroked path, and kitty's own curl sits low enough that its exclusion
+  // rarely triggers; segmenting a sine is not worth the fidelity delta.
+  const drawUnderline = (
+    x0: number,
+    x1: number,
+    style: number,
+    color: string,
+    atY = ulY,
+    gap: [number, number] | null = null,
+  ) => {
     if (!ctx) return;
     // in-cell clamp: the deepest ink of each style stays inside the band,
     // like kitty clamping the font's underline position into the cell
     const depth = style === 2 ? 3 * th : style === 3 ? amp + th : th;
     atY = Math.min(atY, y1 - depth);
     ctx.fillStyle = color;
-    switch (style) {
-      case 2: // double
-        ctx.fillRect(x0, atY, x1 - x0, th);
-        ctx.fillRect(x0, atY + 2 * th, x1 - x0, th);
-        break;
-      case 3: {
-        // curly: sampled sine, phase from absolute x so adjacent cells join
-        const period = Math.max(6, Math.round(fontPx * 0.5));
-        ctx.strokeStyle = color;
-        ctx.lineWidth = th;
-        ctx.beginPath();
-        const step = Math.max(1, Math.round(dpr));
-        for (let x = x0; x <= x1; x += step) {
-          const y = atY + Math.sin((x * 2 * Math.PI) / period) * amp;
-          if (x === x0) ctx.moveTo(x, y);
-          else ctx.lineTo(x, y);
+    // the un-excluded segments of [x0, x1]
+    const segs: [number, number][] =
+      gap !== null && gap[0] < x1 && gap[1] > x0
+        ? ([
+            [x0, Math.max(x0, gap[0])],
+            [Math.min(x1, gap[1]), x1],
+          ].filter(([a, b]) => b > a) as [number, number][])
+        : [[x0, x1]];
+    for (const [s0, s1] of segs) {
+      switch (style) {
+        case 2: // double
+          ctx.fillRect(s0, atY, s1 - s0, th);
+          ctx.fillRect(s0, atY + 2 * th, s1 - s0, th);
+          break;
+        case 3: {
+          // curly: sampled sine, phase from absolute x so adjacent cells join
+          const period = Math.max(6, Math.round(fontPx * 0.5));
+          ctx.strokeStyle = color;
+          ctx.lineWidth = th;
+          ctx.beginPath();
+          const step = Math.max(1, Math.round(dpr));
+          for (let x = s0; x <= s1; x += step) {
+            const y = atY + Math.sin((x * 2 * Math.PI) / period) * amp;
+            if (x === s0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+          break;
         }
-        ctx.stroke();
-        break;
+        case 4: // dotted: th-square dots, one per 2th, phase-locked to x
+          for (let x = s0 - (s0 % (2 * th)); x < s1; x += 2 * th) {
+            if (x >= s0) ctx.fillRect(x, atY, th, th);
+          }
+          break;
+        case 5: // dashed: 3th on, 2th off, phase-locked to x
+          for (let x = s0 - (s0 % (5 * th)); x < s1; x += 5 * th) {
+            const lo = Math.max(x, s0);
+            const hi = Math.min(x + 3 * th, s1);
+            if (hi > lo) ctx.fillRect(lo, atY, hi - lo, th);
+          }
+          break;
+        default: // single
+          ctx.fillRect(s0, atY, s1 - s0, th);
       }
-      case 4: // dotted: th-square dots, one per 2th, phase-locked to x
-        for (let x = x0 - (x0 % (2 * th)); x < x1; x += 2 * th) {
-          if (x >= x0) ctx.fillRect(x, atY, th, th);
-        }
-        break;
-      case 5: // dashed: 3th on, 2th off, phase-locked to x
-        for (let x = x0 - (x0 % (5 * th)); x < x1; x += 5 * th) {
-          const lo = Math.max(x, x0);
-          const hi = Math.min(x + 3 * th, x1);
-          if (hi > lo) ctx.fillRect(lo, atY, hi - lo, th);
-        }
-        break;
-      default: // single
-        ctx.fillRect(x0, atY, x1 - x0, th);
     }
   };
   let curFont = "";
@@ -1427,8 +1510,24 @@ function drawRowStorm(r: number): void {
     if (cell.u || cell.s) {
       const fg = hex(cellFg(cell, curBlock));
       if (cell.u) {
+        const style = typeof cell.u === "number" ? cell.u : 1;
+        // Underline exclusion (D.4): part the line around descender ink,
+        // kitty-style. Only for VISIBLE glyphs (a concealed cell keeps its
+        // line whole) and non-curly styles (see drawUnderline).
+        let gap: [number, number] | null = null;
+        if (style !== 3 && !hidden && cell.t && cell.t !== " ") {
+          const fam = svgFont(cell) ?? fontFam;
+          const font = `${cell.i ? "italic " : ""}${cell.b ? "bold " : ""}${fontPx}px ${fam}`;
+          const depth = style === 2 ? 3 * th : th;
+          const atY = Math.min(ulY, y1 - depth);
+          const span = descSpan(font, cell.t, atY - baseY, depth);
+          if (span !== null) {
+            // pad by one underline thickness, kitty's default exclusion
+            gap = [x0 + span[0] - th, x0 + span[1] + th];
+          }
+        }
         const ulColor = resolveRgb(cell.k);
-        drawUnderline(x0, x1, typeof cell.u === "number" ? cell.u : 1, ulColor ? hex(ulColor) : fg);
+        drawUnderline(x0, x1, style, ulColor ? hex(ulColor) : fg, ulY, gap);
       }
       if (cell.s) {
         ctx.fillStyle = fg;

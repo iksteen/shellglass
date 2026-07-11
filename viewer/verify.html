@@ -395,6 +395,19 @@ if (MODE === "liga") {
   }
 }
 
+// ?mode=stems (&runs=off to force per-cell): D.3's measurement surface — a
+// row of single-stem glyphs for verify.py to derive inter-stem spacing
+// statistics from (per-cell rounded x vs run-shaped font advances).
+if (MODE === "stems") {
+  const ds = [];
+  for (let i = 0; i < ROWS; i++) ds.push([[pad("")]]);
+  ds[2] = [[pad("l".repeat(50))]];
+  apply({ d: ds, w: COLS, h: ROWS });
+  benchFlush();
+  benchStorm(true);
+  if (PARAMS.get("runs") === "off") benchRuns(false);
+}
+
 // ?mode=crt: canvas phosphor self-check — flipping the #crt toggle on must
 // add bloom ink to storm rows (blurred lighter self-composite), and off must
 // remove it. Same green/red screenshot convention as ?mode=links.
