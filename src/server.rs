@@ -47,7 +47,9 @@ pub fn app(state: AppState) -> Router {
 }
 
 async fn font(State(state): State<AppState>, Path(key): Path<String>) -> Response {
-    match key.parse::<usize>().ok().and_then(|i| state.fonts.get(i)) {
+    // Fonts are addressed by content hash (FontFile::key), same as the CSS
+    // references them; a handful of fonts makes the scan-with-rehash trivial.
+    match state.fonts.iter().find(|f| f.key() == key) {
         Some(f) => (
             [(CONTENT_TYPE, f.mime), (CACHE_CONTROL, CACHE_CONTROL_FONT)],
             f.bytes.clone(),

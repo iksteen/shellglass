@@ -469,7 +469,7 @@ checksum = "144e573728da132683b9488acd528274c790e07fc06ff81ee29f9d8f8b1041e0"
 dependencies = [
  "blowfish",
  "pbkdf2",
- "sha2",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -1135,7 +1135,7 @@ dependencies = [
  "ed25519",
  "rand_core 0.10.1",
  "serde",
- "sha2",
+ "sha2 0.11.0",
  "signature",
  "subtle",
  "zeroize",
@@ -2305,7 +2305,7 @@ dependencies = [
  "elliptic-curve",
  "primefield",
  "primeorder",
- "sha2",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -2319,7 +2319,7 @@ dependencies = [
  "fiat-crypto",
  "primefield",
  "primeorder",
- "sha2",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -2333,7 +2333,7 @@ dependencies = [
  "elliptic-curve",
  "primefield",
  "primeorder",
- "sha2",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -2349,7 +2349,7 @@ dependencies = [
  "futures",
  "log",
  "rand 0.10.2",
- "sha2",
+ "sha2 0.11.0",
  "thiserror 2.0.18",
  "tokio",
  "windows",
@@ -2514,7 +2514,7 @@ dependencies = [
  "pbkdf2",
  "rand_core 0.10.1",
  "scrypt",
- "sha2",
+ "sha2 0.11.0",
  "spki",
 ]
 
@@ -3047,7 +3047,7 @@ dependencies = [
  "pkcs1",
  "pkcs8",
  "rand_core 0.10.1",
- "sha2",
+ "sha2 0.11.0",
  "signature",
  "spki",
  "zeroize",
@@ -3111,7 +3111,7 @@ dependencies = [
  "scrypt",
  "sec1",
  "sha1 0.11.0",
- "sha2",
+ "sha2 0.11.0",
  "sha3",
  "signature",
  "spki",
@@ -3355,7 +3355,7 @@ dependencies = [
  "cfg-if",
  "pbkdf2",
  "salsa20",
- "sha2",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -3521,6 +3521,17 @@ dependencies = [
 
 [[package]]
 name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
+]
+
+[[package]]
+name = "sha2"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
@@ -3584,6 +3595,7 @@ dependencies = [
  "rustls-acme",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "signal-hook",
  "tokio",
  "tokio-stream",
@@ -3746,7 +3758,7 @@ dependencies = [
  "rsa",
  "sec1",
  "sha1 0.11.0",
- "sha2",
+ "sha2 0.11.0",
  "signature",
  "ssh-cipher",
  "ssh-encoding",

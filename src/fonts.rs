@@ -77,11 +77,9 @@ fn referenced_families(config: &Config) -> Vec<String> {
 }
 
 /// `Cache-Control` for served fonts. A font's bytes are stable for the life of a
-/// session, so cache them a day and skip refetching on every page load / reconnect.
-/// ponytail: plain max-age, not `immutable` — a client that re-registers a changed
-/// config can remap the same key to different bytes; content-hash keys if you ever
-/// want `immutable`.
-pub const CACHE_CONTROL_FONT: &str = "public, max-age=86400";
+/// Immutable: font URLs are content addresses (`fonts/<font_key>`), so the
+/// bytes behind a URL can never change — safe to cache forever.
+pub const CACHE_CONTROL_FONT: &str = "public, max-age=31536000, immutable";
 
 /// A font file located on this host, to be served to viewers so they render the
 /// glyphs without a local install. `family` is the CSS name it's referenced by.
@@ -94,6 +92,15 @@ pub struct FontFile {
     /// so bold cells render at real weight and monospace width. Without it the
     /// browser fakes bold, which is wider than the cell and gets clipped.
     pub bold: bool,
+}
+
+impl FontFile {
+    /// The font's content address ([`crate::proto::font_key`]): the key its
+    /// `@font-face` URL references and the hub stores/serves it under.
+    #[must_use]
+    pub fn key(&self) -> String {
+        crate::proto::font_key(self.mime, &self.bytes)
+    }
 }
 
 /// The process-wide system font database, built once (scanning font dirs is not
@@ -480,9 +487,7 @@ fn parse_range(spec: &str) -> Result<RangeInclusive<u32>> {
 pub fn font_assets(fonts: &[FontFile]) -> Vec<crate::proto::FontAsset> {
     fonts
         .iter()
-        .enumerate()
-        .map(|(i, f)| crate::proto::FontAsset {
-            key: i.to_string(),
+        .map(|f| crate::proto::FontAsset {
             mime: f.mime.to_string(),
             b64: B64.encode(&f.bytes),
         })

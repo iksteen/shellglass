@@ -248,11 +248,15 @@ system-wide.
 **Fonts are served, so viewers render them without a local install.** Every
 family referenced by `default_font`/`symbol_map` is located on the host — via
 [`fontdb`] (a pure-Rust system font database) or an explicit `[fonts."Name"].path`
-— read once at startup, and served: standalone at `/fonts/<i>`, the hub **per
-session** at `/s/<slug>/fonts/<i>` (so two clients' fonts can't clash). Responses
-are compressed and cached for a day. A single face is extracted from a `.ttc`
-collection; a font that can't be located is a soft failure (warn + skip, the
-browser falls back). In a `[fonts."Name"]` entry, `path` serves a specific file
+— read once at startup, and served **by content hash**: `fonts/<sha256>`,
+relative to the page. The hub stores each distinct font once however many
+sessions push it (it derives the hash from the pushed bytes itself, so no
+client can overwrite another's fonts; a font is evicted when its last
+referencing session goes), and each session serves only its own fonts.
+Content-addressed URLs never change meaning, so responses are compressed and
+cached indefinitely. A single face is extracted from a `.ttc` collection; a
+font that can't be located is a soft failure (warn + skip, the browser falls
+back). In a `[fonts."Name"]` entry, `path` serves a specific file
 (`.ttf`/`.otf`/`.ttc`/`.woff`/`.woff2`) and `system = "Other Name"` maps to a
 differently-named installed family.
 

@@ -53,9 +53,12 @@ struct Session {
     render_cfg: String,
     /// Live publisher: decoded pushed frames in, per-viewer cell deltas out.
     live: Arc<diff::Live>,
-    /// Fonts the client uploaded, keyed as the CSS references them (`key` → (mime,
-    /// bytes)). Scoped to this session so different clients' fonts never clash.
-    fonts: HashMap<String, (String, Vec<u8>)>,
+    /// Content addresses ([`proto::font_key`]) of the fonts this session's
+    /// pushed CSS references. The bytes live in the hub-wide [`FontCache`];
+    /// this set is both the refcount stake AND the serving authorization —
+    /// `/s/<slug>/fonts/<key>` only serves keys in the session's own set, so
+    /// sessions stay isolated even though storage is shared.
+    fonts: std::collections::HashSet<String>,
     /// Per-session kick: the management API's DELETE fires this so the live
     /// `/push` WebSocket Closes immediately (the pusher's next reconnect then
     /// 403s — its id is gone from the registry).
@@ -65,6 +68,56 @@ struct Session {
     /// (default template + default CSS, no fonts, operator-offline) instead
     /// of pushed content; the first register flips it.
     registered: bool,
+}
+
+/// Hub-wide content-addressed font store: one copy per distinct font, however
+/// many sessions push it. The key is [`proto::font_key`], computed by the HUB
+/// from the pushed bytes — there is no client-claimed key anywhere, so a
+/// malicious client cannot overwrite or poison an entry other sessions share
+/// (lying about the mime doesn't help either: it's part of the hash). `refs`
+/// counts referencing sessions; an entry is evicted the moment it hits zero.
+type FontCache = HashMap<String, FontEntry>;
+
+struct FontEntry {
+    mime: String,
+    /// Cheaply cloneable for serving (one allocation, shared).
+    bytes: bytes::Bytes,
+    /// Number of sessions whose `fonts` set contains this key.
+    refs: usize,
+}
+
+/// Apply a session's font-set change to the cache: `new` gains stakes (using
+/// `incoming` bytes for first insertion), `old` releases them, zero-ref
+/// entries evicted. Call with BOTH the sessions lock and the cache lock held
+/// (sessions → cache order), so set membership and refcounts can't skew.
+fn retarget_fonts(
+    cache: &mut FontCache,
+    old: &std::collections::HashSet<String>,
+    new: &std::collections::HashSet<String>,
+    mut incoming: HashMap<String, (String, bytes::Bytes)>,
+) {
+    for key in new.difference(old) {
+        if let Some(e) = cache.get_mut(key) {
+            e.refs += 1;
+        } else if let Some((mime, bytes)) = incoming.remove(key) {
+            cache.insert(
+                key.clone(),
+                FontEntry {
+                    mime,
+                    bytes,
+                    refs: 1,
+                },
+            );
+        }
+    }
+    for key in old.difference(new) {
+        if let Some(e) = cache.get_mut(key) {
+            e.refs -= 1;
+            if e.refs == 0 {
+                cache.remove(key);
+            }
+        }
+    }
 }
 
 /// Cap on concurrent `session_id` (argon2id) hashes. The hash is memory-hard
@@ -225,6 +278,9 @@ fn validate_slug(slug: &str) -> Result<()> {
 #[derive(Clone)]
 pub struct HubState {
     sessions: Arc<Mutex<HashMap<String, Session>>>,
+    /// Shared content-addressed font store (see [`FontCache`]). Lock order:
+    /// `sessions` before `fonts` wherever both are held.
+    fonts: Arc<Mutex<FontCache>>,
     /// The session registry: which ids (`session_id(secret)`) may push and the
     /// public view slug each maps to. Seeded from `--allow`, mutable at runtime
     /// through the management API — every lookup takes a short read lock; the
@@ -258,6 +314,7 @@ impl HubState {
         let (shutdown, _) = broadcast::channel(1);
         let st = Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            fonts: Arc::new(Mutex::new(FontCache::new())),
             registry: Arc::new(std::sync::RwLock::new(allow)),
             api_allowed: Arc::new(std::collections::HashSet::new()),
             persist_path: None,
@@ -297,7 +354,7 @@ impl HubState {
                 template: String::new(),
                 render_cfg: String::new(),
                 live,
-                fonts: HashMap::new(),
+                fonts: std::collections::HashSet::new(),
                 kick,
                 registered: false,
             },
@@ -456,10 +513,20 @@ impl HubState {
 
     /// Drop a removed session's stored state (CSS/fonts/render-config/matrix)
     /// and kick its live pusher, if any. Viewer SSE streams end when the
-    /// `Live` drops with them.
+    /// `Live` drops with them; the session's font stakes are released (a font
+    /// no other session references is evicted from the shared cache).
     fn drop_session_state(&self, id: &str) {
-        let session = self.sessions.lock().unwrap().remove(id);
-        if let Some(s) = session {
+        let mut map = self.sessions.lock().unwrap();
+        if let Some(s) = map.remove(id) {
+            let mut cache = self.fonts.lock().unwrap();
+            retarget_fonts(
+                &mut cache,
+                &s.fonts,
+                &std::collections::HashSet::new(),
+                HashMap::new(),
+            );
+            drop(cache);
+            drop(map);
             let _ = s.kick.send(());
         }
     }
@@ -995,17 +1062,25 @@ fn register_session(
     base: &str,
     reg: proto::RegisterBody,
 ) -> Option<(Arc<diff::Live>, broadcast::Receiver<()>)> {
-    // Decode uploaded fonts; silently drop any with bad base64 (the family just
-    // falls back in the browser rather than failing the whole registration).
-    let fonts: HashMap<String, (String, Vec<u8>)> = reg
+    // Decode uploaded fonts and derive OUR OWN content address for each;
+    // silently drop any with bad base64 (the family just falls back in the
+    // browser rather than failing the whole registration). The wire carries
+    // no client-chosen key — the hash the hub computes here is the only name
+    // a font ever has, so a client can only ever affect entries its own CSS
+    // references; the shared cache cannot be overwritten or poisoned.
+    let incoming: HashMap<String, (String, bytes::Bytes)> = reg
         .fonts
         .into_iter()
-        .filter_map(|f| Some((f.key, (f.mime, B64.decode(f.b64).ok()?))))
+        .filter_map(|f| {
+            let bytes = bytes::Bytes::from(B64.decode(f.b64).ok()?);
+            Some((proto::font_key(&f.mime, &bytes), (f.mime, bytes)))
+        })
         .collect();
+    let keys: std::collections::HashSet<String> = incoming.keys().cloned().collect();
     // The id's public slug (for the announce log below). The pushed CSS is
-    // stored VERBATIM: its font URLs are page-relative (`fonts/<i>`, the SALT
-    // v5 register contract), which the canonical `/s/<slug>/` page resolves
-    // for any slug and behind any subpath mount — nothing to rewrite.
+    // stored VERBATIM: its font URLs are page-relative (`fonts/<font_key>`,
+    // the SALT v5 register contract), which the canonical `/s/<slug>/` page
+    // resolves for any slug and behind any subpath mount — nothing to rewrite.
     let slug = st.slug_of(id)?;
     let css = reg.css;
     let mut map = st.sessions.lock().unwrap();
@@ -1018,7 +1093,12 @@ fn register_session(
         s.css = css;
         s.template = reg.template;
         s.render_cfg = reg.render_cfg;
-        s.fonts = fonts;
+        // Swap the session's font stakes: new fonts enter the shared cache,
+        // ones only this session referenced are evicted.
+        let mut cache = st.fonts.lock().unwrap();
+        retarget_fonts(&mut cache, &s.fonts, &keys, incoming);
+        drop(cache);
+        s.fonts = keys;
         if !s.registered {
             s.registered = true;
             println!("shellglass: session connected — view at {base}/s/{slug}/");
@@ -1034,6 +1114,14 @@ fn register_session(
             "waiting for client…",
         ))));
         let (kick, kick_rx) = broadcast::channel(1);
+        let mut cache = st.fonts.lock().unwrap();
+        retarget_fonts(
+            &mut cache,
+            &std::collections::HashSet::new(),
+            &keys,
+            incoming,
+        );
+        drop(cache);
         map.insert(
             id.to_string(),
             Session {
@@ -1041,7 +1129,7 @@ fn register_session(
                 template: reg.template,
                 render_cfg: reg.render_cfg,
                 live: Arc::clone(&live),
-                fonts,
+                fonts: keys,
                 kick,
                 registered: true,
             },
@@ -1051,24 +1139,35 @@ fn register_session(
     }
 }
 
-/// Serve a session's uploaded font bytes (the page's `@font-face` points here).
-/// Public like `view`/`events` — the slug in the path is the read capability.
+/// Serve a font from the shared cache (the page's `@font-face` points here).
+/// Public like `view`/`events` — the slug in the path is the read capability —
+/// but only keys in the SESSION'S OWN reference set are served: storage is
+/// hub-wide, the namespace stays per-session, so one session can't enumerate
+/// or serve another's fonts through its slug.
 async fn font(State(st): State<HubState>, Path((slug, key)): Path<(String, String)>) -> Response {
     let id = st.id_of_view(&slug);
-    let map = st.sessions.lock().unwrap();
-    let Some(s) = id.and_then(|id| map.get(&id)) else {
-        return (StatusCode::NOT_FOUND, "unknown session").into_response();
+    let referenced = {
+        let map = st.sessions.lock().unwrap();
+        match id.and_then(|id| map.get(&id)) {
+            Some(s) => s.fonts.contains(&key),
+            None => return (StatusCode::NOT_FOUND, "unknown session").into_response(),
+        }
     };
-    match s.fonts.get(&key) {
-        // ponytail: clone the bytes per request; browsers cache fonts (see the
-        // Cache-Control), so this is a cache-miss cost only. Wrap in Arc<[u8]> if it
-        // ever shows up in a profile.
+    if !referenced {
+        return (StatusCode::NOT_FOUND, "unknown font").into_response();
+    }
+    let entry = {
+        let cache = st.fonts.lock().unwrap();
+        cache.get(&key).map(|e| (e.mime.clone(), e.bytes.clone()))
+    };
+    match entry {
+        // Bytes is refcounted — the clone is one Arc bump, not a copy.
         Some((mime, bytes)) => (
             [
-                (CONTENT_TYPE, mime.clone()),
+                (CONTENT_TYPE, mime),
                 (CACHE_CONTROL, CACHE_CONTROL_FONT.to_string()),
             ],
-            bytes.clone(),
+            bytes,
         )
             .into_response(),
         None => (StatusCode::NOT_FOUND, "unknown font").into_response(),
@@ -1434,6 +1533,114 @@ mod tests {
             render_cfg: String::new(),
             fonts: vec![],
         }
+    }
+
+    fn reg_with_fonts(css: &str, fonts: &[(&str, &[u8])]) -> proto::RegisterBody {
+        use base64::Engine as _;
+        proto::RegisterBody {
+            css: css.into(),
+            template: String::new(),
+            render_cfg: String::new(),
+            fonts: fonts
+                .iter()
+                .map(|(mime, bytes)| proto::FontAsset {
+                    mime: (*mime).to_string(),
+                    b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                })
+                .collect(),
+        }
+    }
+
+    // The shared font cache: content-addressed (hub-computed keys), one copy
+    // per distinct font however many sessions push it, refcounted, evicted at
+    // zero references, and served only through a session that references it.
+    #[test]
+    fn font_cache_dedups_refcounts_and_evicts() {
+        let a = session_id("a");
+        let b = session_id("b");
+        let st = HubState::new(
+            parse_allow(&[format!("{a}:one"), format!("{b}:two")]).unwrap(),
+            "http://h".into(),
+        );
+        let shared: (&str, &[u8]) = ("font/ttf", b"SHARED-FONT-BYTES");
+        let only_b: (&str, &[u8]) = ("font/ttf", b"B-ONLY-FONT");
+        let shared_key = proto::font_key(shared.0, shared.1);
+
+        register_session(&st, &a, "http://h", reg_with_fonts("x", &[shared])).unwrap();
+        register_session(&st, &b, "http://h", reg_with_fonts("x", &[shared, only_b])).unwrap();
+        {
+            let cache = st.fonts.lock().unwrap();
+            assert_eq!(cache.len(), 2, "same bytes stored once across sessions");
+            assert_eq!(cache.get(&shared_key).unwrap().refs, 2);
+        }
+
+        // A re-register that drops the shared font releases ONE stake only.
+        register_session(&st, &b, "http://h", reg_with_fonts("x", &[only_b])).unwrap();
+        assert_eq!(
+            st.fonts.lock().unwrap().get(&shared_key).unwrap().refs,
+            1,
+            "session A still holds its stake"
+        );
+
+        // Deleting the last referencing session evicts.
+        st.remove_by_id(&a);
+        st.drop_session_state(&a);
+        assert!(
+            !st.fonts.lock().unwrap().contains_key(&shared_key),
+            "zero-ref font evicted"
+        );
+        st.remove_by_id(&b);
+        st.drop_session_state(&b);
+        assert!(st.fonts.lock().unwrap().is_empty(), "cache fully drained");
+    }
+
+    // Storage is shared; the serving NAMESPACE is not: a session's slug only
+    // serves keys in that session's own reference set.
+    #[tokio::test]
+    async fn font_serving_is_isolated_per_session() {
+        let a = session_id("a");
+        let b = session_id("b");
+        let st = HubState::new(
+            parse_allow(&[format!("{a}:one"), format!("{b}:two")]).unwrap(),
+            "http://h".into(),
+        );
+        let fa: (&str, &[u8]) = ("font/ttf", b"A-FONT");
+        let key_a = proto::font_key(fa.0, fa.1);
+        register_session(&st, &a, "http://h", reg_with_fonts("x", &[fa])).unwrap();
+        register_session(&st, &b, "http://h", reg("x")).unwrap();
+        let router = app(st);
+
+        let res = router
+            .clone()
+            .oneshot(
+                Request::get(format!("/s/one/fonts/{key_a}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "own font serves");
+        let body = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"A-FONT");
+
+        // Session B's slug must NOT serve A's font, even though the bytes sit
+        // in the shared cache.
+        let res = router
+            .clone()
+            .oneshot(
+                Request::get(format!("/s/two/fonts/{key_a}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::NOT_FOUND,
+            "cross-session font access denied"
+        );
     }
 
     #[test]

@@ -10,17 +10,38 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 
 /// One font the client serves to viewers, uploaded in the register message (the
-/// `/push` WebSocket's first message). The hub stores it per session and serves the
-/// bytes at `/s/<id>/fonts/<key>`, which the page's `@font-face` references — so a
-/// viewer renders the glyphs even without the font installed. Per-session storage
-/// means two clients' fonts never clash.
+/// `/push` WebSocket's first message). The hub stores fonts in a hub-wide
+/// content-addressed cache and serves them at `/s/<slug>/fonts/<key>`, where
+/// the key is [`font_key`] — a hash the HUB computes from the pushed bytes.
+/// There is deliberately NO client-chosen key on the wire: the client bakes
+/// its own [`font_key`] into its CSS, and an honest client's URLs match the
+/// hub's derivation; a lying client can only break its own font references,
+/// never overwrite or poison a cache entry another session shares.
 #[derive(Serialize, Deserialize)]
 pub struct FontAsset {
-    /// URL-safe id, unique within the session (the font's index).
-    pub key: String,
     pub mime: String,
     /// base64 of the font file bytes.
     pub b64: String,
+}
+
+/// Content address of a served font: `hex(sha256(mime · 0x00 · bytes))`. Both
+/// sides compute it independently — the client to reference the font in its
+/// `@font-face` CSS (`fonts/<key>`), the hub to store/serve the pushed bytes.
+/// The mime is part of the hash so an attacker can't pre-seed the shared
+/// cache with the right bytes under a wrong content type. Content-addressed
+/// URLs are immutable, so font responses cache forever.
+pub fn font_key(mime: &str, bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    h.update(mime.as_bytes());
+    h.update([0u8]);
+    h.update(bytes);
+    h.finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// Register message: the first message on the `/push` WebSocket — the page CSS, the

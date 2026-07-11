@@ -37,22 +37,24 @@ pub fn viewer_tag() -> &'static str {
     })
 }
 
-/// `@font-face` blocks for served fonts. Each references `{url_prefix}{index}`,
-/// where the index is the font's position (matching [`crate::fonts::font_assets`]).
-/// The prefix is the page-RELATIVE `fonts/` everywhere: it resolves against
-/// the directory-shaped page URL (`/` standalone, `/s/<slug>/` hub), for any
-/// slug and behind any subpath mount. Serving (not inlining) keeps the page
-/// small and lets the browser cache the font.
+/// `@font-face` blocks for served fonts. Each references `{url_prefix}{key}`,
+/// where the key is the font's content address ([`crate::proto::font_key`]) —
+/// the same hash the hub derives from the pushed bytes, so an honest client's
+/// URLs land on its own fonts by construction. The prefix is the
+/// page-RELATIVE `fonts/` everywhere: it resolves against the
+/// directory-shaped page URL (`/` standalone, `/s/<slug>/` hub), for any slug
+/// and behind any subpath mount. Serving (not inlining) keeps the page small
+/// and lets the browser cache the font (forever — the URL is immutable).
 pub fn font_face_css(fonts: &[FontFile], url_prefix: &str) -> String {
     let mut css = String::new();
-    for (i, f) in fonts.iter().enumerate() {
+    for f in fonts {
         let _ = writeln!(
             css,
             "@font-face {{ font-family:'{}'; font-weight:{}; src:url(\"{}{}\") format('{}'); }}",
             crate::fonts::css_escape_family(&f.family),
             if f.bold { "bold" } else { "normal" },
             url_prefix,
-            i,
+            f.key(),
             f.format,
         );
     }
@@ -339,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn font_face_css_references_served_urls() {
+    fn font_face_css_references_content_addresses() {
         let fonts = vec![FontFile {
             family: "NF".into(),
             mime: "font/ttf",
@@ -347,10 +349,13 @@ mod tests {
             bytes: vec![1, 2],
             bold: false,
         }];
-        let css = font_face_css(&fonts, "/s/abc/fonts/");
+        let key = fonts[0].key();
+        assert_eq!(key, crate::proto::font_key("font/ttf", &[1, 2]));
+        assert_eq!(key.len(), 64, "content address is sha256 hex");
+        let css = font_face_css(&fonts, "fonts/");
         assert!(css.contains("font-family:'NF'"), "{css}");
         assert!(
-            css.contains("src:url(\"/s/abc/fonts/0\") format('truetype')"),
+            css.contains(&format!("src:url(\"fonts/{key}\") format('truetype')")),
             "{css}"
         );
     }
