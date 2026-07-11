@@ -300,6 +300,9 @@ mod tests {
         // self-insertion (modules would break it AND need CORS).
         assert!(EMBED_JS.contains("document.currentScript"));
         assert!(EMBED_JS.contains("dataset.src"));
+        // Size defaults must stay zero-specificity (:where), so host
+        // stylesheets override them without !important.
+        assert!(EMBED_JS.contains(":where(iframe.shellglass-view)"));
         assert!(EMBED_JS.contains("customElements.define(\"shellglass-view\""));
         assert!(EMBED_JS.contains("getAttribute(\"src\")"));
         assert!(EMBED_JS.contains("searchParams.set(\"embed\""));

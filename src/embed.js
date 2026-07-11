@@ -30,15 +30,25 @@
     }
   };
 
-  // One-liner form: replace the script tag itself with the iframe.
+  // One-liner form: replace the script tag itself with the iframe. The size
+  // defaults live in a zero-specificity :where() rule, so ANY host stylesheet
+  // rule on .shellglass-view overrides them — no !important needed; a style
+  // attribute on the script tag (carried onto the iframe) beats both, as
+  // inline style does.
   const me = document.currentScript;
   if (me && me.dataset.src) {
+    if (!document.getElementById("shellglass-embed-css")) {
+      const st = document.createElement("style");
+      st.id = "shellglass-embed-css";
+      st.textContent =
+        ":where(iframe.shellglass-view){display:block;border:0;width:100%;height:24em}";
+      document.head.append(st);
+    }
     const f = document.createElement("iframe");
     f.className = "shellglass-view";
     f.title = "shellglass terminal";
-    f.style.cssText = "display:block;border:0;width:100%;height:24em";
     const style = me.getAttribute("style");
-    if (style) f.style.cssText += ";" + style;
+    if (style) f.style.cssText = style;
     const href = embedUrl(me.dataset.src);
     if (href) f.src = href;
     me.replaceWith(f);
