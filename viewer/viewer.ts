@@ -975,8 +975,8 @@ function startCurAnim(from: [number, number], to: [number, number]): void {
 }
 function stepCurAnim(): void {
   if (!curAnim) return;
-  if (!ctx || !storm) {
-    curAnim = null;
+  if (!ctx || !storm || pictureHeld()) {
+    curAnim = null; // a hold landing mid-travel abandons the glide
     return;
   }
   const wipe = curAnim.rows;
@@ -1082,6 +1082,7 @@ function ensureBlinkTimer(): void {
   if (blinkTimer !== null) return;
   blinkTimer = setInterval(() => {
     if (!blinkRows.size) return; // idle: keep the (cheap) timer, skip work
+    if (pictureHeld()) return; // a held picture doesn't blink
     blinkPhase = !blinkPhase;
     for (const r of [...blinkRows]) redrawCanvasRow(r);
   }, 500);
@@ -1104,7 +1105,9 @@ function crtOn(): boolean {
   if (crtBox === undefined) {
     crtBox = document.getElementById("crt") as HTMLInputElement | null;
     // repaint canvas rows when the toggle flips (CSS handles the DOM side)
-    crtBox?.addEventListener("change", () => redrawCanvasAll());
+    crtBox?.addEventListener("change", () => {
+      if (!pictureHeld()) redrawCanvasAll();
+    });
   }
   return crtBox !== null && crtBox.checked;
 }
@@ -1353,6 +1356,7 @@ function setHover(a: number | undefined, r: number): void {
   if (r >= 0 && r !== old) redrawCanvasRow(r);
 }
 function onScreenMove(ev: MouseEvent): void {
+  if (pictureHeld()) return; // no hover repaints on a held picture
   if (!storm) return setHover(undefined, -1);
   const hit = cellAt(ev);
   const linked = hit !== null && linkHref(screen.links, hit.cell.a) !== null;
@@ -1382,8 +1386,14 @@ function attachLinkHandlers(): void {
   for (const ev of ["pointerup", "pointercancel", "blur"]) {
     window.addEventListener(ev, () => {
       pointerHeld = false;
+      // the screen may have gone calm while held — nothing else would flush
+      if (frozenStale) schedulePaint();
     });
   }
+  document.addEventListener("selectionchange", () => {
+    // covers keyboard/programmatic deselection, where no pointer event fires
+    if (frozenStale && !pictureHeld()) schedulePaint();
+  });
 }
 
 export function ghostText(row: Cell[]): string {
@@ -1417,72 +1427,40 @@ export function ghostSpan(
   return [a, bOld - a, next.slice(a, bNew)];
 }
 
-// The live selection in ghost-row coordinates: null = none (or not anchored
-// in ghost rows — then updates can't hurt it); "all" = anchored here but not
-// resolvable to rows (be conservative); else the document-order span.
-type GhostSel = { r0: number; o0: number; r1: number; o1: number } | "all" | null;
-function ghostSelection(): GhostSel {
-  if (typeof getSelection === "undefined") return null;
-  const s = getSelection();
-  if (s === null || s.isCollapsed || s.rangeCount === 0) return null;
-  const range = s.getRangeAt(0);
-  const rowOf = (node: Node): number => {
-    const el = node instanceof Text ? node.parentElement : (node as Element);
-    return el === null ? -1 : screen.rowEls.indexOf(el as HTMLElement);
-  };
-  const r0 = rowOf(range.startContainer);
-  const r1 = rowOf(range.endContainer);
-  if (r0 < 0 && r1 < 0) return null; // lives outside the ghost layer
-  if (r0 < 0 || r1 < 0) return "all"; // straddles the boundary — freeze wide
-  // element-container offsets are child indices, not chars — cover the row
-  const o0 = range.startContainer instanceof Text ? range.startOffset : 0;
-  const o1 = range.endContainer instanceof Text ? range.endOffset : Number.MAX_SAFE_INTEGER;
-  return { r0, o0, r1, o1 };
-}
-
-// Sync one ghost row. Returns false when the update would rewrite characters
-// inside the live selection (content the user is holding) — the caller keeps
-// it stale instead. Everything else patches IN PLACE via replaceData, so
-// Ranges anchored elsewhere in the row survive with adjusted offsets.
-function ghostRow(r: number, sel: GhostSel = null): boolean {
+// Sync one ghost row, patching the text node IN PLACE via replaceData —
+// the node identity survives, and any Range boundary points adjust across
+// the splice instead of orphaning (belt-and-suspenders under the freeze).
+function ghostRow(r: number): void {
   const el = screen.rowEls[r];
-  if (!el) return true;
+  if (!el) return;
   const text = ghostText(screen.cells[r] ?? []);
   const node = el.firstChild;
   if (!(node instanceof Text)) {
-    if (sel === "all") return false;
     el.textContent = text;
-    return true;
+    return;
   }
   const span = ghostSpan(node.data, text);
-  if (span === null) return true;
-  if (sel === "all") return false;
-  if (sel !== null && r >= sel.r0 && r <= sel.r1) {
-    // the selected char range within THIS row (document order)
-    const selStart = r === sel.r0 ? sel.o0 : 0;
-    const selEnd = r === sel.r1 ? sel.o1 : Number.MAX_SAFE_INTEGER;
-    const [a, del] = span;
-    // half-open overlap; a pure insertion is zero-width at `a` (clamped to
-    // width 1 so an insert exactly at the selection start still counts —
-    // the inserted text would land inside the selection)
-    if (a < selEnd && a + Math.max(del, 1) > selStart) return false;
-  }
-  node.replaceData(span[0], span[1], span[2]);
-  return true;
+  if (span !== null) node.replaceData(span[0], span[1], span[2]);
 }
 
-// Rewriting characters INSIDE a live selection changes what the user is
-// holding mid-copy, so those rows stay frozen (the canvas on top keeps
-// painting the true screen): the user copies what was on screen when they
-// selected — the only coherent semantics for copying out of a running
-// animation. Rows the selection doesn't touch — and non-overlapping spans in
-// rows it does — keep updating live via the replaceData patching above. When
-// the selection clears, the next flush resyncs whatever went stale.
-let ghostStale = false;
+// THE WHOLE PICTURE freezes while the user holds it: from pointerdown (the
+// browser anchors a collapsed caret there, before any selection exists) and
+// for as long as a selection is live, neither the ghost text NOR the canvas
+// repaints — what you see, what you highlighted, and what Ctrl-C copies are
+// the same thing, screen-wide. A half-frozen picture (live canvas over a
+// frozen ghost, or per-row freezing) puts the copied text out of sync with
+// the visible pixels. The grid keeps applying deltas underneath; release
+// repaints everything in one step.
+let frozenStale = false;
 function selectionActive(): boolean {
   if (typeof getSelection === "undefined") return false;
   const s = getSelection();
   return s !== null && !s.isCollapsed;
+}
+// One predicate for every repaint path (flush, blink timer, hover, cursor
+// travel) — anything that would put fresh pixels on a held picture.
+function pictureHeld(): boolean {
+  return storm && (selectionActive() || pointerHeld);
 }
 
 // Ghost styling lives in a viewer-injected rule (not the served CSS) so it can never
@@ -1967,31 +1945,32 @@ function flushPaint(): void {
     } else if (!storm) {
       stormHot = 0;
     }
+    const held = pictureHeld();
     // Smooth cursor: catch the move BEFORE painting rows, so this flush's row
     // repaints already suppress the static cursor at the target (no double
-    // cursor while the rect travels). Full rebuilds teleport (layout change).
+    // cursor while the rect travels). Full rebuilds teleport (layout change) —
+    // and so does releasing a hold (the cursor may be rows away by then).
     const cur = screen.cur;
-    if (storm && smoothCursorOn() && cur && lastCurPos &&
+    if (storm && !held && smoothCursorOn() && cur && lastCurPos &&
         (cur[0] !== lastCurPos[0] || cur[1] !== lastCurPos[1])) {
       startCurAnim(lastCurPos, cur);
     }
-    lastCurPos = cur ? [cur[0], cur[1]] : null;
-    // Ghost policy for this flush: with a live selection, only rows/spans that
-    // would rewrite the SELECTED characters freeze (ghostRow decides per row);
-    // a pointer held before any selection exists freezes everything — that's
-    // the anchor window where a collapsed caret can't be located yet.
-    const sel = storm ? ghostSelection() : null;
-    const holdAll = storm && pointerHeld && sel === null;
-    if (storm && sel === null && !pointerHeld && ghostStale) {
-      // Selection cleared/released — resync whatever froze while it was live.
+    if (!held) lastCurPos = cur ? [cur[0], cur[1]] : null;
+    if (storm && !held && frozenStale) {
+      // Hold released — the grid moved on while the picture stood still;
+      // catch both layers up in one step.
+      redrawCanvasAll();
       for (let r = 0; r < screen.cells.length; r++) ghostRow(r);
-      ghostStale = false;
+      frozenStale = false;
     }
     for (const r of dirtyRows) {
       if (storm) {
+        if (held) {
+          frozenStale = true; // neither canvas nor ghost moves under a hold
+          continue;
+        }
         drawRowStorm(r);
-        // keep the selectable backing text in sync with the picture
-        if (holdAll || !ghostRow(r, sel)) ghostStale = true;
+        ghostRow(r); // keep the selectable backing text in sync with the picture
       } else {
         const el = screen.rowEls[r];
         if (!el) continue;

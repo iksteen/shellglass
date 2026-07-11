@@ -669,7 +669,7 @@ function startCurAnim(from, to) {
 function stepCurAnim() {
     if (!curAnim)
         return;
-    if (!ctx || !storm) {
+    if (!ctx || !storm || pictureHeld()) {
         curAnim = null;
         return;
     }
@@ -764,6 +764,8 @@ function ensureBlinkTimer() {
     blinkTimer = setInterval(() => {
         if (!blinkRows.size)
             return;
+        if (pictureHeld())
+            return;
         blinkPhase = !blinkPhase;
         for (const r of [...blinkRows])
             redrawCanvasRow(r);
@@ -782,7 +784,10 @@ let crtBox;
 function crtOn() {
     if (crtBox === undefined) {
         crtBox = document.getElementById("crt");
-        crtBox?.addEventListener("change", () => redrawCanvasAll());
+        crtBox?.addEventListener("change", () => {
+            if (!pictureHeld())
+                redrawCanvasAll();
+        });
     }
     return crtBox !== null && crtBox.checked;
 }
@@ -995,6 +1000,8 @@ function setHover(a, r) {
         redrawCanvasRow(r);
 }
 function onScreenMove(ev) {
+    if (pictureHeld())
+        return;
     if (!storm)
         return setHover(undefined, -1);
     const hit = cellAt(ev);
@@ -1020,8 +1027,14 @@ function attachLinkHandlers() {
     for (const ev of ["pointerup", "pointercancel", "blur"]) {
         window.addEventListener(ev, () => {
             pointerHeld = false;
+            if (frozenStale)
+                schedulePaint();
         });
     }
+    document.addEventListener("selectionchange", () => {
+        if (frozenStale && !pictureHeld())
+            schedulePaint();
+    });
 }
 export function ghostText(row) {
     let text = "";
@@ -1044,60 +1057,29 @@ export function ghostSpan(old, next) {
     }
     return [a, bOld - a, next.slice(a, bNew)];
 }
-function ghostSelection() {
-    if (typeof getSelection === "undefined")
-        return null;
-    const s = getSelection();
-    if (s === null || s.isCollapsed || s.rangeCount === 0)
-        return null;
-    const range = s.getRangeAt(0);
-    const rowOf = (node) => {
-        const el = node instanceof Text ? node.parentElement : node;
-        return el === null ? -1 : screen.rowEls.indexOf(el);
-    };
-    const r0 = rowOf(range.startContainer);
-    const r1 = rowOf(range.endContainer);
-    if (r0 < 0 && r1 < 0)
-        return null;
-    if (r0 < 0 || r1 < 0)
-        return "all";
-    const o0 = range.startContainer instanceof Text ? range.startOffset : 0;
-    const o1 = range.endContainer instanceof Text ? range.endOffset : Number.MAX_SAFE_INTEGER;
-    return { r0, o0, r1, o1 };
-}
-function ghostRow(r, sel = null) {
+function ghostRow(r) {
     const el = screen.rowEls[r];
     if (!el)
-        return true;
+        return;
     const text = ghostText(screen.cells[r] ?? []);
     const node = el.firstChild;
     if (!(node instanceof Text)) {
-        if (sel === "all")
-            return false;
         el.textContent = text;
-        return true;
+        return;
     }
     const span = ghostSpan(node.data, text);
-    if (span === null)
-        return true;
-    if (sel === "all")
-        return false;
-    if (sel !== null && r >= sel.r0 && r <= sel.r1) {
-        const selStart = r === sel.r0 ? sel.o0 : 0;
-        const selEnd = r === sel.r1 ? sel.o1 : Number.MAX_SAFE_INTEGER;
-        const [a, del] = span;
-        if (a < selEnd && a + Math.max(del, 1) > selStart)
-            return false;
-    }
-    node.replaceData(span[0], span[1], span[2]);
-    return true;
+    if (span !== null)
+        node.replaceData(span[0], span[1], span[2]);
 }
-let ghostStale = false;
+let frozenStale = false;
 function selectionActive() {
     if (typeof getSelection === "undefined")
         return false;
     const s = getSelection();
     return s !== null && !s.isCollapsed;
+}
+function pictureHeld() {
+    return storm && (selectionActive() || pointerHeld);
 }
 let ghostCss = false;
 function ensureGhostCss() {
@@ -1411,24 +1393,28 @@ function flushPaint() {
         else if (!storm) {
             stormHot = 0;
         }
+        const held = pictureHeld();
         const cur = screen.cur;
-        if (storm && smoothCursorOn() && cur && lastCurPos &&
+        if (storm && !held && smoothCursorOn() && cur && lastCurPos &&
             (cur[0] !== lastCurPos[0] || cur[1] !== lastCurPos[1])) {
             startCurAnim(lastCurPos, cur);
         }
-        lastCurPos = cur ? [cur[0], cur[1]] : null;
-        const sel = storm ? ghostSelection() : null;
-        const holdAll = storm && pointerHeld && sel === null;
-        if (storm && sel === null && !pointerHeld && ghostStale) {
+        if (!held)
+            lastCurPos = cur ? [cur[0], cur[1]] : null;
+        if (storm && !held && frozenStale) {
+            redrawCanvasAll();
             for (let r = 0; r < screen.cells.length; r++)
                 ghostRow(r);
-            ghostStale = false;
+            frozenStale = false;
         }
         for (const r of dirtyRows) {
             if (storm) {
+                if (held) {
+                    frozenStale = true;
+                    continue;
+                }
                 drawRowStorm(r);
-                if (holdAll || !ghostRow(r, sel))
-                    ghostStale = true;
+                ghostRow(r);
             }
             else {
                 const el = screen.rowEls[r];

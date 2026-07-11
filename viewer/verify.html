@@ -263,38 +263,44 @@ if (MODE === "freeze") {
   document.body.style.background = pass ? "#00ff00" : "#ff0000";
 }
 
-// ?mode=ghostpatch: selection-aware in-place ghost patching — with a live
-// selection over the LEFT of a row, a change to the RIGHT of the same row
-// must land in the ghost (replaceData keeps the Range intact), a change
-// INSIDE the selected span must be held back, and clearing the selection
-// must resync it. The tmux-split-with-cmatrix case. Green/red convention.
-if (MODE === "ghostpatch") {
+// ?mode=hold: the whole picture freezes while a selection is live — neither
+// the canvas pixels nor the ghost text of ANY row may change (what you see,
+// what you highlighted, and what Ctrl-C copies are the same thing); clearing
+// the selection resyncs both layers in one step. Green/red convention.
+if (MODE === "hold") {
   const d8 = [];
-  for (let i = 0; i < ROWS; i++) d8.push([[pad("")]]);
-  d8[3] = [[pad("stable left prompt      churning right pane")]];
+  for (let i = 0; i < ROWS; i++) d8.push([[pad(`row ${i} calm text`)]]);
   apply({ d: d8, w: COLS, h: ROWS });
   benchFlush();
   benchStorm(true);
   const spin = (ms) => { const t = performance.now(); while (performance.now() - t < ms); };
-  const node = document.querySelectorAll("#screen .row")[3].firstChild;
+  const rows = document.querySelectorAll("#screen .row");
+  const selNode = rows[3].firstChild;
+  const otherNode = rows[5].firstChild; // a row the selection does NOT touch
   const range = document.createRange();
-  range.setStart(node, 0);
-  range.setEnd(node, 18); // "stable left prompt"
+  range.setStart(selNode, 0);
+  range.setEnd(selNode, 10); // "row 3 calm"
   const sel = getSelection();
   sel.removeAllRanges();
   sel.addRange(range);
-  const held = sel.toString();
-  // non-conflicting change (right pane): patches live, selection intact
-  spin(50); apply({ r: [[3, 24, "CHURNED"]] }); benchFlush();
-  const liveOk = node.data.includes("CHURNED") && sel.toString() === held;
-  // conflicting change (inside the selection): held back
-  spin(50); apply({ r: [[3, 7, "XXXX"]] }); benchFlush();
-  const heldOk = !node.data.includes("XXXX") && sel.toString() === held;
-  // selection cleared: next flush resyncs the frozen change
+  const canvas = document.querySelector("#screen canvas");
+  const g = canvas.getContext("2d");
+  const lh = 17 * devicePixelRatio;
+  const band5 = () =>
+    Array.from(g.getImageData(0, Math.round(5 * lh), canvas.width, Math.round(lh)).data);
+  const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
+  const pixBefore = band5();
+  const ghostBefore = otherNode.data;
+  // a change to a DIFFERENT row: held globally — pixels, ghost, selection all still
+  spin(50); apply({ r: [[5, 0, pad("CHANGED under a hold")]] }); benchFlush();
+  const heldOk = same(band5(), pixBefore) && otherNode.data === ghostBefore
+    && sel.toString() === "row 3 calm";
+  // selection cleared: the next flush catches BOTH layers up
   sel.removeAllRanges();
-  spin(50); apply({ r: [[3, 50, "!"]] }); benchFlush();
-  const resyncOk = node.data.includes("XXXX") && node.data.includes("!");
-  const pass = liveOk && heldOk && resyncOk;
+  spin(50); benchFlush();
+  const releasedOk = !same(band5(), pixBefore)
+    && otherNode.data.startsWith("CHANGED under a hold");
+  const pass = heldOk && releasedOk;
   document.getElementById("screen").style.display = "none";
   document.body.style.background = pass ? "#00ff00" : "#ff0000";
 }
