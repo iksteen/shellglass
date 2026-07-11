@@ -169,6 +169,22 @@ test("glyphOps emits pure device-pixel ops for the box/block range", () => {
     { t: "rect", x: 0, y: 8, w: 10, h: 1 },
     { t: "rect", x: 0, y: 12, w: 10, h: 1 },
   ]);
+  // The rail offsets clamp PER AXIS. At small zooms the rounded cell width
+  // alternates along a row (4px, 3px, 4px…) — ═'s rail *y* must not care:
+  // both widths give the same rails, or the border meanders ("squished at
+  // certain points", seen live at fit-zoom ≈0.45). The narrow axis clamps
+  // only its own rails: ║ in a 3px-wide cell pulls its rails in to ±1.
+  const railYs = (w: number) =>
+    glyphOps(0x2550, 0, 0, w, 8, 1).map((o) => (o as { y: number }).y);
+  assert.deepEqual(railYs(4), railYs(3), "═ rails independent of cell width");
+  assert.deepEqual(
+    glyphOps(0x2551, 0, 0, 3, 20, 1),
+    [
+      { t: "rect", x: 1, y: 0, w: 1, h: 20 },
+      { t: "rect", x: 3, y: 0, w: 1, h: 20 },
+    ],
+    "║ clamps its x-offset to the narrow cell",
+  );
   // ╬ full double cross: 4 rails, centre hole preserved.
   assert.equal(ops(0x256c).length, 4);
   // ╔ double corner: the outer rails reach the outer corner (3,8); the INNER rails

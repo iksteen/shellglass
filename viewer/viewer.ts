@@ -769,14 +769,21 @@ function doublesOps(x0: number, y0: number, x1: number, y1: number, cp: number, 
   const midY = Math.round((y0 + y1) / 2);
   const t = lw(1, light);
   const h = t >> 1;
-  // Rail offset from centre: ~2 line-widths so the gap reads clearly, clamped to fit
-  // the (narrow) cell width — the height always has room, and one offset for both axes
-  // keeps the gap the same all around a box.
-  const off = Math.max(1, Math.min(2 * t, Math.floor((x1 - x0) / 2) - h));
+  // Rail offset from centre: ~2 line-widths so the gap reads clearly, clamped
+  // PER AXIS to fit the cell. The clamps must be independent: at small zooms
+  // the rounded cell width alternates (e.g. 4px/3px along a row), and a
+  // width-derived offset applied to the HORIZONTAL rails' y made ═ meander
+  // ±1px cell by cell — a squished, wavy border. offY depends only on the
+  // row band (constant along a row ⇒ straight horizontal rails); offX only
+  // on the column (constant down a column ⇒ straight vertical rails).
+  const offX = Math.max(1, Math.min(2 * t, Math.floor((x1 - x0) / 2) - h));
+  const offY = Math.max(1, Math.min(2 * t, Math.floor((y1 - y0) / 2) - h));
   // A full double (both axes doubled) forms real corners: the OUTER rail reaches the
   // outer corner, the INNER rail stops at the inner crossing rail so it doesn't cross
   // the gap. That only applies with exactly one arm on the crossing axis (a corner);
   // tees/crosses and half-double junctions keep the rails running to centre.
+  // Corner meets stay exact because x positions always use offX and y
+  // positions offY — both rails intersect at (midX±offX, midY±offY).
   const dbl = vd && hd;
   const oneH = !!l !== !!r;
   const oneV = !!u !== !!d;
@@ -785,18 +792,18 @@ function doublesOps(x0: number, y0: number, x1: number, y1: number, cp: number, 
   const ops: Op[] = [];
   if (u || d) {
     for (const sx of vd ? [-1, 1] : [0]) {
-      const xc = midX + sx * off;
+      const xc = midX + sx * offX;
       // sx*hDir<0 ⇒ this rail is on the far side of the horizontal arm ⇒ the OUTER rail.
-      const a = u ? y0 : dbl && oneH ? midY + (sx * hDir < 0 ? -off : off) - h : midY - (hd ? off : 0) - h;
-      const b = d ? y1 : dbl && oneH ? midY + (sx * hDir < 0 ? off : -off) + h : midY + (hd ? off : 0) + h;
+      const a = u ? y0 : dbl && oneH ? midY + (sx * hDir < 0 ? -offY : offY) - h : midY - (hd ? offY : 0) - h;
+      const b = d ? y1 : dbl && oneH ? midY + (sx * hDir < 0 ? offY : -offY) + h : midY + (hd ? offY : 0) + h;
       ops.push(rectOp(xc - h, a, t, b - a));
     }
   }
   if (l || r) {
     for (const sy of hd ? [-1, 1] : [0]) {
-      const yc = midY + sy * off;
-      const a = l ? x0 : dbl && oneV ? midX + (sy * vDir < 0 ? -off : off) - h : midX - (vd ? off : 0) - h;
-      const b = r ? x1 : dbl && oneV ? midX + (sy * vDir < 0 ? off : -off) + h : midX + (vd ? off : 0) + h;
+      const yc = midY + sy * offY;
+      const a = l ? x0 : dbl && oneV ? midX + (sy * vDir < 0 ? -offX : offX) - h : midX - (vd ? offX : 0) - h;
+      const b = r ? x1 : dbl && oneV ? midX + (sy * vDir < 0 ? offX : -offX) + h : midX + (vd ? offX : 0) + h;
       ops.push(rectOp(a, yc - h, b - a, t));
     }
   }

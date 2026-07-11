@@ -460,7 +460,8 @@ function doublesOps(x0, y0, x1, y1, cp, light) {
     const midY = Math.round((y0 + y1) / 2);
     const t = lw(1, light);
     const h = t >> 1;
-    const off = Math.max(1, Math.min(2 * t, Math.floor((x1 - x0) / 2) - h));
+    const offX = Math.max(1, Math.min(2 * t, Math.floor((x1 - x0) / 2) - h));
+    const offY = Math.max(1, Math.min(2 * t, Math.floor((y1 - y0) / 2) - h));
     const dbl = vd && hd;
     const oneH = !!l !== !!r;
     const oneV = !!u !== !!d;
@@ -469,17 +470,17 @@ function doublesOps(x0, y0, x1, y1, cp, light) {
     const ops = [];
     if (u || d) {
         for (const sx of vd ? [-1, 1] : [0]) {
-            const xc = midX + sx * off;
-            const a = u ? y0 : dbl && oneH ? midY + (sx * hDir < 0 ? -off : off) - h : midY - (hd ? off : 0) - h;
-            const b = d ? y1 : dbl && oneH ? midY + (sx * hDir < 0 ? off : -off) + h : midY + (hd ? off : 0) + h;
+            const xc = midX + sx * offX;
+            const a = u ? y0 : dbl && oneH ? midY + (sx * hDir < 0 ? -offY : offY) - h : midY - (hd ? offY : 0) - h;
+            const b = d ? y1 : dbl && oneH ? midY + (sx * hDir < 0 ? offY : -offY) + h : midY + (hd ? offY : 0) + h;
             ops.push(rectOp(xc - h, a, t, b - a));
         }
     }
     if (l || r) {
         for (const sy of hd ? [-1, 1] : [0]) {
-            const yc = midY + sy * off;
-            const a = l ? x0 : dbl && oneV ? midX + (sy * vDir < 0 ? -off : off) - h : midX - (vd ? off : 0) - h;
-            const b = r ? x1 : dbl && oneV ? midX + (sy * vDir < 0 ? off : -off) + h : midX + (vd ? off : 0) + h;
+            const yc = midY + sy * offY;
+            const a = l ? x0 : dbl && oneV ? midX + (sy * vDir < 0 ? -offX : offX) - h : midX - (vd ? offX : 0) - h;
+            const b = r ? x1 : dbl && oneV ? midX + (sy * vDir < 0 ? offX : -offX) + h : midX + (vd ? offX : 0) + h;
             ops.push(rectOp(a, yc - h, b - a, t));
         }
     }
