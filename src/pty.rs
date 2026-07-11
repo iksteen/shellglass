@@ -331,8 +331,11 @@ fn screen_thread(
                                     col,
                                     cols,
                                     rows,
+                                    hash: crate::proto::content_key(&img.mime, &img.bytes),
+                                },
+                                blob: crate::model::ImageBlob {
                                     mime: img.mime,
-                                    data: img.base64.into(),
+                                    bytes: img.bytes.into(),
                                 },
                             });
                         }
@@ -595,6 +598,10 @@ fn report_unmirrored(seen: &SeqSeen) {
 struct Placed {
     id: std::num::NonZeroU32,
     img: ImagePlacement,
+    /// The payload behind `img.hash` — rides every frame's `image_data` (by
+    /// refcount) so each frame is self-contained for the standalone server
+    /// and the push client's blob uploads.
+    blob: crate::model::ImageBlob,
 }
 
 /// Snapshot the PTY screen as a [`Frame`], resolving each tracked image's tagged
@@ -603,6 +610,10 @@ struct Placed {
 fn frame_from(parser: &SgParser, images: &mut Vec<Placed>) -> Arc<Frame> {
     let mut grid = crate::parse::grid_from_screen(parser.screen());
     grid.images = resolve_images(parser.screen(), images);
+    grid.image_data = images
+        .iter()
+        .map(|p| (p.img.hash.clone(), p.blob.clone()))
+        .collect();
     Arc::new(Frame::Screen(grid))
 }
 
@@ -1016,8 +1027,11 @@ mod tests {
                 col,
                 cols: Some(w),
                 rows: Some(h),
+                hash: "ab".repeat(32),
+            },
+            blob: crate::model::ImageBlob {
                 mime: "image/png".into(),
-                data: "".into(),
+                bytes: bytes::Bytes::new(),
             },
         }]
     }

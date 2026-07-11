@@ -67,6 +67,7 @@ use tokio_stream::wrappers::WatchStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use crate::model::{Color, Frame, Grid, ImagePlacement, StyledCell};
+use std::collections::HashMap;
 
 /// Viewer wire-protocol version. Injected into the page at serve time
 /// (`window.SHELLGLASS.proto`) and announced as the first SSE event on every
@@ -295,6 +296,78 @@ impl Live {
             axum::http::HeaderValue::from_static("no"),
         );
         resp
+    }
+}
+
+/// Server-side store for content-addressed inline-image payloads, serving the
+/// page-relative `images/<content_key>` route (per session on the hub, one for
+/// the standalone server). Byte-capped FIFO: when over cap, the oldest entries
+/// go first — EXCEPT protected ones (keys the current frame still references),
+/// which must stay servable however large the on-screen set is. The slack
+/// beyond the current frame is the grace window for viewers fetching against
+/// a frame that just changed.
+pub struct ImageStore {
+    map: HashMap<String, (String, bytes::Bytes)>,
+    /// Insertion order, oldest first (an entry appears once; re-inserts are no-ops).
+    order: std::collections::VecDeque<String>,
+    total: usize,
+    cap: usize,
+}
+
+impl ImageStore {
+    #[must_use]
+    pub fn new(cap: usize) -> Self {
+        ImageStore {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            total: 0,
+            cap,
+        }
+    }
+
+    /// Insert a payload under its content key, then evict oldest unprotected
+    /// entries until back under the byte cap. A key already present is a no-op
+    /// (content-addressed: same key = same bytes).
+    pub fn insert(
+        &mut self,
+        hash: String,
+        mime: String,
+        bytes: bytes::Bytes,
+        protected: &std::collections::HashSet<String>,
+    ) {
+        if self.map.contains_key(&hash) {
+            return;
+        }
+        self.total += bytes.len();
+        self.map.insert(hash.clone(), (mime, bytes));
+        self.order.push_back(hash);
+        let mut kept = std::collections::VecDeque::new();
+        while self.total > self.cap {
+            let Some(old) = self.order.pop_front() else {
+                break; // everything left is protected: over-cap by on-screen content
+            };
+            if protected.contains(&old) {
+                kept.push_back(old);
+                continue;
+            }
+            if let Some((_, b)) = self.map.remove(&old) {
+                self.total -= b.len();
+            }
+        }
+        // Protected survivors keep their relative age at the front.
+        while let Some(k) = kept.pop_back() {
+            self.order.push_front(k);
+        }
+    }
+
+    #[must_use]
+    pub fn get(&self, hash: &str) -> Option<(String, bytes::Bytes)> {
+        self.map.get(hash).cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
     }
 }
 
@@ -1467,6 +1540,9 @@ fn apply_wire(prev: &Frame, msg: WireMsgIn) -> Option<Frame> {
                 title,
                 links,
                 images,
+                // Wire frames carry placements only; the hub's blobs live in
+                // its per-session store, not the applied matrix.
+                image_data: std::collections::HashMap::new(),
             }));
         }
         WireMsgIn::Banner { html } => return Some(Frame::Banner(html)),
@@ -1552,6 +1628,31 @@ mod tests {
     use super::*;
     use crate::model::Color;
 
+    // The image store: byte-capped FIFO where on-screen (protected) keys
+    // survive any eviction pass, content-addressed no-op on re-insert.
+    #[test]
+    fn image_store_caps_and_protects() {
+        let mut store = ImageStore::new(10);
+        let none = std::collections::HashSet::new();
+        let bytes = |n: usize| bytes::Bytes::from(vec![0u8; n]);
+        store.insert("a".into(), "image/png".into(), bytes(4), &none);
+        store.insert("b".into(), "image/png".into(), bytes(4), &none);
+        assert_eq!(store.len(), 2, "under cap: both kept");
+        // Re-insert is a no-op (same key = same content), not a size leak.
+        store.insert("a".into(), "image/png".into(), bytes(4), &none);
+        assert_eq!(store.len(), 2);
+        // Over cap: the OLDEST unprotected entry goes.
+        store.insert("c".into(), "image/png".into(), bytes(4), &none);
+        assert!(store.get("a").is_none(), "oldest evicted");
+        assert!(store.get("b").is_some() && store.get("c").is_some());
+        // A protected key survives eviction even when it is the oldest.
+        let protect_b: std::collections::HashSet<String> = ["b".to_string()].into();
+        store.insert("d".into(), "image/png".into(), bytes(4), &protect_b);
+        assert!(store.get("b").is_some(), "on-screen key immune");
+        assert!(store.get("c").is_none(), "next-oldest evicted instead");
+        assert!(store.get("d").is_some());
+    }
+
     fn cell(c: char) -> StyledCell {
         StyledCell {
             text: c.to_string(),
@@ -1570,6 +1671,7 @@ mod tests {
             title: String::new(),
             links: std::collections::BTreeMap::new(),
             images: Vec::new(),
+            image_data: std::collections::HashMap::new(),
         }
     }
 
@@ -2254,8 +2356,7 @@ mod tests {
             col: 2,
             cols: Some(3),
             rows: Some(1),
-            mime: "image/png".into(),
-            data: "AAA".into(),
+            hash: "ab".repeat(32),
         });
         let prev = Frame::Banner("x".into());
         let full = encode_delta(&prev, &Frame::Screen(g.clone())).expect("banner → screen is full");

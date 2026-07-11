@@ -4,7 +4,7 @@
 //! serves the baked browser renderer.
 
 use crate::config::Config;
-use crate::fonts::{CACHE_CONTROL_FONT, FontFile};
+use crate::fonts::{CACHE_CONTROL_IMMUTABLE, FontFile};
 use crate::render;
 use crate::{diff, fonts};
 use axum::Router;
@@ -30,6 +30,10 @@ pub struct AppState {
     pub template: Arc<String>,
     /// Live publisher: per-viewer SSE streams of cell deltas.
     pub live: Arc<diff::Live>,
+    /// Content-addressed inline-image payloads, serving `images/<key>` (fed
+    /// from the frame stream in `run_serve`; on-screen keys are protected
+    /// from eviction).
+    pub images: Arc<std::sync::Mutex<diff::ImageStore>>,
 }
 
 pub fn app(state: AppState) -> Router {
@@ -43,7 +47,39 @@ pub fn app(state: AppState) -> Router {
         .route("/embed.js", get(embed_js).layer(compress.clone()))
         .route("/favicon.svg", get(favicon).layer(compress.clone()))
         .route("/fonts/{key}", get(font).layer(compress))
+        // No compression: image formats are already compressed.
+        .route("/images/{key}", get(image))
         .with_state(state)
+}
+
+/// Serve an inline-image payload (frame placements reference `images/<key>`).
+/// The store is authoritative; the current frame's own `image_data` is the
+/// fallback for the sliver between a frame publishing and the feed task
+/// catching up. Content-addressed ⇒ immutable, cache forever.
+async fn image(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+    let entry = state
+        .images
+        .lock()
+        .unwrap()
+        .get(&key)
+        .or_else(|| match &*state.live.frame() {
+            crate::model::Frame::Screen(g) => g
+                .image_data
+                .get(&key)
+                .map(|b| (b.mime.clone(), b.bytes.clone())),
+            crate::model::Frame::Banner(_) => None,
+        });
+    match entry {
+        Some((mime, bytes)) => (
+            [
+                (CONTENT_TYPE, mime),
+                (CACHE_CONTROL, CACHE_CONTROL_IMMUTABLE.to_string()),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "unknown image").into_response(),
+    }
 }
 
 async fn font(State(state): State<AppState>, Path(key): Path<String>) -> Response {
@@ -51,7 +87,10 @@ async fn font(State(state): State<AppState>, Path(key): Path<String>) -> Respons
     // references them; a handful of fonts makes the scan-with-rehash trivial.
     match state.fonts.iter().find(|f| f.key() == key) {
         Some(f) => (
-            [(CONTENT_TYPE, f.mime), (CACHE_CONTROL, CACHE_CONTROL_FONT)],
+            [
+                (CONTENT_TYPE, f.mime),
+                (CACHE_CONTROL, CACHE_CONTROL_IMMUTABLE),
+            ],
             f.bytes.clone(),
         )
             .into_response(),

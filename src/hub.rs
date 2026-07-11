@@ -19,7 +19,7 @@
 //! dead or restarting hub.
 
 use crate::diff;
-use crate::fonts::CACHE_CONTROL_FONT;
+use crate::fonts::CACHE_CONTROL_IMMUTABLE;
 use crate::model::Frame;
 use crate::proto::{self, KEY_HEADER};
 use crate::render;
@@ -53,12 +53,18 @@ struct Session {
     render_cfg: String,
     /// Live publisher: decoded pushed frames in, per-viewer cell deltas out.
     live: Arc<diff::Live>,
-    /// Content addresses ([`proto::font_key`]) of the fonts this session's
+    /// Content addresses ([`proto::content_key`]) of the fonts this session's
     /// pushed CSS references. The bytes live in the hub-wide [`FontCache`];
     /// this set is both the refcount stake AND the serving authorization —
     /// `/s/<slug>/fonts/<key>` only serves keys in the session's own set, so
     /// sessions stay isolated even though storage is shared.
     fonts: std::collections::HashSet<String>,
+    /// Content-addressed inline-image payloads this session's pusher uploaded
+    /// (blob messages), serving `/s/<slug>/images/<key>`. Per session — image
+    /// content is session-specific, so unlike fonts there is nothing to share;
+    /// dies with the session. Keys the current frame references are protected
+    /// from the byte-cap eviction (see [`diff::ImageStore`]).
+    images: Arc<Mutex<diff::ImageStore>>,
     /// Per-session kick: the management API's DELETE fires this so the live
     /// `/push` WebSocket Closes immediately (the pusher's next reconnect then
     /// 403s — its id is gone from the registry).
@@ -71,7 +77,7 @@ struct Session {
 }
 
 /// Hub-wide content-addressed font store: one copy per distinct font, however
-/// many sessions push it. The key is [`proto::font_key`], computed by the HUB
+/// many sessions push it. The key is [`proto::content_key`], computed by the HUB
 /// from the pushed bytes — there is no client-claimed key anywhere, so a
 /// malicious client cannot overwrite or poison an entry other sessions share
 /// (lying about the mime doesn't help either: it's part of the hash). `refs`
@@ -119,6 +125,11 @@ fn retarget_fonts(
         }
     }
 }
+
+/// Per-session byte cap for uploaded image payloads ([`diff::ImageStore`]).
+/// Generous: on-screen images are protected from eviction regardless, so the
+/// cap only bounds how much RECENTLY-OFF-SCREEN grace a session keeps.
+const IMAGE_STORE_CAP: usize = 64 * 1024 * 1024;
 
 /// Cap on concurrent `session_id` (argon2id) hashes. The hash is memory-hard
 /// (~19 MiB, deliberately expensive) — unbounded concurrent grinding on bad keys
@@ -355,6 +366,7 @@ impl HubState {
                 render_cfg: String::new(),
                 live,
                 fonts: std::collections::HashSet::new(),
+                images: Arc::new(Mutex::new(diff::ImageStore::new(IMAGE_STORE_CAP))),
                 kick,
                 registered: false,
             },
@@ -700,6 +712,8 @@ pub fn app(state: HubState) -> Router {
             get(favicon).layer(compress.clone()),
         )
         .route("/s/{slug}/fonts/{key}", get(font).layer(compress))
+        // No compression: image formats are already compressed.
+        .route("/s/{slug}/images/{key}", get(image))
         // The management API (Bearer-authorized in the API salt domain; the
         // namespace 404s while --api-allow is unconfigured). Delete is two
         // explicit routes: an un-aliased slug IS the id, so one ambiguous
@@ -1027,9 +1041,18 @@ async fn push_session(st: HubState, id: String, base: String, mut socket: WebSoc
                                 break;
                             }
                         },
-                        // Streaming: apply + forward. publish_wire drops malformed or
-                        // out-of-sync messages rather than the whole session.
-                        Some(l) => l.publish_wire(t.as_str()),
+                        // Streaming: image payload uploads are intercepted and
+                        // stored (never forwarded — viewers fetch over HTTP);
+                        // everything else is a wire message: apply + forward.
+                        // publish_wire drops malformed or out-of-sync messages
+                        // rather than the whole session.
+                        Some(l) => {
+                            if t.as_str().starts_with("{\"blob\":") {
+                                store_blob(&st, &id, l, t.as_str());
+                            } else {
+                                l.publish_wire(t.as_str());
+                            }
+                        }
                     },
                     Message::Close(_) => break,
                     // Ping is auto-ponged by axum; Pong/Binary are ignored.
@@ -1047,6 +1070,37 @@ async fn push_session(st: HubState, id: String, base: String, mut socket: WebSoc
     if let Some(l) = &live {
         l.set_online(false);
     }
+}
+
+/// Store an uploaded image payload in the session's image store, keyed by the
+/// hash the HUB derives from the decoded bytes — a client cannot choose the
+/// key, so it can only ever provide the bytes its own frames reference (same
+/// no-poisoning doctrine as fonts). Protection for the eviction pass comes
+/// from the session's current applied frame: whatever is on screen right now
+/// must stay servable. Malformed messages are dropped, like bad wire messages.
+fn store_blob(st: &HubState, id: &str, live: &diff::Live, msg: &str) {
+    let Ok(m) = serde_json::from_str::<proto::BlobMsg>(msg) else {
+        return;
+    };
+    let Ok(bytes) = B64.decode(m.blob.d) else {
+        return;
+    };
+    let hash = proto::content_key(&m.blob.m, &bytes);
+    let protected: std::collections::HashSet<String> = match &*live.frame() {
+        Frame::Screen(g) => g.images.iter().map(|p| p.hash.clone()).collect(),
+        Frame::Banner(_) => std::collections::HashSet::new(),
+    };
+    let store = {
+        let map = st.sessions.lock().unwrap();
+        match map.get(id) {
+            Some(s) => Arc::clone(&s.images),
+            None => return, // deleted mid-stream; the kick is on its way
+        }
+    };
+    store
+        .lock()
+        .unwrap()
+        .insert(hash, m.blob.m, bytes::Bytes::from(bytes), &protected);
 }
 
 /// Create or refresh the session for `id` from a register message; returns its
@@ -1073,12 +1127,12 @@ fn register_session(
         .into_iter()
         .filter_map(|f| {
             let bytes = bytes::Bytes::from(B64.decode(f.b64).ok()?);
-            Some((proto::font_key(&f.mime, &bytes), (f.mime, bytes)))
+            Some((proto::content_key(&f.mime, &bytes), (f.mime, bytes)))
         })
         .collect();
     let keys: std::collections::HashSet<String> = incoming.keys().cloned().collect();
     // The id's public slug (for the announce log below). The pushed CSS is
-    // stored VERBATIM: its font URLs are page-relative (`fonts/<font_key>`,
+    // stored VERBATIM: its font URLs are page-relative (`fonts/<content_key>`,
     // the SALT v5 register contract), which the canonical `/s/<slug>/` page
     // resolves for any slug and behind any subpath mount — nothing to rewrite.
     let slug = st.slug_of(id)?;
@@ -1130,6 +1184,7 @@ fn register_session(
                 render_cfg: reg.render_cfg,
                 live: Arc::clone(&live),
                 fonts: keys,
+                images: Arc::new(Mutex::new(diff::ImageStore::new(IMAGE_STORE_CAP))),
                 kick,
                 registered: true,
             },
@@ -1165,12 +1220,39 @@ async fn font(State(st): State<HubState>, Path((slug, key)): Path<(String, Strin
         Some((mime, bytes)) => (
             [
                 (CONTENT_TYPE, mime),
-                (CACHE_CONTROL, CACHE_CONTROL_FONT.to_string()),
+                (CACHE_CONTROL, CACHE_CONTROL_IMMUTABLE.to_string()),
             ],
             bytes,
         )
             .into_response(),
         None => (StatusCode::NOT_FOUND, "unknown font").into_response(),
+    }
+}
+
+/// Serve an uploaded inline-image payload from the session's own store (the
+/// frame placements' `images/<key>` URLs point here). Public like the font
+/// route — the slug is the read capability; the store being per-session is
+/// the isolation. Content-addressed ⇒ immutable, cache forever.
+async fn image(State(st): State<HubState>, Path((slug, key)): Path<(String, String)>) -> Response {
+    let id = st.id_of_view(&slug);
+    let store = {
+        let map = st.sessions.lock().unwrap();
+        match id.and_then(|id| map.get(&id)) {
+            Some(s) => Arc::clone(&s.images),
+            None => return (StatusCode::NOT_FOUND, "unknown session").into_response(),
+        }
+    };
+    let entry = store.lock().unwrap().get(&key);
+    match entry {
+        Some((mime, bytes)) => (
+            [
+                (CONTENT_TYPE, mime),
+                (CACHE_CONTROL, CACHE_CONTROL_IMMUTABLE.to_string()),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "unknown image").into_response(),
     }
 }
 
@@ -1564,7 +1646,7 @@ mod tests {
         );
         let shared: (&str, &[u8]) = ("font/ttf", b"SHARED-FONT-BYTES");
         let only_b: (&str, &[u8]) = ("font/ttf", b"B-ONLY-FONT");
-        let shared_key = proto::font_key(shared.0, shared.1);
+        let shared_key = proto::content_key(shared.0, shared.1);
 
         register_session(&st, &a, "http://h", reg_with_fonts("x", &[shared])).unwrap();
         register_session(&st, &b, "http://h", reg_with_fonts("x", &[shared, only_b])).unwrap();
@@ -1594,6 +1676,74 @@ mod tests {
         assert!(st.fonts.lock().unwrap().is_empty(), "cache fully drained");
     }
 
+    // Image blobs: stored under the HUB-derived content key (no client-chosen
+    // key exists), served from the session's own store, isolated per session,
+    // and dropped when malformed.
+    #[tokio::test]
+    async fn image_blobs_store_and_serve_per_session() {
+        use base64::Engine as _;
+        let a = session_id("a");
+        let b = session_id("b");
+        let st = HubState::new(
+            parse_allow(&[format!("{a}:one"), format!("{b}:two")]).unwrap(),
+            "http://h".into(),
+        );
+        let (live_a, _k) = register_session(&st, &a, "http://h", reg("x")).unwrap();
+        register_session(&st, &b, "http://h", reg("x")).unwrap();
+
+        let bytes = b"PNG-ISH-BYTES";
+        let key = proto::content_key("image/png", bytes);
+        let msg = format!(
+            "{{\"blob\":{{\"m\":\"image/png\",\"d\":\"{}\"}}}}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        );
+        assert!(msg.starts_with("{\"blob\":"), "intercept prefix holds");
+        store_blob(&st, &a, &live_a, &msg);
+        // Malformed payloads are dropped, not fatal.
+        store_blob(
+            &st,
+            &a,
+            &live_a,
+            "{\"blob\":{\"m\":\"x\",\"d\":\"@@notb64\"}}",
+        );
+        store_blob(&st, &a, &live_a, "{\"blob\":42}");
+
+        let router = app(st);
+        let res = router
+            .clone()
+            .oneshot(
+                Request::get(format!("/s/one/images/{key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "own image serves");
+        assert!(
+            res.headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("immutable")),
+            "content address caches forever"
+        );
+        let body = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], bytes);
+
+        // Another session's slug must not serve it (per-session store).
+        let res = router
+            .clone()
+            .oneshot(
+                Request::get(format!("/s/two/images/{key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
     // Storage is shared; the serving NAMESPACE is not: a session's slug only
     // serves keys in that session's own reference set.
     #[tokio::test]
@@ -1605,7 +1755,7 @@ mod tests {
             "http://h".into(),
         );
         let fa: (&str, &[u8]) = ("font/ttf", b"A-FONT");
-        let key_a = proto::font_key(fa.0, fa.1);
+        let key_a = proto::content_key(fa.0, fa.1);
         register_session(&st, &a, "http://h", reg_with_fonts("x", &[fa])).unwrap();
         register_session(&st, &b, "http://h", reg("x")).unwrap();
         let router = app(st);

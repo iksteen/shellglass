@@ -202,9 +202,13 @@ that didn't appear in the terminal, and none is lost that did.
 
 Images behave like they do in a cell-based terminal: they scroll with the text,
 clip against the top edge on the way out, and disappear when the screen region
-they occupy is cleared or overwritten. Hub mode included — images ride the same
-frame stream, and late-joining viewers get any image currently on screen. The
-read-only SSH view is cells-only and does not show images.
+they occupy is cleared or overwritten. Hub mode included — late-joining viewers
+get any image currently on screen. Frames carry only image *placements* (a
+content hash); viewers fetch the bytes once over HTTP and cache them forever
+(the URL is immutable), so a large on-screen image costs each viewer one
+download — not a re-transmission inside every full frame, multiplied by every
+viewer. Copying a selection still embeds the actual bitmap. The read-only SSH
+view is cells-only and does not show images.
 
 ## Read-only SSH view
 

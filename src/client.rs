@@ -23,6 +23,8 @@ use crate::model::Frame;
 use crate::proto::{KEY_HEADER, MAX_WS_MESSAGE, RegisterBody};
 use crate::render;
 use anyhow::{Context, Result, bail};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
 use futures_util::{SinkExt, StreamExt};
 use reqwest_websocket::{Bytes, HandshakeError, Message, Upgrade, WebSocket};
 use std::sync::Arc;
@@ -244,7 +246,18 @@ async fn run_session(
     {
         return End::Disconnected;
     }
+    // Content keys of image payloads already uploaded on THIS connection —
+    // reset per connect, because a restarted hub lost its stores. Blobs go
+    // out before the frame that references them (WS FIFO makes that a hard
+    // ordering guarantee for the hub and every viewer behind it).
+    let mut sent_blobs = std::collections::HashSet::new();
     let mut prev = rx.borrow_and_update().clone();
+    if send_new_blobs(&mut ws, &prev, &mut sent_blobs)
+        .await
+        .is_err()
+    {
+        return End::Disconnected;
+    }
     if send(
         &mut ws,
         Message::Text(diff::full_message(&prev)),
@@ -269,10 +282,13 @@ async fn run_session(
                 // A bounded send + the watch's latest-only semantics give backpressure:
                 // if the network stalls the delta is computed against the last frame
                 // actually sent, coalescing the skipped ones.
-                if let Some(msg) = diff::encode_delta(&prev, &next)
-                    && send(&mut ws, Message::Text(msg.to_string()), SEND_TIMEOUT).await.is_err()
-                {
-                    return End::Disconnected;
+                if let Some(msg) = diff::encode_delta(&prev, &next) {
+                    if send_new_blobs(&mut ws, &next, &mut sent_blobs).await.is_err() {
+                        return End::Disconnected;
+                    }
+                    if send(&mut ws, Message::Text(msg.to_string()), SEND_TIMEOUT).await.is_err() {
+                        return End::Disconnected;
+                    }
                 }
                 prev = next;
             }
@@ -294,6 +310,36 @@ async fn run_session(
             }
         }
     }
+}
+
+/// Upload the frame's image payloads this connection hasn't sent yet, as blob
+/// messages ahead of the frame itself. The frame's `image_data` covers every
+/// on-screen placement, so a full referencing hash H is always preceded (on
+/// this FIFO socket) by H's bytes.
+async fn send_new_blobs(
+    ws: &mut WebSocket,
+    frame: &Frame,
+    sent: &mut std::collections::HashSet<String>,
+) -> Result<(), ()> {
+    let Frame::Screen(grid) = frame else {
+        return Ok(());
+    };
+    for (hash, blob) in &grid.image_data {
+        if sent.contains(hash) {
+            continue;
+        }
+        let msg = serde_json::to_string(&crate::proto::BlobMsg {
+            blob: crate::proto::BlobBody {
+                m: blob.mime.clone(),
+                d: B64.encode(&blob.bytes),
+            },
+        })
+        .map_err(|_| ())?;
+        // Blobs can be MBs (like the register) — the longer deadline applies.
+        send(ws, Message::Text(msg), INITIAL_SEND_TIMEOUT).await?;
+        sent.insert(hash.clone());
+    }
+    Ok(())
 }
 
 /// Send one message, treating a stall past `timeout` (send buffer full against a dead

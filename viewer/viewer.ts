@@ -81,15 +81,16 @@ interface FullMsg {
   y?: Record<number, string>; // OSC 8 link table (id -> URI); absent = empty
   i?: ImageRef[]; // inline images placed on the screen; absent = none
 }
-// One inline image (iTerm2/kitty) placed at a cell. `m`/`d` build a data: URL;
-// `w`/`h` (cols/rows) size it, else it renders at natural pixel size.
+// One inline image (iTerm2/kitty/sixel) placed at a cell. `k` is the content
+// address: the bytes are fetched from the page-relative `images/<k>`
+// (immutable — cached across reconnects instead of re-riding every full
+// frame). `w`/`h` (cols/rows) size it, else it renders at natural pixel size.
 export interface ImageRef {
   r: number; // top row (may be negative: the image is clipped above the top edge)
   c: number; // left col
   w?: number; // width in cells
   h?: number; // height in cells (rows)
-  m: string; // mime type
-  d: string; // base64 image file
+  k: string; // content address of the image bytes
 }
 // On diff-family messages the cursor is TRI-STATE: absent = unchanged,
 // null = became hidden, [row, col] = moved. A cursor-only move drops `r`,
@@ -1952,16 +1953,34 @@ function paintFull(dims: { w: number; h: number; i?: ImageRef[] }): void {
   // a stylesheet rule (never an inline style, which would travel with a copied
   // fragment and paste invisibly). Each is inserted as a SIBLING right after
   // its anchor row, so document order matches visual order and a selection
-  // spanning the image's rows carries it into the clipboard's HTML flavor
-  // (the data: src pastes as a real picture).
+  // spanning the image's rows carries it into the clipboard's HTML flavor.
   screenImages = (dims.i ?? []).map((ref) => {
     const anchor =
       screen.rowEls[Math.min(Math.max(ref.r, 0), screen.rowEls.length - 1)];
     anchor.insertAdjacentHTML(ref.r < 0 ? "beforebegin" : "afterend", renderImage(ref));
     const el = (ref.r < 0 ? anchor.previousElementSibling : anchor.nextElementSibling) as HTMLImageElement;
-    // data: URLs still decode async — a static screen would never repaint, so
-    // redraw the canvas when a not-yet-ready image lands.
-    if (!el.complete) el.addEventListener("load", () => redrawCanvasAll());
+    // The fetch resolves async (usually from cache — the URL is immutable) —
+    // a static screen would never repaint, so redraw when the image lands.
+    // Then swap the element's src to an embedded data: URL: the HTTP URL is
+    // session-relative and dies with the session, so a COPIED fragment must
+    // carry the actual bitmap to paste as a real picture (the swap re-fires
+    // `load`; the data:-prefix guard stops the recursion, and any later
+    // paint uses the browser-cached decode either way).
+    el.addEventListener("load", () => {
+      redrawCanvasAll();
+      if (el.src.startsWith("data:")) return;
+      const c = document.createElement("canvas");
+      c.width = el.naturalWidth;
+      c.height = el.naturalHeight;
+      const g = c.getContext("2d");
+      if (!g || !c.width || !c.height) return;
+      g.drawImage(el, 0, 0);
+      try {
+        el.src = c.toDataURL("image/png");
+      } catch {
+        /* tainted canvas can't happen (same-origin), but never break paint */
+      }
+    });
     return { ref, el };
   });
 }
@@ -1981,7 +2000,10 @@ function renderImage(im: ImageRef): string {
   const vars =
     `--sg-c:${im.c};--sg-r:${im.r}` +
     (sized ? `;--sg-w:${im.w};--sg-h:${im.h}` : "");
-  return `<img class="inline-img${sized ? " sized" : ""}" style="${vars}" alt="" src="data:${im.m};base64,${im.d}">`;
+  // Relative content-addressed URL: resolves under the page directory
+  // (subpath-safe) and is immutable, so the browser cache absorbs re-renders
+  // and reconnects. `k` is server-derived 64-hex — attribute-safe by shape.
+  return `<img class="inline-img${sized ? " sized" : ""}" style="${vars}" alt="" src="images/${im.k}">`;
 }
 
 function decodeRow([r, l, text, style]: WireRow): { r: number; l: number; cells: Cell[] } {

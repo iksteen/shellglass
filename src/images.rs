@@ -36,13 +36,14 @@ const B64: GeneralPurpose = GeneralPurpose::new(
         .with_decode_padding_mode(DecodePaddingMode::Indifferent),
 );
 
-/// One extracted inline image, ready to hand the browser as a `data:` URL.
+/// One extracted inline image, decoded to raw browser-native file bytes (the
+/// form [`crate::proto::content_key`] hashes and the image routes serve).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Image {
     /// MIME type sniffed from the decoded bytes (`image/png`, …).
     pub mime: String,
-    /// The image file, base64 (forwarded verbatim; the browser decodes it).
-    pub base64: String,
+    /// The image file bytes.
+    pub bytes: Vec<u8>,
     /// Display size in terminal cells (cols, rows) if the app specified one;
     /// otherwise the browser renders the image at its natural pixel size.
     pub cells: Option<(u16, u16)>,
@@ -524,9 +525,9 @@ impl Interceptor {
         let image = match acc.fmt {
             KittyFmt::Png => Image {
                 mime: sniff_mime(&bytes)?.to_string(),
-                base64: B64.encode(&bytes),
-                cells: acc.cells,
                 px: dims(&bytes),
+                bytes,
+                cells: acc.cells,
             },
             KittyFmt::Rgba | KittyFmt::Rgb => {
                 let (w, h) = acc.px?;
@@ -538,7 +539,7 @@ impl Interceptor {
                 let png = encode_png(w, h, channels, &bytes)?;
                 Image {
                     mime: "image/png".to_string(),
-                    base64: B64.encode(&png),
+                    bytes: png,
                     cells: acc.cells,
                     px: Some((w, h)),
                 }
@@ -662,7 +663,7 @@ fn parse_sixel(seq: &[u8]) -> Option<Segment> {
     let png = encode_png(w, h, 4, &img.pixels)?;
     Some(Segment::Image(Image {
         mime: "image/png".to_string(),
-        base64: B64.encode(&png),
+        bytes: png,
         cells: None,
         px: Some((w, h)),
     }))
@@ -696,9 +697,9 @@ fn image_from_b64(base64: String, cells: Option<(u16, u16)>) -> Option<Image> {
     let mime = sniff_mime(&bytes)?;
     Some(Image {
         mime: mime.to_string(),
-        base64: base64.trim().to_string(),
-        cells,
         px: dims(&bytes),
+        bytes,
+        cells,
     })
 }
 
@@ -831,7 +832,7 @@ mod tests {
         assert_eq!(imgs.len(), 1);
         assert_eq!(imgs[0].mime, "image/png");
         assert_eq!(imgs[0].cells, Some((4, 2)));
-        assert_eq!(imgs[0].base64, b64);
+        assert_eq!(imgs[0].bytes, B64.decode(&b64).unwrap());
     }
 
     #[test]
@@ -850,7 +851,7 @@ mod tests {
         assert_eq!(imgs.len(), 1);
         assert_eq!(imgs[0].mime, "image/png");
         assert_eq!(imgs[0].cells, Some((4, 2)));
-        assert_eq!(imgs[0].base64, b64);
+        assert_eq!(imgs[0].bytes, B64.decode(&b64).unwrap());
     }
 
     #[test]
@@ -977,7 +978,7 @@ mod tests {
         assert_eq!(imgs.len(), 1);
         assert_eq!(imgs[0].mime, "image/png");
 
-        let png = B64.decode(&imgs[0].base64).unwrap();
+        let png = imgs[0].bytes.clone();
         let decoder = png::Decoder::new(std::io::Cursor::new(&png));
         let mut reader = decoder.read_info().expect("valid PNG");
         assert_eq!((reader.info().width, reader.info().height), (2, 2));

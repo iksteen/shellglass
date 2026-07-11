@@ -8,7 +8,7 @@
 //! consulted is `fc-match`, purely to learn the OS's default family for a CSS
 //! generic (`monospace`, …); it's optional and absent on macOS/Windows.
 
-// Everything except [`CACHE_CONTROL_FONT`] and [`FontFile`] is the discovery
+// Everything except [`CACHE_CONTROL_IMMUTABLE`] and [`FontFile`] is the discovery
 // machinery — mirror-side only (roadmap item 13): the hub never locates fonts,
 // it just re-serves what clients push.
 #[cfg(feature = "mirror")]
@@ -77,9 +77,9 @@ fn referenced_families(config: &Config) -> Vec<String> {
 }
 
 /// `Cache-Control` for served fonts. A font's bytes are stable for the life of a
-/// Immutable: font URLs are content addresses (`fonts/<font_key>`), so the
+/// Immutable: font URLs are content addresses (`fonts/<content_key>`), so the
 /// bytes behind a URL can never change — safe to cache forever.
-pub const CACHE_CONTROL_FONT: &str = "public, max-age=31536000, immutable";
+pub const CACHE_CONTROL_IMMUTABLE: &str = "public, max-age=31536000, immutable";
 
 /// A font file located on this host, to be served to viewers so they render the
 /// glyphs without a local install. `family` is the CSS name it's referenced by.
@@ -95,11 +95,11 @@ pub struct FontFile {
 }
 
 impl FontFile {
-    /// The font's content address ([`crate::proto::font_key`]): the key its
+    /// The font's content address ([`crate::proto::content_key`]): the key its
     /// `@font-face` URL references and the hub stores/serves it under.
     #[must_use]
     pub fn key(&self) -> String {
-        crate::proto::font_key(self.mime, &self.bytes)
+        crate::proto::content_key(self.mime, &self.bytes)
     }
 }
 

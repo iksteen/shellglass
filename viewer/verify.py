@@ -2,16 +2,33 @@
 """Canvas verification: screenshot verify.html (the canvas picture over ghost
 text) and check terminal-rendering semantics on the pixels, plus the green/red
 per-mode self-checks. Kills only the Firefox PIDs it spawns."""
-import http.server, os, socketserver, subprocess, sys, threading
+import base64, http.server, os, socketserver, subprocess, sys, threading
 from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LH = 17  # --lh in verify.html (CSS px; screenshots at dpr=1 headless)
 ROWS, COLS, FS = 17, 60, 14
 
+# A red 8x8 PNG, served for any /images/<hash> request (the ?mode=image
+# self-check references a fixed content address; in production the shellglass
+# servers own this route).
+RED8 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP8z4AdMOEQ"
+    "H6QSAM1BAQ/oQeJvAAAAAElFTkSuQmCC"
+)
+
 class H(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *a, **kw):
         super().__init__(*a, directory=HERE, **kw)
+    def do_GET(self):
+        if self.path.split("?")[0].startswith("/images/"):
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(RED8)))
+            self.end_headers()
+            self.wfile.write(RED8)
+            return
+        super().do_GET()
     def translate_path(self, path):
         if path.split("?")[0] == "/viewer.js":
             return os.path.join(HERE, "dist", "viewer.js")

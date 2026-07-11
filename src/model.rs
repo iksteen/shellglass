@@ -113,10 +113,15 @@ pub(crate) fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// An inline image (iTerm2/kitty) placed at a terminal cell, forwarded to the
-/// browser as a `data:` URL overlay. Serializes compactly for the full-frame wire
-/// message under the `i` key (see [`crate::diff`]); the browser decodes the base64.
-#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
+/// An inline image (iTerm2/kitty/sixel) placed at a terminal cell. The wire
+/// carries the PLACEMENT only — position, size, and the image's content
+/// address ([`crate::proto::content_key`]) under the `k` key; the browser
+/// fetches the bytes over HTTP at the page-relative `images/<k>` (immutable,
+/// so reconnecting viewers hit their cache instead of re-downloading —
+/// in-frame base64 could never be cached and multiplied by every viewer).
+/// The bytes themselves live in [`Grid::image_data`] on the producing side
+/// and travel client→hub as blob messages, never inside frames.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ImagePlacement {
     /// Top-left cell of the image. May be negative when the image has partially
     /// scrolled off the top: the viewer clips it above the screen edge.
@@ -130,28 +135,20 @@ pub struct ImagePlacement {
     pub cols: Option<u16>,
     #[serde(rename = "h", default, skip_serializing_if = "Option::is_none")]
     pub rows: Option<u16>,
-    #[serde(rename = "m")]
-    pub mime: String,
-    /// The image file, base64. `Arc` because a placement is cloned into every
-    /// frame it's visible in (and compared frame-over-frame in `encode_delta`) —
-    /// the multi-MB payload must ride along by refcount, not by copy.
-    #[serde(rename = "d")]
-    pub data: std::sync::Arc<str>,
+    /// Content address of the image bytes ([`crate::proto::content_key`]).
+    #[serde(rename = "k")]
+    pub hash: String,
 }
 
-/// Frame-over-frame image equality runs on every dirty frame (any change to the
-/// image set forces a full wire frame), so compare the payload by pointer first:
-/// an unchanged placement shares its `Arc` with the previous frame, making the
-/// common no-change case O(1) instead of a multi-MB memcmp.
-impl PartialEq for ImagePlacement {
-    fn eq(&self, other: &Self) -> bool {
-        self.row == other.row
-            && self.col == other.col
-            && self.cols == other.cols
-            && self.rows == other.rows
-            && self.mime == other.mime
-            && (std::sync::Arc::ptr_eq(&self.data, &other.data) || self.data == other.data)
-    }
+/// An image payload, keyed by its content address in [`Grid::image_data`].
+/// `Bytes` because a blob is cloned into every frame its placement is visible
+/// in — the multi-MB payload must ride along by refcount, not by copy.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageBlob {
+    pub mime: String,
+    /// The raw image file bytes (what [`crate::proto::content_key`] hashes;
+    /// base64 only exists transiently on the blob wire message).
+    pub bytes: bytes::Bytes,
 }
 
 /// The terminal screen as cells. `rows[r]` holds the visible cells of row `r`, with
@@ -182,6 +179,12 @@ pub struct Grid {
     pub links: std::collections::BTreeMap<u32, String>,
     /// Inline images currently placed on the screen (empty for the common case).
     pub images: Vec<ImagePlacement>,
+    /// The payloads behind `images`, keyed by content address — POPULATED ONLY
+    /// on the producing side (PTY backend): the standalone server serves them
+    /// at `images/<key>` and the push client uploads them as blob messages.
+    /// Never on the wire; a Grid decoded from wire messages (the hub's applied
+    /// matrix) has it empty — the hub keeps blobs in its per-session store.
+    pub image_data: std::collections::HashMap<String, ImageBlob>,
 }
 
 /// What a backend publishes on the frame channel: a live screen snapshot, or an

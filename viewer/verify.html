@@ -88,19 +88,34 @@ if (MODE === "links") {
   document.body.style.background = pass ? "#00ff00" : "#ff0000";
 }
 
-// ?mode=image: inline-image self-check — the <img> element is hidden (by
-// stylesheet rule) and the image draws on the canvas UNDER the glyphs: a text
-// cell over the image shows its painted bg (text wins, like a real cell
-// terminal), an untouched cell shows the image. Green/red convention.
+// ?mode=image: inline-image self-check — the placement references a content
+// address, the <img> fetches it from the page-relative images/<k> (verify.py
+// serves a red 8×8 PNG there), stays hidden (stylesheet rule), and the image
+// draws on the canvas UNDER the glyphs: a text cell over the image shows its
+// painted bg (text wins, like a real cell terminal), an untouched cell shows
+// the image. After load the element swaps its src to an embedded data: URL so
+// a COPIED fragment pastes a real picture even after the session dies.
+// Green/red convention.
 if (MODE === "image") {
-  const RED8 = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP8z4AdMOEQH6QSAM1BAQ/oQeJvAAAAAElFTkSuQmCC";
   const d3 = [];
   for (let i = 0; i < ROWS; i++) d3.push([[pad(i === 2 ? "    OVERWRITE" : "")]]);
   apply({ d: d3, w: COLS, h: ROWS,
-          i: [{ r: 1, c: 2, w: 10, h: 4, m: "image/png", d: RED8 }] });
+          i: [{ r: 1, c: 2, w: 10, h: 4, k: "ab".repeat(32) }] });
   benchFlush();
   const img = document.querySelector("img.inline-img");
-  img.decode().then(() => {
+  const fetched = img.getAttribute("src") === `images/${"ab".repeat(32)}`;
+  // Assert from the img's own load events: the viewer's listener (attached
+  // first) swaps src to data: on the network load; the swap starts a second
+  // (data:) load the WINDOW load must also wait for — so asserting on the
+  // completed data: load runs before the screenshot, race-free.
+  const swapped = () => new Promise((res) => {
+    const check = () => {
+      if (img.src.startsWith("data:") && img.complete) res(null);
+    };
+    img.addEventListener("load", check);
+    check(); // in case both loads already finished
+  });
+  swapped().then(() => {
     benchRedraw(); // deterministic: don't race the async image-load repaint
     const scr = document.querySelector("#screen .screen");
     const canvas = document.querySelector("#screen canvas");
@@ -119,17 +134,24 @@ if (MODE === "image") {
     const cs = getComputedStyle(img);
     const laidOut = cs.position === "absolute" && cs.objectFit === "contain";
     // copy semantics: the image sits in document order between the rows it
-    // spans, so a selection over those rows carries it (clipboard HTML)
+    // spans (so a selection over them carries it), and the copied fragment's
+    // src is the EMBEDDED bitmap, not the session-relative URL
     const rows = document.querySelectorAll("#screen .row");
     const range = document.createRange();
     range.setStart(rows[1].firstChild, 0);
     range.setEnd(rows[5].firstChild, 3);
-    const copied = range.cloneContents().querySelector("img.inline-img") !== null;
-    const pass = hidden && noInline && laidOut && copied
+    const copiedImg = range.cloneContents().querySelector("img.inline-img");
+    const copied = copiedImg !== null && copiedImg.src.startsWith("data:image/png");
+    const pass = fetched && hidden && noInline && laidOut && copied
       && imgPx[0] > 180 && imgPx[1] < 60 // red image under blank cells
       && txtPx[0] < 60 && txtPx[1] < 60 && txtPx[2] < 60; // painted bg under text
     document.getElementById("screen").style.display = "none";
-    document.body.style.background = pass ? "#00ff00" : "#ff0000";
+    // Failure paints the flag bits into the blue channel for the screenshot.
+    const bits = (fetched ? 1 : 0) + (hidden ? 2 : 0) + (noInline ? 4 : 0)
+      + (laidOut ? 8 : 0) + (copied ? 16 : 0)
+      + (imgPx[0] > 180 && imgPx[1] < 60 ? 32 : 0)
+      + (txtPx[0] < 60 && txtPx[1] < 60 && txtPx[2] < 60 ? 64 : 0);
+    document.body.style.background = pass ? "#00ff00" : `rgb(255, 0, ${bits})`;
     document.title = "verified-ready";
   });
 }

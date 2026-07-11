@@ -1334,8 +1334,23 @@ function paintFull(dims) {
         const anchor = screen.rowEls[Math.min(Math.max(ref.r, 0), screen.rowEls.length - 1)];
         anchor.insertAdjacentHTML(ref.r < 0 ? "beforebegin" : "afterend", renderImage(ref));
         const el = (ref.r < 0 ? anchor.previousElementSibling : anchor.nextElementSibling);
-        if (!el.complete)
-            el.addEventListener("load", () => redrawCanvasAll());
+        el.addEventListener("load", () => {
+            redrawCanvasAll();
+            if (el.src.startsWith("data:"))
+                return;
+            const c = document.createElement("canvas");
+            c.width = el.naturalWidth;
+            c.height = el.naturalHeight;
+            const g = c.getContext("2d");
+            if (!g || !c.width || !c.height)
+                return;
+            g.drawImage(el, 0, 0);
+            try {
+                el.src = c.toDataURL("image/png");
+            }
+            catch {
+            }
+        });
         return { ref, el };
     });
 }
@@ -1343,7 +1358,7 @@ function renderImage(im) {
     const sized = im.w && im.h;
     const vars = `--sg-c:${im.c};--sg-r:${im.r}` +
         (sized ? `;--sg-w:${im.w};--sg-h:${im.h}` : "");
-    return `<img class="inline-img${sized ? " sized" : ""}" style="${vars}" alt="" src="data:${im.m};base64,${im.d}">`;
+    return `<img class="inline-img${sized ? " sized" : ""}" style="${vars}" alt="" src="images/${im.k}">`;
 }
 function decodeRow([r, l, text, style]) {
     if (typeof text === "string") {

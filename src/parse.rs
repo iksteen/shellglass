@@ -101,8 +101,9 @@ pub fn grid_from_screen<T>(screen: &vt100::Screen<T>) -> Grid {
         title: screen.title().to_string(),
         links,
         // Images are tracked outside vt100 (it drops the sequences); the PTY backend
-        // fills this in after extraction. Text-only extraction leaves it empty.
+        // fills these in after extraction. Text-only extraction leaves them empty.
         images: Vec::new(),
+        image_data: std::collections::HashMap::new(),
     }
 }
 

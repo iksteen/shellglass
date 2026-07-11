@@ -574,6 +574,38 @@ async fn run_serve(
         listener.local_addr()?
     );
     let (rx, _notifier) = pty::start(&source.command())?;
+    // Feed the image store from a sibling subscription: every frame's payloads
+    // are inserted (no-ops when already present), with the frame's own
+    // placements protected from the byte-cap eviction.
+    let images = Arc::new(std::sync::Mutex::new(diff::ImageStore::new(
+        64 * 1024 * 1024,
+    )));
+    {
+        let images = Arc::clone(&images);
+        let mut rx = rx.clone();
+        tokio::spawn(async move {
+            loop {
+                if let crate::model::Frame::Screen(g) = &**rx.borrow_and_update()
+                    && !g.image_data.is_empty()
+                {
+                    let protected: std::collections::HashSet<String> =
+                        g.images.iter().map(|p| p.hash.clone()).collect();
+                    let mut store = images.lock().unwrap();
+                    for (hash, blob) in &g.image_data {
+                        store.insert(
+                            hash.clone(),
+                            blob.mime.clone(),
+                            blob.bytes.clone(),
+                            &protected,
+                        );
+                    }
+                }
+                if rx.changed().await.is_err() {
+                    return; // PTY gone; the server is shutting down with it
+                }
+            }
+        });
+    }
     let live = diff::Live::spawn(rx);
     if let Some((l, key)) = ssh_ready {
         let target = ssh::Target::Single(Arc::clone(&live));
@@ -593,6 +625,7 @@ async fn run_serve(
         fonts: s.fonts,
         template: s.template,
         live,
+        images,
     };
     axum::serve(listener, server::app(state)).await?;
     Ok(())
