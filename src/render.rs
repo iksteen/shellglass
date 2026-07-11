@@ -93,6 +93,26 @@ pub fn head_css(font_css: &str, config: &Config) -> String {
     format!("{font_css}{base_css}")
 }
 
+/// The base terminal CSS with nothing but built-in defaults — no config, no
+/// served fonts. The hub serves this for a registered session whose pusher has
+/// never connected (the operator-offline placeholder): custom fonts are
+/// deliberately ignored until the pusher provides them, and the hub-only build
+/// has no `Config` anyway. Keep the structure in lockstep with [`head_css`].
+pub fn default_head_css() -> String {
+    "html,body { margin:0; }\n\
+     #screen { font-family:monospace; font-size:14px; --lh:16.8px; \
+     line-height:var(--lh); color:#d0d0d0; background:#000; }\n\
+     .screen { position:relative; white-space:pre; overflow:hidden; }\n\
+     .row { position:relative; height:var(--lh); contain:layout style; }\n\
+     .run { position:absolute; top:0; height:var(--lh); overflow:hidden; }\n"
+        .to_string()
+}
+
+/// Render config matching [`default_head_css`] — the viewer's own defaults,
+/// spelled out (field names are viewer.ts's `Cfg`).
+pub const DEFAULT_RENDER_CFG: &str =
+    r##"{"defFg":"#d0d0d0","defBg":"#000000","fillFont":"monospace","sym":[]}"##;
+
 /// Fill a viewer `template` with the terminal `<style>`, the (empty) `#screen`
 /// div, and the updater `<script>`. Tokens: `{{style}}`, `{{screen}}`,
 /// `{{script}}`. The screen starts empty — the renderer paints it from the full

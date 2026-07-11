@@ -60,6 +60,11 @@ struct Session {
     /// `/push` WebSocket Closes immediately (the pusher's next reconnect then
     /// 403s — its id is gone from the registry).
     kick: broadcast::Sender<()>,
+    /// False for a registry STUB: the session is allowed but its pusher has
+    /// never registered. The view route serves the built-in placeholder
+    /// (default template + default CSS, no fonts, operator-offline) instead
+    /// of pushed content; the first register flips it.
+    registered: bool,
 }
 
 /// Cap on concurrent `session_id` (argon2id) hashes. The hash is memory-hard
@@ -193,14 +198,50 @@ pub struct HubState {
 impl HubState {
     pub fn new(allow: AllowConfig, base: String) -> Self {
         let (shutdown, _) = broadcast::channel(1);
-        Self {
+        let st = Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             registry: Arc::new(std::sync::RwLock::new(allow)),
             api_allowed: Arc::new(std::collections::HashSet::new()),
             base: base.into(),
             hash_slots: Arc::new(Semaphore::new(HASH_SLOTS)),
             shutdown,
+        };
+        // Every seeded --allow entry gets its placeholder immediately: the
+        // view URL works (operator-offline) before any pusher connects.
+        let seeded: Vec<String> = st.registry.read().unwrap().by_id.keys().cloned().collect();
+        for id in seeded {
+            st.ensure_stub(&id);
         }
+        st
+    }
+
+    /// Make sure `id` has at least a STUB session, so `/s/<slug>` and its SSE
+    /// stream exist from the moment the session is registered (CLI or API):
+    /// a "waiting for operator…" banner on an offline `Live` — the viewer's
+    /// `operator` event machinery shows the same offline state as a live
+    /// session whose pusher dropped. A no-op when the session already exists.
+    fn ensure_stub(&self, id: &str) {
+        let mut map = self.sessions.lock().unwrap();
+        if map.contains_key(id) {
+            return;
+        }
+        let live = diff::Live::new(Arc::new(Frame::Banner(render::banner(
+            "waiting for operator…",
+        ))));
+        live.set_online(false);
+        let (kick, _) = broadcast::channel(1);
+        map.insert(
+            id.to_string(),
+            Session {
+                css: String::new(),
+                template: String::new(),
+                render_cfg: String::new(),
+                live,
+                fonts: HashMap::new(),
+                kick,
+                registered: false,
+            },
+        );
     }
 
     /// Enable the management API for these API ids (`--api-allow`). Builder
@@ -243,6 +284,9 @@ impl HubState {
         }
         reg.by_view.insert(slug.to_string(), id.to_string());
         reg.by_id.insert(id.to_string(), slug.to_string());
+        drop(reg);
+        // The view URL works immediately, operator-offline, before any push.
+        self.ensure_stub(id);
         Ok(())
     }
 
@@ -796,15 +840,26 @@ fn register_session(
         .replace(&format!("/s/{id}/fonts/"), &format!("/s/{slug}/fonts/"));
     let mut map = st.sessions.lock().unwrap();
     if let Some(s) = map.get_mut(id) {
+        // The common path: every allowed id has at least a stub (ensure_stub),
+        // so a first register is "stub becomes real" and a reconnect is a
+        // refresh. Either way the pushed CSS/config/fonts replace what's
+        // stored, and viewers sitting on the placeholder page reload through
+        // its operator-online hook (see the view route).
         s.css = css;
         s.template = reg.template;
         s.render_cfg = reg.render_cfg;
         s.fonts = fonts;
-        // A reconnect: the operator is back (push_session marked it offline on the
-        // previous drop). New sessions start online, so only this branch needs it.
+        if !s.registered {
+            s.registered = true;
+            println!("shellglass: session connected — view at {base}/s/{slug}");
+        }
+        // Coming (back) online — new stubs start offline, dropped pushers were
+        // marked offline by push_session.
         s.live.set_online(true);
         Some((Arc::clone(&s.live), s.kick.subscribe()))
     } else {
+        // Fallback only: an authorized id always has a stub, but keep the
+        // create path for the theoretical gap.
         let live = diff::Live::new(Arc::new(Frame::Banner(render::banner(
             "waiting for client…",
         ))));
@@ -818,6 +873,7 @@ fn register_session(
                 live: Arc::clone(&live),
                 fonts,
                 kick,
+                registered: true,
             },
         );
         println!("shellglass: session connected — view at {base}/s/{slug}");
@@ -855,6 +911,32 @@ async fn view(State(st): State<HubState>, Path(slug): Path<String>) -> Response 
     let Some(s) = id.and_then(|id| map.get(&id)) else {
         return (StatusCode::NOT_FOUND, "unknown session").into_response();
     };
+    if !s.registered {
+        // Registered-but-unseeded: the pusher has never connected, so there is
+        // no pushed CSS/template/fonts to serve. Serve the built-in template
+        // with plain defaults (custom fonts deliberately ignored) — the SSE
+        // stream connects to the stub's offline Live, so the page shows the
+        // same operator-offline state as a live session whose pusher dropped.
+        // The extra observer reloads the page the moment the operator comes
+        // online: the reload then fetches the REAL page (pushed CSS + fonts),
+        // which this placeholder cannot render.
+        let script = format!(
+            "{}\n<script>new MutationObserver(() => {{\n\
+             const s = document.body.dataset.offline;\n\
+             if (s === undefined || s === \"\") location.reload();\n\
+             }}).observe(document.body, {{ attributes: true, attributeFilter: [\"data-offline\"] }});</script>",
+            render::sse_script(&format!("/s/{slug}/events"), render::DEFAULT_RENDER_CFG)
+        );
+        return (
+            [(CACHE_CONTROL, "no-cache")],
+            Html(render::page(
+                render::DEFAULT_TEMPLATE,
+                &render::default_head_css(),
+                &script,
+            )),
+        )
+            .into_response();
+    }
     let script = render::sse_script(&format!("/s/{slug}/events"), &s.render_cfg);
     // Empty template = an older client that didn't push one; use the built-in.
     let template = if s.template.is_empty() {
@@ -1089,14 +1171,19 @@ mod tests {
             parse_allow(std::slice::from_ref(&id)).unwrap(),
             "http://h".into(),
         );
-        assert!(
-            st.live(&id).is_none(),
-            "no session before the first register"
-        );
+        // Seeding creates a STUB immediately: the view URL and its SSE stream
+        // exist before any pusher, operator-offline.
+        let stub = st.live(&id).expect("stub Live exists before any register");
+        assert!(!stub.is_online(), "stub starts operator-offline");
 
-        // First register (the WS's first message) creates the session + its Live.
+        // First register (the WS's first message) adopts the stub's Live —
+        // placeholder viewers already subscribed aren't orphaned.
         let (live1, _kick1) = register_session(&st, &id, "http://h", reg("a{}")).unwrap();
-        assert!(st.live(&id).is_some(), "session exists after register");
+        assert!(
+            Arc::ptr_eq(&stub, &live1),
+            "register must adopt the stub's Live"
+        );
+        assert!(live1.is_online(), "register brings the operator online");
 
         // A reconnect re-registers: the CSS refreshes but the same Live is reused, so
         // viewers already subscribed don't get orphaned.
@@ -1322,6 +1409,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    }
+
+    // A registered-but-unseeded session serves the built-in placeholder
+    // (operator-offline) and transitions to the pushed page on registration.
+    #[tokio::test]
+    async fn unseeded_session_serves_placeholder_until_registered() {
+        let sid = session_id("pusher");
+        let st = HubState::new(
+            parse_allow(&[format!("{sid}:demo")]).unwrap(),
+            "http://h".into(),
+        );
+        let router = app(st.clone());
+
+        // The view URL works before any pusher: built-in template + the
+        // reload-on-operator-online observer (the placeholder's marker).
+        let res = router
+            .clone()
+            .oneshot(Request::get("/s/demo").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "unseeded slug serves a page");
+        let body = axum::body::to_bytes(res.into_body(), 1 << 22)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&body);
+        assert!(
+            html.contains("attributeFilter"),
+            "placeholder carries the reload-on-online observer"
+        );
+
+        // Its SSE stream exists (the stub's offline Live) — status only, the
+        // body is an endless stream.
+        let res = router
+            .clone()
+            .oneshot(Request::get("/s/demo/events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "unseeded SSE connects");
+
+        // Unknown slugs stay hard 404s — 'waiting for operator' ≠ 'not a session'.
+        let res = router
+            .clone()
+            .oneshot(Request::get("/s/nope").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // The pusher registers: the view now serves the pushed page, and the
+        // placeholder observer is gone.
+        register_session(&st, &sid, "http://h", reg(".pushed{}")).unwrap();
+        let res = router
+            .clone()
+            .oneshot(Request::get("/s/demo").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 1 << 22)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&body);
+        assert!(
+            html.contains(".pushed{}"),
+            "registered view serves pushed CSS"
+        );
+        assert!(
+            !html.contains("attributeFilter"),
+            "no placeholder machinery on the real page"
+        );
     }
 
     // Domain separation end to end: a key whose SESSION id is a registered
