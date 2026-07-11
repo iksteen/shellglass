@@ -592,7 +592,18 @@ rasterizer at terminal sizes).
    asserting the canvas ink differs from forced per-cell rendering AND the
    run's advance matches the grid; re-run `bench.py` (rain's per-cell
    styles fall back, typing/editor should coalesce).
-3. **Integer device-pixel cell grid (stem evenness).** Kitty sizes the
+3. ⏸ **Integer device-pixel cell grid (stem evenness).** Measured
+   2026-07-11 and deferred. Stem-spacing histogram (`?mode=stems`, a row
+   of `l`): at dpr 1 / cellW 8.403 the jitter is real — stdev 0.325px
+   run-drawn, 0.407px per-cell (the rasterizer snaps each stem
+   individually even inside a shaped run, so D.2 does not fix it) — but at
+   common fractional zooms it vanishes (10.5px cells: stdev 0.02–0.08).
+   The genuine fix needs the canvas to OWN the grid: `.screen` sized from
+   integer device cells with ghost `letter-spacing` compensation, which
+   feeds back into the template's fit-zoom measurement loop (fitZ depends
+   on width, width would depend on zoom) — oscillation risk that needs its
+   own design. 0.33px stdev doesn't justify it today; revisit if stem
+   wobble is ever the visible complaint. Original sketch: kitty sizes the
    cell in whole device pixels; our `cellW` is fractional (1ch ≈ 8.43px at
    14px), so per-cell `Math.round` edges make cells alternate 8/9 device px
    and glyph spacing jitters ±0.5px — visible as uneven stems in columns a
@@ -603,7 +614,14 @@ rasterizer at terminal sizes).
    px instead of `ch`) so ghost text, selection hit-testing and the fit
    script stay in agreement. Verify: the histogram collapses to one bucket;
    full parity rig unchanged.
-4. **Underline skip-ink (kitty's exclusion zones).** `drawUnderline` draws
+4. ✅ **Underline skip-ink (kitty's exclusion zones)** (landed 2026-07-11,
+   `canvas-track-d`): `descSpan` runs kitty's per-column scan on an
+   offscreen raster, cached per (font, glyph, band); `drawUnderline`
+   segments straight/double/dotted/dashed around the exclusion (curly draws
+   through — segmenting a stroked sine isn't worth it); concealed glyphs
+   exclude nothing. Verified: skip-ink rig check, gaps at Mgjq descenders
+   in both renderers, space-continuity intact. Original sketch:
+   `drawUnderline` draws
    straight through descenders; kitty carves exclusion zones
    (`calculate_underline_exclusion_zones` in kitty/fonts.c) and Firefox's
    DOM does `text-decoration-skip-ink` — both leave gaps around g/j/p tails.
@@ -614,7 +632,12 @@ rasterizer at terminal sizes).
    source: straight vs curly/dotted/dashed) before implementing. Verify:
    extend the decoration-continuity rig check to assert canvas gap positions
    at descenders line up with the DOM's skip-ink gaps.
-5. **Pinch-zoom sharpness.** The visual viewport scales the canvas raster
+5. ✅ **Pinch-zoom sharpness** (landed 2026-07-11, `canvas-track-d`):
+   `watchPinch` folds `visualViewport.scale` (capped 3×) into the backing
+   density on its resize event and repaints; verified via the `benchPinch`
+   hook (`?mode=pinch`: 1.5× store per axis, ~2.25× denser ink, exact
+   restore on release). Original sketch: the visual viewport scales the
+   canvas raster
    with no event our ResizeObserver/dpr-media hooks see — but
    `visualViewport` fires `resize` on pinch. Listen next to `watchZoom`,
    fold `visualViewport.scale` (capped ~3× to bound backing-store memory)
