@@ -236,6 +236,33 @@ if (MODE === "blink") {
   document.body.style.background = pass ? "#00ff00" : "#ff0000";
 }
 
+// ?mode=freeze: the ghost layer freezes for the WHOLE pointer hold — the
+// browser anchors a (collapsed) selection at pointerdown, and a ghost text
+// node replaced before the first drag movement orphans it. During the hold
+// the ghost node must stay the same object with the same data; releasing the
+// pointer lets the next flush resync. Green/red convention.
+if (MODE === "freeze") {
+  const d7 = [];
+  for (let i = 0; i < ROWS; i++) d7.push([[pad(`row ${i} stable text`)]]);
+  apply({ d: d7, w: COLS, h: ROWS });
+  benchFlush();
+  benchStorm(true);
+  const spin = (ms) => { const t = performance.now(); while (performance.now() - t < ms); };
+  const rowEl = document.querySelectorAll("#screen .row")[3];
+  const node = rowEl.firstChild;
+  const before = node.data;
+  document.getElementById("screen").dispatchEvent(
+    new PointerEvent("pointerdown", { bubbles: true }));
+  spin(50); apply({ r: [[3, 0, pad("CHANGED while held")]] }); benchFlush();
+  const heldSame = rowEl.firstChild === node && node.data === before;
+  window.dispatchEvent(new PointerEvent("pointerup"));
+  spin(50); apply({ r: [[3, 0, pad("changed after release")]] }); benchFlush();
+  const releasedFresh = rowEl.firstChild.data.startsWith("changed after release");
+  const pass = heldSame && releasedFresh;
+  document.getElementById("screen").style.display = "none";
+  document.body.style.background = pass ? "#00ff00" : "#ff0000";
+}
+
 // ?mode=crt: canvas phosphor self-check — flipping the #crt toggle on must
 // add bloom ink to storm rows (blurred lighter self-composite), and off must
 // remove it. Same green/red screenshot convention as ?mode=links.

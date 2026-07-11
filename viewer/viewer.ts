@@ -1364,10 +1364,26 @@ function onScreenClick(ev: MouseEvent): void {
   const uri = hit === null ? null : linkHref(screen.links, hit.cell.a);
   if (uri !== null) window.open(uri, "_blank", "noopener,noreferrer");
 }
+// A selection only counts as "active" once it is NON-collapsed — but the
+// browser anchors it (collapsed) at pointerdown, and the first ghost update
+// after that replaces the text node and orphans the anchor. At storm rates
+// that is a ≤33ms race the user loses most frames. So the ghost layer freezes
+// for the WHOLE pointer hold: by the time the anchor lands, nothing moves
+// under it. pointerup (or a cancelled/blurred drag) releases; if no selection
+// formed, the next flush resyncs as usual.
+let pointerHeld = false;
 function attachLinkHandlers(): void {
   screenEl.addEventListener("mousemove", onScreenMove);
   screenEl.addEventListener("mouseleave", () => setHover(undefined, -1));
   screenEl.addEventListener("click", onScreenClick);
+  screenEl.addEventListener("pointerdown", () => {
+    pointerHeld = true;
+  });
+  for (const ev of ["pointerup", "pointercancel", "blur"]) {
+    window.addEventListener(ev, () => {
+      pointerHeld = false;
+    });
+  }
 }
 
 export function ghostText(row: Cell[]): string {
@@ -1433,7 +1449,12 @@ function setStorm(on: boolean): void {
       // and the calm-down fires ~1.2s after the animation ends, exactly when the
       // user reaches for Ctrl-C. Storm stays on (the canvas keeps painting); the
       // first tick after the selection clears drops back to DOM.
-      if (clock() - lastStormy > STORM_EXIT_MS && !selectionActive() && !canvasModeOn())
+      if (
+        clock() - lastStormy > STORM_EXIT_MS &&
+        !selectionActive() &&
+        !pointerHeld && // a drag in progress anchors Ranges the exit would kill
+        !canvasModeOn()
+      )
         setStorm(false);
     }, 300);
   } else {
@@ -1880,7 +1901,7 @@ function flushPaint(): void {
       startCurAnim(lastCurPos, cur);
     }
     lastCurPos = cur ? [cur[0], cur[1]] : null;
-    const frozen = storm && selectionActive();
+    const frozen = storm && (selectionActive() || pointerHeld);
     if (storm && !frozen && ghostStale) {
       // Selection just cleared — the ghost layer froze while it was live; resync all.
       for (let r = 0; r < screen.cells.length; r++) ghostRow(r);

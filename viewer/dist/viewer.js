@@ -1009,10 +1009,19 @@ function onScreenClick(ev) {
     if (uri !== null)
         window.open(uri, "_blank", "noopener,noreferrer");
 }
+let pointerHeld = false;
 function attachLinkHandlers() {
     screenEl.addEventListener("mousemove", onScreenMove);
     screenEl.addEventListener("mouseleave", () => setHover(undefined, -1));
     screenEl.addEventListener("click", onScreenClick);
+    screenEl.addEventListener("pointerdown", () => {
+        pointerHeld = true;
+    });
+    for (const ev of ["pointerup", "pointercancel", "blur"]) {
+        window.addEventListener(ev, () => {
+            pointerHeld = false;
+        });
+    }
 }
 export function ghostText(row) {
     let text = "";
@@ -1061,7 +1070,10 @@ function setStorm(on) {
         redrawCanvasAll();
         lastStormy = clock();
         stormTimer = setInterval(() => {
-            if (clock() - lastStormy > STORM_EXIT_MS && !selectionActive() && !canvasModeOn())
+            if (clock() - lastStormy > STORM_EXIT_MS &&
+                !selectionActive() &&
+                !pointerHeld &&
+                !canvasModeOn())
                 setStorm(false);
         }, 300);
     }
@@ -1348,7 +1360,7 @@ function flushPaint() {
             startCurAnim(lastCurPos, cur);
         }
         lastCurPos = cur ? [cur[0], cur[1]] : null;
-        const frozen = storm && selectionActive();
+        const frozen = storm && (selectionActive() || pointerHeld);
         if (storm && !frozen && ghostStale) {
             for (let r = 0; r < screen.cells.length; r++)
                 ghostRow(r);
