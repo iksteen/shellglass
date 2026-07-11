@@ -182,6 +182,13 @@ real session automatically when the first push arrives. Runtime-added sessions
 are **ephemeral** — a hub restart forgets them; the managing tool is the source
 of truth and re-adds them.
 
+`--allow` entries are ordinary registry entries: they get the same
+operator-offline placeholder before their pusher connects, and the API can
+delete them like any other session. The difference is at restart — `--allow`
+is the declarative baseline, so a restart **re-seeds** flag-configured
+sessions (undoing runtime deletions of them), while API-added sessions are
+forgotten.
+
 ## How it works
 
 ```

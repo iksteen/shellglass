@@ -1069,6 +1069,19 @@ mod tests {
         );
     }
 
+    // --allow seeds are "just another entry": the API deletes them exactly
+    // like runtime-added ones (a restart re-seeds them — the flags are the
+    // declarative baseline, the API the runtime layer).
+    #[test]
+    fn cli_seeded_sessions_are_api_deletable() {
+        let a = session_id("a");
+        let st = HubState::new(parse_allow(&[format!("{a}:alpha")]).unwrap(), String::new());
+        assert!(st.live("alpha").is_some(), "seed gets its placeholder stub");
+        assert_eq!(st.remove_by_slug("alpha").as_deref(), Some(a.as_str()));
+        assert!(!st.is_allowed(&a), "seeded session removed like any other");
+        assert!(st.live("alpha").is_none(), "stub gone with it");
+    }
+
     #[test]
     fn list_sessions_reports_registry() {
         let a = session_id("a");
