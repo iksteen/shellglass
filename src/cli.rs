@@ -181,6 +181,13 @@ pub struct HubArgs {
     #[arg(long = "allow", value_name = "SESSION_ID[:SLUG]")]
     allow: Vec<String>,
 
+    /// An API id permitted to call the session-management API (`/api/sessions`);
+    /// repeat for several. Compute one with `print-id --key K --api` (API ids live
+    /// in their own salt domain — a session key is never an API credential). With
+    /// no --api-allow the whole /api namespace is off (404).
+    #[arg(long = "api-allow", value_name = "API_ID")]
+    api_allow: Vec<String>,
+
     /// Serve HTTPS with this certificate chain (PEM). Requires --tls-key.
     #[arg(long, requires = "tls_key")]
     tls_cert: Option<PathBuf>,
@@ -306,12 +313,21 @@ impl HubArgs {
     pub async fn run(self) -> Result<()> {
         let tls = Tls::from_args(&self)?;
         let allow = hub::parse_allow(&self.allow).context("parsing --allow")?;
-        if allow.is_empty() {
+        let api_allow = hub::parse_api_allow(&self.api_allow).context("parsing --api-allow")?;
+        if allow.is_empty() && api_allow.is_empty() {
             eprintln!(
-                "shellglass: warning — no --allow session ids; the hub will reject all pushes (403)"
+                "shellglass: warning — no --allow session ids and no --api-allow; the hub will reject all pushes (403)"
             );
         }
-        serve_hub(allow, &self.bind, tls, self.ssh_bind, self.ssh_host_key).await
+        serve_hub(
+            allow,
+            api_allow,
+            &self.bind,
+            tls,
+            self.ssh_bind,
+            self.ssh_host_key,
+        )
+        .await
     }
 }
 
@@ -467,6 +483,7 @@ fn describe_source(source: &SourceArgs) -> String {
 #[cfg(feature = "hub")]
 async fn serve_hub(
     allow: hub::AllowConfig,
+    api_allow: std::collections::HashSet<String>,
     addr: &str,
     tls: Tls,
     ssh_bind: Option<String>,
@@ -486,7 +503,7 @@ async fn serve_hub(
             )
         }
     };
-    let hub_state = hub::HubState::new(allow, base);
+    let hub_state = hub::HubState::new(allow, base).with_api_allowed(api_allow);
     // Optional read-only SSH view: the session id is the SSH username. A setup failure
     // must not abort the hub's HTTP service — log and continue without the SSH view.
     if let Some(ssh_addr) = &ssh_bind {

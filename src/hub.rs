@@ -123,6 +123,21 @@ pub fn parse_allow(entries: &[String]) -> Result<AllowConfig> {
     Ok(cfg)
 }
 
+/// Parse `--api-allow` entries (API ids from `print-id --api`) into the set
+/// [`HubState::with_api_allowed`] takes. Ids have the same 64-hex shape as
+/// session ids (same derivation, different salt domain); duplicates are a
+/// startup error like `--allow`'s.
+pub fn parse_api_allow(entries: &[String]) -> Result<std::collections::HashSet<String>> {
+    let mut set = std::collections::HashSet::new();
+    for id in entries {
+        validate_id(id).with_context(|| format!("--api-allow entry {id:?}"))?;
+        if !set.insert(id.clone()) {
+            bail!("--api-allow lists api id {id} more than once");
+        }
+    }
+    Ok(set)
+}
+
 /// A session id must be exactly what [`session_id`] emits — 64 lowercase hex chars.
 /// Checking it here turns a fat-fingered id, or a `slug:id` written the wrong way
 /// round, into a clear startup error instead of a session that can never be pushed to.
@@ -161,6 +176,10 @@ pub struct HubState {
     /// only writers are the API's add/remove handlers. The operator/API adds
     /// ids, never secrets — the hub screens by hash.
     registry: Arc<std::sync::RwLock<AllowConfig>>,
+    /// API ids (`api_id(secret)`, the API salt domain) permitted to call the
+    /// management API. CLI-configured (`--api-allow`), not runtime-mutable.
+    /// Empty = the API is off and the whole `/api` namespace 404s.
+    api_allowed: Arc<std::collections::HashSet<String>>,
     /// Public base URL (`scheme://host:port`, no trailing slash) for logging the
     /// view URL when a new session connects.
     base: Arc<str>,
@@ -177,10 +196,19 @@ impl HubState {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             registry: Arc::new(std::sync::RwLock::new(allow)),
+            api_allowed: Arc::new(std::collections::HashSet::new()),
             base: base.into(),
             hash_slots: Arc::new(Semaphore::new(HASH_SLOTS)),
             shutdown,
         }
+    }
+
+    /// Enable the management API for these API ids (`--api-allow`). Builder
+    /// style; call before the state is cloned into the router.
+    #[must_use]
+    pub fn with_api_allowed(mut self, ids: impl IntoIterator<Item = String>) -> Self {
+        self.api_allowed = Arc::new(ids.into_iter().collect());
+        self
     }
 
     /// The public slug for an allowed session id; `None` = not (or no longer)
@@ -353,11 +381,55 @@ fn log_reject(headers: &HeaderMap, peer: SocketAddr, route: &str, code: StatusCo
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map_or_else(|| peer.ip().to_string(), str::to_string);
+    // "auth failure" (not "push auth failure"): the same line now covers the
+    // management API's rejections too; the route names which surface.
     eprintln!(
-        "shellglass: push auth failure {} on {route} client={client} peer={}",
+        "shellglass: auth failure {} on {route} client={client} peer={}",
         code.as_u16(),
         peer.ip()
     );
+}
+
+/// Resolve a management-API request's `Authorization: Bearer <key>` to an
+/// authorization decision, or the status to reject with: `404` while the API
+/// is unconfigured (the whole namespace stays hidden), `401` with no usable
+/// header, `403` when the key's API id isn't on `--api-allow`. The key hashes
+/// in the API salt domain ([`proto::api_id`]) — a session key can never pass
+/// here — behind the same argon2 DoS guards and fail2ban-parseable rejection
+/// logging as [`authorize`].
+async fn authorize_api(
+    st: &HubState,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+    route: &'static str,
+) -> Result<(), StatusCode> {
+    if st.api_allowed.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let key = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("bearer "))
+        })
+        .map(str::to_string);
+    let Some(key) = key else {
+        log_reject(headers, peer, route, StatusCode::UNAUTHORIZED);
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    let id = {
+        let _permit = st.hash_slots.acquire().await.expect("hash_slots open");
+        tokio::task::spawn_blocking(move || proto::api_id(&key))
+            .await
+            .expect("hash task")
+    };
+    if st.api_allowed.contains(&id) {
+        Ok(())
+    } else {
+        log_reject(headers, peer, route, StatusCode::FORBIDDEN);
+        Err(StatusCode::FORBIDDEN)
+    }
 }
 
 /// Whether a WebSocket recv error is a message that exceeded the size limit — i.e.
@@ -386,7 +458,139 @@ pub fn app(state: HubState) -> Router {
         .route("/s/{slug}", get(view).layer(compress.clone()))
         .route("/s/{slug}/events", get(events))
         .route("/s/{slug}/fonts/{key}", get(font).layer(compress))
+        // The management API (Bearer-authorized in the API salt domain; the
+        // namespace 404s while --api-allow is unconfigured). Delete is two
+        // explicit routes: an un-aliased slug IS the id, so one ambiguous
+        // route could target the wrong namespace.
+        .route("/api/sessions", get(api_list).post(api_add))
+        .route(
+            "/api/sessions/by-id/{id}",
+            axum::routing::delete(api_delete_by_id),
+        )
+        .route(
+            "/api/sessions/by-slug/{slug}",
+            axum::routing::delete(api_delete_by_slug),
+        )
         .with_state(state)
+}
+
+/// POST body for `/api/sessions`: the session's public id (from `print-id`,
+/// never a key) and an optional view slug (defaults to the id, exactly like
+/// `--allow <id>` without `:slug`).
+#[derive(serde::Deserialize)]
+struct ApiAddBody {
+    id: String,
+    #[serde(default)]
+    slug: Option<String>,
+}
+
+fn api_json(code: StatusCode, body: &serde_json::Value) -> Response {
+    (code, [(CONTENT_TYPE, "application/json")], body.to_string()).into_response()
+}
+
+/// `POST /api/sessions` — register a session at runtime. The body is taken
+/// raw and parsed AFTER authorization, so an unauthorized caller learns
+/// nothing (not even that its JSON was malformed) and the unconfigured
+/// namespace stays a plain 404.
+async fn api_add(
+    State(st): State<HubState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Err(code) = authorize_api(&st, &headers, peer, "/api/sessions").await {
+        return code.into_response();
+    }
+    let body: ApiAddBody = match serde_json::from_str(&body) {
+        Ok(b) => b,
+        Err(e) => {
+            return api_json(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({ "error": format!("invalid JSON body: {e}") }),
+            );
+        }
+    };
+    match st.add_session(&body.id, body.slug.as_deref()) {
+        Ok(()) => {
+            let slug = body.slug.unwrap_or_else(|| body.id.clone());
+            println!("shellglass: api added session {} (slug {slug})", body.id);
+            api_json(
+                StatusCode::CREATED,
+                &serde_json::json!({ "id": body.id, "slug": slug }),
+            )
+        }
+        Err(AddError::IdTaken) => api_json(
+            StatusCode::CONFLICT,
+            &serde_json::json!({ "error": "session id already registered" }),
+        ),
+        Err(AddError::SlugTaken) => api_json(
+            StatusCode::CONFLICT,
+            &serde_json::json!({ "error": "slug already in use" }),
+        ),
+        Err(AddError::Invalid(m)) => {
+            api_json(StatusCode::BAD_REQUEST, &serde_json::json!({ "error": m }))
+        }
+    }
+}
+
+/// `DELETE /api/sessions/by-id/{id}` — remove a session BY ITS SESSION ID.
+async fn api_delete_by_id(
+    State(st): State<HubState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(code) = authorize_api(&st, &headers, peer, "/api/sessions/by-id").await {
+        return code.into_response();
+    }
+    if st.remove_by_id(&id) {
+        println!("shellglass: api removed session {id} (by id)");
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        api_json(
+            StatusCode::NOT_FOUND,
+            &serde_json::json!({ "error": "unknown session id" }),
+        )
+    }
+}
+
+/// `DELETE /api/sessions/by-slug/{slug}` — remove a session BY ITS VIEW SLUG.
+async fn api_delete_by_slug(
+    State(st): State<HubState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+) -> Response {
+    if let Err(code) = authorize_api(&st, &headers, peer, "/api/sessions/by-slug").await {
+        return code.into_response();
+    }
+    match st.remove_by_slug(&slug) {
+        Some(id) => {
+            println!("shellglass: api removed session {id} (by slug {slug})");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        None => api_json(
+            StatusCode::NOT_FOUND,
+            &serde_json::json!({ "error": "unknown slug" }),
+        ),
+    }
+}
+
+/// `GET /api/sessions` — every registered session, for reconciliation.
+async fn api_list(
+    State(st): State<HubState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(code) = authorize_api(&st, &headers, peer, "/api/sessions").await {
+        return code.into_response();
+    }
+    let sessions: Vec<serde_json::Value> = st
+        .list_sessions()
+        .into_iter()
+        .map(|(id, slug, live)| serde_json::json!({ "id": id, "slug": slug, "live": live }))
+        .collect();
+    api_json(StatusCode::OK, &serde_json::Value::Array(sessions))
 }
 
 fn key_of(headers: &HeaderMap) -> Option<String> {
@@ -947,5 +1151,196 @@ mod tests {
         );
         h.insert("host", "internal:8080".parse().unwrap());
         assert_eq!(view_base(&h, cfg), "https://hub.example.com");
+    }
+
+    // ── management API (router-level) ─────────────────────────────────────────
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt as _;
+
+    fn api_req(method: &str, uri: &str, bearer: Option<&str>, body: Option<&str>) -> Request<Body> {
+        let mut b = Request::builder().method(method).uri(uri);
+        if let Some(k) = bearer {
+            b = b.header("authorization", format!("Bearer {k}"));
+        }
+        if body.is_some() {
+            b = b.header("content-type", "application/json");
+        }
+        let mut req = b
+            .body(body.map_or_else(Body::empty, |s| Body::from(s.to_string())))
+            .unwrap();
+        // Handlers extract ConnectInfo; a real server injects it, oneshot must.
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9))));
+        req
+    }
+
+    #[tokio::test]
+    async fn api_namespace_hidden_until_configured() {
+        let router = app(HubState::new(AllowConfig::default(), String::new()));
+        for req in [
+            api_req("GET", "/api/sessions", Some("whatever"), None),
+            api_req("POST", "/api/sessions", Some("whatever"), Some("{}")),
+            api_req("DELETE", "/api/sessions/by-slug/x", Some("whatever"), None),
+        ] {
+            let res = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                res.status(),
+                StatusCode::NOT_FOUND,
+                "no --api-allow = the namespace is a plain 404"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn api_auth_and_session_lifecycle() {
+        let key = "api-secret";
+        let st = HubState::new(AllowConfig::default(), String::new())
+            .with_api_allowed([proto::api_id(key)]);
+        let router = app(st.clone());
+        let sid = session_id("pusher");
+
+        // Missing and wrong credentials.
+        let res = router
+            .clone()
+            .oneshot(api_req("GET", "/api/sessions", None, None))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let res = router
+            .clone()
+            .oneshot(api_req("GET", "/api/sessions", Some("wrong"), None))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // Add, aliased.
+        let body = format!(r#"{{"id":"{sid}","slug":"pretty"}}"#);
+        let res = router
+            .clone()
+            .oneshot(api_req("POST", "/api/sessions", Some(key), Some(&body)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert!(st.is_allowed(&sid), "added session may push");
+
+        // Duplicate id 409; malformed id 400.
+        let res = router
+            .clone()
+            .oneshot(api_req("POST", "/api/sessions", Some(key), Some(&body)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let res = router
+            .clone()
+            .oneshot(api_req(
+                "POST",
+                "/api/sessions",
+                Some(key),
+                Some(r#"{"id":"not-hex"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // List for reconciliation.
+        let res = router
+            .clone()
+            .oneshot(api_req("GET", "/api/sessions", Some(key), None))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let list: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(list[0]["id"], sid.as_str());
+        assert_eq!(list[0]["slug"], "pretty");
+        assert_eq!(list[0]["live"], false);
+
+        // EXPLICIT namespaces: deleting an aliased session by its id-shaped
+        // SLUG must miss — by-slug never falls back to the id namespace.
+        let res = router
+            .clone()
+            .oneshot(api_req(
+                "DELETE",
+                &format!("/api/sessions/by-slug/{sid}"),
+                Some(key),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert!(st.is_allowed(&sid), "wrong-namespace delete is a no-op");
+
+        // Delete by slug; the session is gone from both namespaces.
+        let res = router
+            .clone()
+            .oneshot(api_req(
+                "DELETE",
+                "/api/sessions/by-slug/pretty",
+                Some(key),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert!(!st.is_allowed(&sid), "removed session may not push");
+        let res = router
+            .clone()
+            .oneshot(api_req(
+                "DELETE",
+                "/api/sessions/by-slug/pretty",
+                Some(key),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "second delete: gone");
+
+        // Re-add un-aliased; delete by id.
+        let res = router
+            .clone()
+            .oneshot(api_req(
+                "POST",
+                "/api/sessions",
+                Some(key),
+                Some(&format!(r#"{{"id":"{sid}"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let res = router
+            .clone()
+            .oneshot(api_req(
+                "DELETE",
+                &format!("/api/sessions/by-id/{sid}"),
+                Some(key),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    }
+
+    // Domain separation end to end: a key whose SESSION id is a registered
+    // session must still be rejected by the API (its API id differs).
+    #[tokio::test]
+    async fn api_rejects_session_domain_keys() {
+        let key = "double-duty-secret";
+        let st = HubState::new(AllowConfig::default(), String::new())
+            .with_api_allowed([proto::api_id("someone-else")]);
+        st.add_session(&session_id(key), None).unwrap();
+        let router = app(st);
+        let res = router
+            .oneshot(api_req("GET", "/api/sessions", Some(key), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::FORBIDDEN,
+            "a session key must never authorize the management API"
+        );
     }
 }
