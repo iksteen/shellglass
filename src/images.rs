@@ -14,12 +14,17 @@
 //!
 //! Handled: iTerm2 OSC 1337 `File` — single-shot or multipart
 //! (`MultipartFile`/`FilePart`/`FileEnd`); kitty `_G` in
-//! PNG (`f=100`) or raw RGB/RGBA (`f=24`/`f=32`, re-encoded to PNG) over any of the
-//! direct (`t=d`), file (`t=f`/`t=t`), or shared-memory (`t=s`) transmission
-//! mediums; and sixel DCS (`ESC P … q … ST`, decoded to RGBA and re-encoded to
-//! PNG). For the file/shm mediums the payload is a path/name, so we read the same
-//! bytes the real terminal reads — read-only, since the terminal keeps rendering
-//! locally and owns any cleanup, so we never race its delete.
+//! PNG (`f=100`) or raw RGB/RGBA (`f=24`/`f=32`, re-encoded to PNG) over the
+//! DIRECT (`t=d`) transmission medium only; and sixel DCS (`ESC P … q … ST`,
+//! decoded to RGBA and re-encoded to PNG).
+//!
+//! The kitty file (`t=f`/`t=t`) and shared-memory (`t=s`) mediums carry a
+//! filesystem path / shm name in the payload — and this stream is UNTRUSTED. We
+//! deliberately DO NOT read them: an injected control sequence (a hostile MOTD,
+//! tainted tarball, booby-trapped README) would otherwise exfiltrate any file the
+//! broadcaster can read to every viewer. The local terminal still renders those
+//! natively; the mirror recovers them because detect-mode clients fall back to
+//! direct transmission when we decline the medium (see the tee in `pty.rs`).
 
 use base64::Engine;
 use base64::engine::DecodePaddingMode;
@@ -224,18 +229,18 @@ enum KittyFmt {
     Unsupported,
 }
 
-/// How the transmitted bytes reach us — the kitty `t` key. For the indirect
-/// mediums the base64 payload is a *reference* (path / shm name), not the image,
-/// so we read the referenced bytes ourselves — the same bytes the real terminal
-/// reads. Read-only: the terminal keeps rendering locally and owns any cleanup, so
-/// we never race its delete.
+/// How the transmitted bytes reach us — the kitty `t` key. Only [`Direct`] is
+/// honored; the indirect mediums name a filesystem path / shm object we refuse to
+/// open (untrusted stream ⇒ arbitrary-file exfiltration). They are still
+/// classified so the tee can recognize and reject them (see `pty.rs`).
+///
+/// [`Direct`]: KittyMedium::Direct
 enum KittyMedium {
     /// `t=d` (or absent): the payload is the base64 image itself.
     Direct,
-    /// `t=f`/`t=t`: the payload is a base64 filesystem path (`t=t` also asks the
-    /// terminal to delete after reading; we leave that to the real terminal).
+    /// `t=f`/`t=t`: the payload is a base64 filesystem path. NEVER read.
     File,
-    /// `t=s`: the payload is a base64 POSIX shared-memory object name.
+    /// `t=s`: the payload is a base64 POSIX shared-memory object name. NEVER read.
     Shm,
     /// Unknown transmission medium — drop.
     Unsupported,
@@ -543,27 +548,27 @@ impl Interceptor {
             return None; // wait for the rest
         }
         // Last chunk — flush. A non-display action ends here: consumed, never
-        // rendered (and its file/shm reference never read — a capability query
-        // must not touch the filesystem). Mirror fidelity: the local kitty drew
-        // nothing for it either.
+        // rendered. Mirror fidelity: the local kitty drew nothing for it either.
         let acc = self.kitty.take()?;
+        // SECURITY: the file/shm mediums carry a filesystem path / shm name in the
+        // payload, and this stream is UNTRUSTED (an injected control sequence — a
+        // malicious MOTD, a tainted tarball, a booby-trapped README). Reading it
+        // would hand any file the broadcaster can read to every viewer: the raw
+        // framebuffer path (`f=24`/`f=32`) needs no image header, so arbitrary file
+        // bytes become pixels, and `S`/`O` pages a large file across sequences. We
+        // never open a path from stream content. The local terminal still renders
+        // these natively (its own read of its own files); commit 2 makes detect-mode
+        // clients fall back to direct so the mirror recovers the image in-band.
         if !acc.display
             || acc.over
             || matches!(acc.fmt, KittyFmt::Unsupported)
-            || matches!(acc.medium, KittyMedium::Unsupported)
+            || !matches!(acc.medium, KittyMedium::Direct)
         {
             return None;
         }
-        // The base64 payload is either the image itself (direct) or a reference
-        // (path / shm name) we resolve to the same bytes the real terminal reads.
-        let decoded = B64.decode(acc.payload.trim()).ok()?;
-        let mut bytes = match acc.medium {
-            KittyMedium::Direct => decoded,
-            KittyMedium::File => read_capped(std::str::from_utf8(&decoded).ok()?)?,
-            KittyMedium::Shm => read_capped(&shm_path(std::str::from_utf8(&decoded).ok()?))?,
-            KittyMedium::Unsupported => return None,
-        };
-        // `S`/`O`: the transmitted data may be a window into the file/shm object.
+        // Direct: the base64 payload is the image itself.
+        let mut bytes = B64.decode(acc.payload.trim()).ok()?;
+        // `S`/`O`: the transmitted data may be a window into the payload.
         if let Some(sz) = acc.size {
             bytes = bytes.get(acc.offset..acc.offset.checked_add(sz)?)?.to_vec();
         }
@@ -607,50 +612,6 @@ impl Interceptor {
             KittyFmt::Unsupported => None,
         }
     }
-}
-
-/// Read a file referenced by a kitty file/shm transmission, capped so a stray or
-/// hostile reference can't pull an unbounded blob into memory and onto the wire.
-/// The format sniff downstream (`sniff_mime`) then drops anything that isn't an
-/// image, so only genuine image files ever reach a viewer.
-// ponytail: no path allowlist — we read whatever the app referenced, matching the
-// terminal we mirror; the size cap + mime sniff are the backstop. Revisit if
-// broadcasting to a hub makes arbitrary-file reads a concern worth restricting.
-fn read_capped(path: &str) -> Option<Vec<u8>> {
-    use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-    // O_NONBLOCK: opening a FIFO for reading otherwise blocks until a writer
-    // appears — wedging the screen thread and freezing the whole mirror. Regular
-    // files ignore the flag entirely.
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-        .ok()?;
-    // fstat the open handle (not the path — no swap race) and require a regular
-    // file: rejects FIFOs, devices, and kernel pseudo-files outright.
-    if !file.metadata().ok()?.is_file() {
-        return None;
-    }
-    // Cap the read itself rather than trusting a pre-read size check — a file
-    // that grows after the check would otherwise pull an unbounded blob into
-    // memory and onto the wire. One extra byte distinguishes exactly-at-cap
-    // from over.
-    let mut bytes = Vec::new();
-    file.take(MAX_IMAGE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() as u64 > MAX_IMAGE_BYTES {
-        return None;
-    }
-    Some(bytes)
-}
-
-/// Map a POSIX shared-memory object name (kitty `t=s`) to its Linux `/dev/shm`
-/// path. A leading `/` is part of the shm namespace, not a real path component.
-// ponytail: Linux `/dev/shm`; use `shm_open` if a non-Linux Unix ever needs this.
-fn shm_path(name: &str) -> String {
-    format!("/dev/shm/{}", name.strip_prefix('/').unwrap_or(name))
 }
 
 /// Inflate a zlib stream (kitty `o=z` payloads).
@@ -1155,28 +1116,10 @@ mod tests {
     }
 
     #[test]
-    fn kitty_file_transport_reads_the_referenced_png() {
-        // t=f: the payload is a base64 path; we read that PNG file (the same bytes
-        // the real terminal reads) and forward it like a direct image. The path is
-        // base64'd *without* padding, exactly as `kitten icat` emits it — the decode
-        // must tolerate that (the stock STANDARD engine would reject it).
-        let path = std::env::temp_dir().join("sg_icat_file_test.png");
-        std::fs::write(&path, B64.decode(png_b64()).unwrap()).unwrap();
-        let b64path = B64.encode(path.to_str().unwrap().as_bytes());
-        let unpadded = b64path.trim_end_matches('=');
+    fn kitty_unknown_and_indirect_mediums_dropped() {
         let mut it = Interceptor::new();
-        let s = format!("\x1b_Ga=T,f=100,t=f;{unpadded}\x1b\\");
-        let imgs = only_images(it.feed(s.as_bytes()));
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(imgs.len(), 1);
-        assert_eq!(imgs[0].mime, "image/png");
-        assert_eq!(imgs[0].px, Some((1, 1))); // png_b64 is 1x1
-    }
-
-    #[test]
-    fn kitty_missing_file_and_unknown_medium_dropped() {
-        let mut it = Interceptor::new();
-        // t=f pointing at a nonexistent path → nothing to show.
+        // File transport is refused wholesale (never read) — see
+        // file_and_shm_mediums_never_read_the_filesystem for the security intent.
         let noent = B64.encode(b"/nonexistent/sg/does-not-exist.png");
         let s = format!("\x1b_Ga=T,f=100,t=f;{noent}\x1b\\");
         assert!(only_images(it.feed(s.as_bytes())).is_empty());
@@ -1355,30 +1298,25 @@ mod tests {
     }
 
     #[test]
-    fn read_capped_rejects_non_regular_files_without_blocking() {
-        // A kitty t=f reference to a FIFO used to block std::fs::read forever
-        // (screen thread wedged, mirror frozen). The O_NONBLOCK open + is_file
-        // check must reject it immediately.
-        let path = std::env::temp_dir().join("sg_read_capped_fifo_test");
-        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    fn file_and_shm_mediums_never_read_the_filesystem() {
+        // SECURITY: an injected kitty file/shm transmission must NOT read the
+        // referenced path — that was an arbitrary-file exfiltration vector (raw
+        // framebuffer needs no image header, so any file's bytes become pixels).
+        // Point one at a real, readable file with recognizable content and assert
+        // nothing is extracted: the mirror never opens a path from the stream.
+        let path = std::env::temp_dir().join("sg_exfil_probe_test");
+        std::fs::write(&path, vec![0x41u8; 2 * 2 * 3]).unwrap(); // 2x2 RGB of 'A's
+        let p64 = B64.encode(path.to_str().unwrap());
+        for medium in ["f", "t", "s"] {
+            let mut it = Interceptor::new();
+            let seq = format!("\x1b_Ga=T,f=24,t={medium},s=2,v=2;{p64}\x1b\\");
+            let segs = it.feed(seq.as_bytes());
+            assert!(
+                only_images(segs).is_empty(),
+                "t={medium} must produce no image (no file read)"
+            );
+        }
         let _ = std::fs::remove_file(&path);
-        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
-        let got = read_capped(path.to_str().unwrap());
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(got, None, "FIFO must be rejected, not read");
-        // Device files are equally not images.
-        assert_eq!(read_capped("/dev/null"), None);
-    }
-
-    #[test]
-    fn read_capped_caps_the_read_itself() {
-        // The cap must hold even if the file grows between any check and the
-        // read — so it's enforced on the bytes actually read.
-        let path = std::env::temp_dir().join("sg_read_capped_size_test");
-        std::fs::write(&path, vec![0u8; (16 << 20) + 1]).unwrap();
-        let got = read_capped(path.to_str().unwrap());
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(got, None, "over-cap file must be rejected");
     }
 
     #[test]
