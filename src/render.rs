@@ -5,7 +5,7 @@
 
 // The Config/Resolver-consuming assembly is mirror-side (serve/push build the
 // page + render config from local state); the hub only uses the baked assets,
-// `page`, `sse_script` and `banner` on client-pushed strings.
+// `page` and `sse_script` on client-pushed strings.
 #[cfg(feature = "mirror")]
 use crate::config::Config;
 use crate::fonts::FontFile;
@@ -214,18 +214,6 @@ pub fn render_page(template: &str, font_css: &str, config: &Config, cfg_json: &s
         template,
         &head_css(font_css, config),
         &sse_script("events", cfg_json),
-    )
-}
-
-/// Red in-page error banner (shared by every mode's failure path).
-pub fn banner(msg: &str) -> String {
-    let esc = msg
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
-    format!(
-        "<div style=\"color:#ff6b6b;font-family:monospace;padding:8px;\">\
-         shellglass: {esc}</div>"
     )
 }
 

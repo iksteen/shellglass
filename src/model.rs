@@ -187,14 +187,20 @@ pub struct Grid {
     pub image_data: std::collections::HashMap<String, ImageBlob>,
 }
 
-/// What a backend publishes on the frame channel: a live screen snapshot, or an
-/// error banner to show in place of the screen. The client streams its wire-encoded
-/// deltas to the hub; the standalone server and hub both keep the current `Frame`
-/// in a [`crate::diff::Live`].
+/// What a backend publishes on the frame channel: a live screen snapshot. The
+/// client streams its wire-encoded deltas to the hub; the standalone server and
+/// hub both keep the current `Frame` in a [`crate::diff::Live`].
+///
+/// A one-variant enum, deliberately: it once also carried a `Banner(String)`
+/// (an HTML notice shown in place of the screen), removed because the only
+/// producers were the hub's own stub strings — an "offline" indication that the
+/// viewer chrome and the `operator` SSE event already convey, and whose
+/// `innerHTML` render was a needless injection sink. Offline sessions now show
+/// an ordinary blank screen (with a plain-text "waiting…" line, safe as cells).
+/// Kept as an enum so a future non-screen frame has a home.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Frame {
     Screen(Grid),
-    Banner(String),
 }
 
 #[cfg(test)]

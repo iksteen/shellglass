@@ -321,9 +321,7 @@ async fn send_new_blobs(
     frame: &Frame,
     sent: &mut std::collections::HashSet<String>,
 ) -> Result<(), ()> {
-    let Frame::Screen(grid) = frame else {
-        return Ok(());
-    };
+    let Frame::Screen(grid) = frame;
     for (hash, blob) in &grid.image_data {
         if sent.contains(hash) {
             continue;

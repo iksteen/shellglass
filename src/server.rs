@@ -57,18 +57,12 @@ pub fn app(state: AppState) -> Router {
 /// fallback for the sliver between a frame publishing and the feed task
 /// catching up. Content-addressed ⇒ immutable, cache forever.
 async fn image(State(state): State<AppState>, Path(key): Path<String>) -> Response {
-    let entry = state
-        .images
-        .lock()
-        .unwrap()
-        .get(&key)
-        .or_else(|| match &*state.live.frame() {
-            crate::model::Frame::Screen(g) => g
-                .image_data
-                .get(&key)
-                .map(|b| (b.mime.clone(), b.bytes.clone())),
-            crate::model::Frame::Banner(_) => None,
-        });
+    let entry = state.images.lock().unwrap().get(&key).or_else(|| {
+        let crate::model::Frame::Screen(g) = &*state.live.frame();
+        g.image_data
+            .get(&key)
+            .map(|b| (b.mime.clone(), b.bytes.clone()))
+    });
     match entry {
         Some((mime, bytes)) => (
             [

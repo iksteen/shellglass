@@ -138,9 +138,6 @@ function decodeCells(text: TextEntry[], runs?: StyleRun[]): Cell[] {
 export function decodeBlock(block: Block): Cell[] {
   return decodeCells(block[0] ?? [], block[1]);
 }
-interface BannerMsg {
-  b: string;
-}
 // Version hello, first event of every SSE stream: the wire proto and the baked
 // viewer.js content tag. If either differs from what this page booted with, the
 // the server upgraded under us — reload to fetch the matching page + viewer.js
@@ -149,7 +146,7 @@ interface VersionMsg {
   v: number;
   js?: string;
 }
-type Msg = FullMsg | DiffMsg | CellMsg | LineMsg | BannerMsg | VersionMsg;
+type Msg = FullMsg | DiffMsg | CellMsg | LineMsg | VersionMsg;
 
 export interface Cfg {
   defFg: string; // default fg as #rrggbb (for reverse/dim materialization)
@@ -1822,6 +1819,13 @@ export function patchCells(
     }
     for (let dx = 0; dx < patch.cells.length; dx++) {
       const i = patch.l + dx;
+      // Stop at a sane column ceiling. The hub relays a pusher's `l` verbatim
+      // (it clamps its OWN matrix but forwards the original), so an untrusted
+      // wire diff could carry `l` in the hundreds of millions; without this
+      // bound the blank-pad loop below would hang/OOM the tab from a tiny
+      // message. Real terminals are far under MAX_COL — mirrors the hub's own
+      // `if i >= cols { break }` in diff.rs apply_wire.
+      if (i >= MAX_COL) break;
       // Pad a growing row with canonical blanks — bare assignment past the end
       // would leave holes (undefined cells) that renderRow can't iterate.
       while (row.length < i) row.push({ t: " " });
@@ -1831,6 +1835,10 @@ export function patchCells(
   }
   return dirty;
 }
+
+// Hard ceiling on a diff's write column (see patchCells). Far above any real
+// terminal width, so it only ever rejects a malformed/hostile wire message.
+const MAX_COL = 1 << 16;
 
 // Paint is decoupled from apply. A message updates the in-memory `screen` model
 // synchronously (cheap), marks what changed, and schedules one coalesced flush;
@@ -1844,7 +1852,6 @@ export function patchCells(
 let paintScheduled = false;
 const dirtyRows = new Set<number>();
 let rebuildDims: { w: number; h: number; i?: ImageRef[] } | null = null;
-let rebuildBanner: string | null = null;
 
 // Footer stats counters (see startStats): total SSE payload received, and the number
 // of paints actually committed.
@@ -1869,14 +1876,6 @@ function flushPaint(): void {
   paintScheduled = false;
   paints++;
 
-  if (rebuildBanner !== null) {
-    // banner replaces the grid wholesale
-    screenEl.innerHTML = rebuildBanner;
-    rebuildBanner = null;
-    rebuildDims = null;
-    dirtyRows.clear();
-    return;
-  }
   if (rebuildDims) {
     paintFull(rebuildDims);
     rebuildDims = null;
@@ -1930,7 +1929,6 @@ function applyFull(m: FullMsg): void {
   defaultsCss = applyDefaults(m.e);
   setTitle(m.t ?? "");
   rebuildDims = { w: m.w, h: m.h, i: m.i };
-  rebuildBanner = null;
   dirtyRows.clear(); // a full frame supersedes any pending per-row dirt
   schedulePaint();
 }
@@ -2037,6 +2035,19 @@ function paintFull(dims: { w: number; h: number; i?: ImageRef[] }): void {
 // paste targets that half-parse them (LibreOffice). Custom properties mean
 // nothing outside our page, so a pasted image falls back to its natural
 // dimensions: the true bitmap, correct aspect.
+// Escape a string for an HTML double-quoted attribute value. The hub relays a
+// pusher's placement VERBATIM, so `k` (the content address) is untrusted; on an
+// embed page — which runs the built-in template, not the pusher's — an
+// unescaped `k` would be a pusher-driven injection into a third-party host.
+// Escaping rather than shape-validating keeps this format-agnostic: no change to
+// what a content address looks like can reopen the injection.
+export function attrEscape(s: string): string {
+  return String(s).replace(
+    /[&"'<>]/g,
+    (c) => ({ "&": "&amp;", '"': "&quot;", "'": "&#39;", "<": "&lt;", ">": "&gt;" })[c]!,
+  );
+}
+
 function renderImage(im: ImageRef): string {
   const sized = im.w && im.h;
   const vars =
@@ -2044,8 +2055,10 @@ function renderImage(im: ImageRef): string {
     (sized ? `;--sg-w:${im.w};--sg-h:${im.h}` : "");
   // Relative content-addressed URL: resolves under the page directory
   // (subpath-safe) and is immutable, so the browser cache absorbs re-renders
-  // and reconnects. `k` is server-derived 64-hex — attribute-safe by shape.
-  return `<img class="inline-img${sized ? " sized" : ""}" style="${vars}" alt="" src="images/${im.k}">`;
+  // and reconnects. `k` is attr-escaped — untrusted, and a non-address just
+  // 404s harmlessly. Coordinates are numeric (the hub drops any wire message
+  // that fails typed u16/i16 deserialization), so they need no escaping.
+  return `<img class="inline-img${sized ? " sized" : ""}" style="${vars}" alt="" src="images/${attrEscape(im.k)}">`;
 }
 
 function decodeRow([r, l, text, style]: WireRow): { r: number; l: number; cells: Cell[] } {
@@ -2090,16 +2103,8 @@ function applyLine(m: LineMsg): void {
   applyPatches(m.p, m.q, [decodeRow(m.l)]);
 }
 
-function applyBanner(m: BannerMsg): void {
-  screen = { cells: [], cur: null, sty: 0, links: {}, rowEls: [] };
-  rebuildBanner = m.b;
-  rebuildDims = null;
-  dirtyRows.clear();
-  schedulePaint();
-}
-
 // Tag-free dispatch on which payload key is present. `c` (cell) MUST come first —
-// its flattened style letters (b/d/w) would otherwise read as banner/full/wide.
+// its flattened style letters (d/w) would otherwise read as full/wide.
 // A message with only `p` is a cursor-only diff.
 export function apply(m: Msg): void {
   if ("v" in m) {
@@ -2111,7 +2116,6 @@ export function apply(m: Msg): void {
   if ("c" in m) applyCell(m);
   else if ("l" in m) applyLine(m);
   else if ("d" in m) applyFull(m);
-  else if ("b" in m) applyBanner(m);
   else applyDiff(m); // { r?, p? } — includes cursor-only { p }
 }
 

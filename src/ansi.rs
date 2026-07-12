@@ -14,10 +14,8 @@ use std::fmt::Write;
 /// ANSI bytes bringing a `view.0`×`view.1` (cols×rows) client terminal from `prev`
 /// (`None` = unknown → full repaint) to `next`.
 pub fn paint(prev: Option<&Frame>, next: &Frame, view: (u16, u16)) -> String {
-    match next {
-        Frame::Banner(html) => paint_banner(html, view),
-        Frame::Screen(g) => paint_screen(prev_screen(prev, g), g, view),
-    }
+    let Frame::Screen(g) = next;
+    paint_screen(prev_screen(prev, g), g, view)
 }
 
 /// The previous grid iff it can serve as a diff base: same kind and same dimensions.
@@ -152,33 +150,6 @@ fn cursor_seq(out: &mut String, g: &Grid, view: (u16, u16), content_rows: usize)
         }
         _ => out.push_str("\x1b[?25l"),
     }
-}
-
-/// Banner frame (waiting / error): strip the HTML to text and paint it red at 1,1.
-/// Always a full repaint — banners are rare, no diffing worth doing (ponytail).
-fn paint_banner(html: &str, view: (u16, u16)) -> String {
-    let text = strip_html(html);
-    let text: String = text.chars().take(usize::from(view.0)).collect();
-    format!("\x1b[2J\x1b[H\x1b[0;31m{text}\x1b[0m\x1b[?25l")
-}
-
-/// ponytail: not a real HTML-to-text pass — drops `<…>` tags and unescapes the three
-/// entities `render::banner` emits. That's the only shape it ever sees.
-fn strip_html(html: &str) -> String {
-    let mut out = String::new();
-    let mut in_tag = false;
-    for ch in html.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(ch),
-            _ => {}
-        }
-    }
-    // Unescape &amp; LAST so "&amp;lt;" → "&lt;", not "<".
-    out.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
 }
 
 /// The SGR-relevant styling of a cell (`wide` is layout, not styling).
@@ -422,9 +393,7 @@ mod tests {
     #[test]
     fn cursor_shown_iff_visible_and_inside_crop() {
         let mut f = screen(&["abcd", "efgh", "ijkl"], 4);
-        let Frame::Screen(g) = &mut f else {
-            unreachable!()
-        };
+        let Frame::Screen(g) = &mut f;
         // Cursor at (2,0) is below the single visible content row of a 3x2 view.
         g.cursor = Some((2, 0));
         let out = paint(None, &f, (3, 2));
@@ -433,26 +402,12 @@ mod tests {
             "hidden below crop: {out:?}"
         );
         // Cursor at (0,1) is inside → shown at 1;2.
-        let Frame::Screen(g) = &mut f else {
-            unreachable!()
-        };
+        let Frame::Screen(g) = &mut f;
         g.cursor = Some((0, 1));
         let out = paint(None, &f, (3, 2));
         assert!(
             out.contains("\x1b[1;2H\x1b[?25h"),
             "shown inside crop: {out:?}"
         );
-    }
-
-    #[test]
-    fn banner_paint_strips_html_and_unescapes() {
-        let html = crate::render::banner("a < b & c");
-        let out = paint(None, &Frame::Banner(html), (80, 24));
-        assert!(
-            out.contains("shellglass: a < b & c"),
-            "tags stripped, entities decoded: {out:?}"
-        );
-        assert!(!out.contains("<div"), "no stray markup: {out:?}");
-        assert!(out.contains("\x1b[0;31m"), "painted red: {out:?}");
     }
 }

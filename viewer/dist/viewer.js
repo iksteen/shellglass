@@ -1233,6 +1233,8 @@ export function patchCells(state, dp) {
         }
         for (let dx = 0; dx < patch.cells.length; dx++) {
             const i = patch.l + dx;
+            if (i >= MAX_COL)
+                break;
             while (row.length < i)
                 row.push({ t: " " });
             row[i] = patch.cells[dx];
@@ -1241,10 +1243,10 @@ export function patchCells(state, dp) {
     }
     return dirty;
 }
+const MAX_COL = 1 << 16;
 let paintScheduled = false;
 const dirtyRows = new Set();
 let rebuildDims = null;
-let rebuildBanner = null;
 let bytesIn = 0;
 let paints = 0;
 const clock = () => (typeof performance !== "undefined" ? performance.now() : 0);
@@ -1257,13 +1259,6 @@ function schedulePaint() {
 function flushPaint() {
     paintScheduled = false;
     paints++;
-    if (rebuildBanner !== null) {
-        screenEl.innerHTML = rebuildBanner;
-        rebuildBanner = null;
-        rebuildDims = null;
-        dirtyRows.clear();
-        return;
-    }
     if (rebuildDims) {
         paintFull(rebuildDims);
         rebuildDims = null;
@@ -1307,7 +1302,6 @@ function applyFull(m) {
     defaultsCss = applyDefaults(m.e);
     setTitle(m.t ?? "");
     rebuildDims = { w: m.w, h: m.h, i: m.i };
-    rebuildBanner = null;
     dirtyRows.clear();
     schedulePaint();
 }
@@ -1368,11 +1362,14 @@ function paintFull(dims) {
         o.el.naturalWidth > 0 &&
         screenImages.some((n) => !n.el.complete && refsOverlap(o.ref, n.ref)));
 }
+export function attrEscape(s) {
+    return String(s).replace(/[&"'<>]/g, (c) => ({ "&": "&amp;", '"': "&quot;", "'": "&#39;", "<": "&lt;", ">": "&gt;" })[c]);
+}
 function renderImage(im) {
     const sized = im.w && im.h;
     const vars = `--sg-c:${im.c};--sg-r:${im.r}` +
         (sized ? `;--sg-w:${im.w};--sg-h:${im.h}` : "");
-    return `<img class="inline-img${sized ? " sized" : ""}" style="${vars}" alt="" src="images/${im.k}">`;
+    return `<img class="inline-img${sized ? " sized" : ""}" style="${vars}" alt="" src="images/${attrEscape(im.k)}">`;
 }
 function decodeRow([r, l, text, style]) {
     if (typeof text === "string") {
@@ -1408,13 +1405,6 @@ function applyCell(m) {
 function applyLine(m) {
     applyPatches(m.p, m.q, [decodeRow(m.l)]);
 }
-function applyBanner(m) {
-    screen = { cells: [], cur: null, sty: 0, links: {}, rowEls: [] };
-    rebuildBanner = m.b;
-    rebuildDims = null;
-    dirtyRows.clear();
-    schedulePaint();
-}
 export function apply(m) {
     if ("v" in m) {
         const wireChanged = proto !== undefined && m.v !== proto;
@@ -1429,8 +1419,6 @@ export function apply(m) {
         applyLine(m);
     else if ("d" in m)
         applyFull(m);
-    else if ("b" in m)
-        applyBanner(m);
     else
         applyDiff(m);
 }

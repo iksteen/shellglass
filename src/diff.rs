@@ -11,7 +11,7 @@
 //! There is **no `"t"` tag**: every message type owns one payload key, and the
 //! decoder dispatches on which is present. `c` must be tested FIRST — the
 //! single-cell form flattens its style letters (`f,g,b,d,i,u,n,w`) into the
-//! envelope, so `b`/`d`/`w` there must not be read as banner/full/width.
+//! envelope, so `d`/`w` there must not be read as full/width.
 //!
 //! - `{"d":[block,…], w, h, p?}` — a full snapshot (sent to each viewer on
 //!   connect, and whenever the screen size changes). `p` = cursor; absent = hidden.
@@ -24,7 +24,6 @@
 //!   (spinner ticks, typing echo, appended log lines) take this form.
 //! - `{"l":[row, left, text, style?], p?}` — a single changed line that isn't
 //!   uniform (mixed styles, blanks-as-0, or cluster cells).
-//! - `{"b": html}` — an error banner.
 //! - `{"v": proto, js}` — version hello, first event of every SSE stream: the
 //!   wire proto and the baked viewer.js content tag. A page that mismatches on
 //!   either reloads itself (see [`PROTO`]).
@@ -175,7 +174,7 @@ impl Live {
 
     /// Publish an already-encoded wire message (hub path): apply it to the stored
     /// frame and forward the received bytes verbatim — no re-diff, no re-encode.
-    /// Malformed or out-of-sync messages (a diff while the state is a banner) are
+    /// Malformed messages (unparseable, or a row payload that can't decode) are
     /// dropped so viewers never receive something they can't apply.
     pub fn publish_wire(&self, msg: &str) {
         // Parse outside the writer lock; only apply+commit are serialized.
@@ -374,32 +373,24 @@ impl ImageStore {
 /// Encode the delta from `cur` to `next`, or `None` if nothing viewers see changed.
 /// Also used by the push client to stream the same deltas to the hub.
 pub fn encode_delta(cur: &Frame, next: &Frame) -> Option<Arc<str>> {
-    let msg = match (cur, next) {
-        (Frame::Banner(old), Frame::Banner(new)) if old == new => return None,
-        (_, Frame::Banner(html)) => banner_message(html),
-        // An image add/remove/move rides only in the full frame, so any change to
-        // the image set forces a full (cheap: images are rare and the set is
-        // usually empty ⇒ this compares two empty vecs). Same for the OSC 10/11
-        // default-color overrides (`e`, likewise full-frame-only and rare).
-        (Frame::Screen(a), Frame::Screen(b))
-            if same_layout(a, b)
-                && a.images == b.images
-                && a.default_colors == b.default_colors =>
-        {
-            diff_message(a, b)?
-        }
-        (_, Frame::Screen(b)) => full_message_grid(b),
+    let (Frame::Screen(a), Frame::Screen(b)) = (cur, next);
+    // An image add/remove/move rides only in the full frame, so any change to
+    // the image set forces a full (cheap: images are rare and the set is
+    // usually empty ⇒ this compares two empty vecs). Same for the OSC 10/11
+    // default-color overrides (`e`, likewise full-frame-only and rare).
+    let msg = if same_layout(a, b) && a.images == b.images && a.default_colors == b.default_colors {
+        diff_message(a, b)?
+    } else {
+        full_message_grid(b)
     };
     Some(Arc::from(msg))
 }
 
-/// The full-snapshot message for a frame (banner frames snapshot as a banner).
-/// Also used by the push client on each (re)connect to seed the hub's matrix.
+/// The full-snapshot message for a frame. Also used by the push client on each
+/// (re)connect to seed the hub's matrix.
 pub fn full_message(frame: &Frame) -> String {
-    match frame {
-        Frame::Screen(g) => full_message_grid(g),
-        Frame::Banner(html) => banner_message(html),
-    }
+    let Frame::Screen(g) = frame;
+    full_message_grid(g)
 }
 
 /// Same screen size ⇒ a diff is applicable; a resize forces a full frame. Compares
@@ -467,9 +458,6 @@ enum WireMsg<'a> {
         cur: Option<Option<(u16, u16)>>,
         sty: Option<u8>,
         r: WireRow<'a>,
-    },
-    Banner {
-        html: &'a str,
     },
 }
 
@@ -554,9 +542,6 @@ impl Serialize for WireMsg<'_> {
                 if let Some(sty) = sty {
                     m.serialize_entry("q", sty)?;
                 }
-            }
-            WireMsg::Banner { html } => {
-                m.serialize_entry("b", html)?;
             }
         }
         m.end()
@@ -922,10 +907,6 @@ fn full_message_grid(g: &Grid) -> String {
     serde_json::to_string(&msg).expect("full wire message serializes")
 }
 
-fn banner_message(html: &str) -> String {
-    serde_json::to_string(&WireMsg::Banner { html }).expect("banner wire message serializes")
-}
-
 /// Per-line diff between two same-size grids. `None` if nothing (cells or cursor)
 /// changed. Single-row diffs get their own compact tags (`c` / `l`).
 fn diff_message(a: &Grid, b: &Grid) -> Option<String> {
@@ -1090,9 +1071,6 @@ enum WireMsgIn {
         sty: Option<u8>,
         r: WireRowIn,
     },
-    Banner {
-        html: String,
-    },
 }
 
 /// Deserialize a value out of an already-parsed `Value`, mapping serde_json's error
@@ -1110,7 +1088,7 @@ impl<'de> Deserialize<'de> for WireMsgIn {
             .ok_or_else(|| de::Error::custom("wire message must be a JSON object"))?;
         // Tag-free dispatch: each type owns one payload key. `c` FIRST — the
         // single-cell form flattens its style (f,g,b,d,i,u,n,w) into the envelope,
-        // so those letters must never reach the banner/full/width branches.
+        // so those letters must never reach the full/width branches.
         //
         // Cursor `p` is tri-state on diffs: absent = unchanged, null = hidden.
         let tri = || -> Result<Option<Option<(u16, u16)>>, D::Error> {
@@ -1194,9 +1172,6 @@ impl<'de> Deserialize<'de> for WireMsgIn {
                     None => Vec::new(),
                 },
             });
-        }
-        if let Some(b) = obj.get("b") {
-            return Ok(WireMsgIn::Banner { html: from_val(b)? });
         }
         if obj.get("p").is_some() || obj.get("q").is_some() || obj.get("t").is_some() {
             // Cursor/title-only change: no row payload, just the tri-state
@@ -1516,8 +1491,8 @@ fn decode_block(block: CellBlockIn) -> Vec<StyledCell> {
 
 /// Apply a decoded wire message to the previous frame, yielding the new one — the
 /// state transition `viewer.ts` performs, mirrored so the hub's matrix stays in
-/// lockstep with every browser. `None` = drop the message (a diff arriving while
-/// the state is a banner is a desync; forwarding it would corrupt viewers too).
+/// lockstep with every browser. `None` = drop the message (a diff whose row
+/// payload can't decode is a desync; forwarding it would corrupt viewers too).
 fn apply_wire(prev: &Frame, msg: WireMsgIn) -> Option<Frame> {
     // Normalize the three diff shapes into (cursor, style, title, links, rows).
     let (cur, sty, title, links, rows) = match msg {
@@ -1545,7 +1520,6 @@ fn apply_wire(prev: &Frame, msg: WireMsgIn) -> Option<Frame> {
                 image_data: std::collections::HashMap::new(),
             }));
         }
-        WireMsgIn::Banner { html } => return Some(Frame::Banner(html)),
         WireMsgIn::Diff {
             cur,
             sty,
@@ -1575,9 +1549,7 @@ fn apply_wire(prev: &Frame, msg: WireMsgIn) -> Option<Frame> {
             (cur, sty, None, std::collections::BTreeMap::new(), vec![r])
         }
     };
-    let Frame::Screen(grid) = prev else {
-        return None; // a diff can't apply to a banner — drop it
-    };
+    let Frame::Screen(grid) = prev;
     let mut grid = grid.clone();
     // A row is never wider than the screen. Clamp the write column to `cols` so a
     // malformed/malicious diff can't drive the blank-padding growth below into a
@@ -1919,9 +1891,7 @@ mod tests {
         b.cursor = Some((1, 1));
         let msg = diff_message(&a, &b).unwrap();
         assert!(!msg.contains("\"p\":"), "unchanged cursor omitted: {msg}");
-        let Frame::Screen(g) = apply(&Frame::Screen(a), &msg).unwrap() else {
-            panic!("screen")
-        };
+        let Frame::Screen(g) = apply(&Frame::Screen(a), &msg).unwrap();
         assert_eq!(g.cursor, Some((1, 1)), "hub keeps the cursor when absent");
         // Becoming hidden is an explicit null, applied as None.
         let mut h = b.clone();
@@ -1929,9 +1899,7 @@ mod tests {
         h.rows[0][0].text = "q".into();
         let msg2 = diff_message(&b, &h).unwrap();
         assert!(msg2.contains("\"p\":null"), "hide is explicit null: {msg2}");
-        let Frame::Screen(g2) = apply(&Frame::Screen(b), &msg2).unwrap() else {
-            panic!("screen")
-        };
+        let Frame::Screen(g2) = apply(&Frame::Screen(b), &msg2).unwrap();
         assert_eq!(g2.cursor, None);
     }
 
@@ -2026,9 +1994,7 @@ mod tests {
         );
         // And it round-trips through the hub-side decoder intact.
         let applied = apply(&Frame::Screen(a), &msg).unwrap();
-        let Frame::Screen(g) = applied else {
-            panic!("screen")
-        };
+        let Frame::Screen(g) = applied;
         assert_eq!(g.rows[0][0].text, "e\u{0301}");
     }
 
@@ -2060,7 +2026,7 @@ mod tests {
     }
 
     #[test]
-    fn full_and_banner_messages_have_expected_shape() {
+    fn full_message_has_expected_shape() {
         let g = grid(&["hi"]);
         let full = full_message_grid(&g);
         assert!(full.starts_with("{\"d\":"), "{full}");
@@ -2068,8 +2034,6 @@ mod tests {
         assert!(full.contains(r#""d":[[["hi"]]]"#), "{full}");
         // Hidden cursor is omitted entirely, not "p":null.
         assert!(!full.contains("\"p\":"), "hidden cursor omitted: {full}");
-        let banner = banner_message("oops");
-        assert_eq!(banner, "{\"b\":\"oops\"}");
     }
 
     #[test]
@@ -2101,7 +2065,7 @@ mod tests {
         assert!(full.contains(r#"{"s":1}"#), "{full}");
 
         // Round trip through the hub's decode path.
-        let prev = Frame::Banner("x".into());
+        let prev = Frame::Screen(grid(&[]));
         let Some(Frame::Screen(out)) = apply(&prev, &full) else {
             panic!("full applies")
         };
@@ -2131,7 +2095,7 @@ mod tests {
             "the concealed glyph still rides: {full}"
         );
 
-        let prev = Frame::Banner("x".into());
+        let prev = Frame::Screen(grid(&[]));
         let Some(Frame::Screen(out)) = apply(&prev, &full) else {
             panic!("full applies")
         };
@@ -2148,7 +2112,7 @@ mod tests {
         let full = full_message_grid(&g);
         assert!(full.contains(r#"{"x":1}"#), "{full}");
 
-        let prev = Frame::Banner("x".into());
+        let prev = Frame::Screen(grid(&[]));
         let Some(Frame::Screen(out)) = apply(&prev, &full) else {
             panic!("full applies")
         };
@@ -2180,7 +2144,7 @@ mod tests {
         // Fulls carry it absolutely; default is omitted.
         assert!(full_message_grid(&b).contains(r#""q":5"#));
         assert!(!full_message_grid(&a).contains(r#""q""#));
-        let prev = Frame::Banner("x".into());
+        let prev = Frame::Screen(grid(&[]));
         let Some(Frame::Screen(g)) = apply(&prev, &full_message_grid(&b)) else {
             panic!("full applies")
         };
@@ -2270,7 +2234,7 @@ mod tests {
             "{full}"
         );
 
-        let prev = Frame::Banner("x".into());
+        let prev = Frame::Screen(grid(&[]));
         let Some(Frame::Screen(g)) = apply(&prev, &full) else {
             panic!("full applies")
         };
@@ -2313,14 +2277,13 @@ mod tests {
     }
 
     #[test]
-    fn full_frame_when_previous_was_a_banner() {
-        let prev = Frame::Banner("starting".into());
+    fn full_frame_when_layout_changes() {
+        // A row-count/width change (here: empty screen → a real screen) can't
+        // ride a per-line diff, so it forces a full.
+        let prev = Frame::Screen(grid(&[]));
         let next = Frame::Screen(grid(&["ok"]));
-        let msg = encode_delta(&prev, &next).expect("banner → screen is a change");
-        assert!(
-            msg.starts_with("{\"d\":"),
-            "screen after banner is full: {msg}"
-        );
+        let msg = encode_delta(&prev, &next).expect("layout change is a change");
+        assert!(msg.starts_with("{\"d\":"), "layout change is full: {msg}");
     }
 
     // ── decode/apply round trips (hub matrix must mirror every viewer) ────────
@@ -2358,7 +2321,7 @@ mod tests {
             rows: Some(1),
             hash: "ab".repeat(32),
         });
-        let prev = Frame::Banner("x".into());
+        let prev = Frame::Screen(grid(&[]));
         let full = encode_delta(&prev, &Frame::Screen(g.clone())).expect("banner → screen is full");
         let Some(Frame::Screen(out)) = apply(&prev, &full) else {
             panic!("full applies")
@@ -2401,7 +2364,7 @@ mod tests {
         g.rows[0][2].bold = true;
         g.rows[1].push(StyledCell::default()); // trailing blank rides as 0
         g.cursor = Some((1, 2));
-        let prev = Frame::Banner("old".into());
+        let prev = Frame::Screen(grid(&[]));
         let applied = apply(&prev, &full_message_grid(&g)).expect("full applies");
         assert_eq!(applied, Frame::Screen(g));
     }
@@ -2419,9 +2382,7 @@ mod tests {
         b.cursor = Some((1, 10));
         let msg = diff_message(&a, &b).expect("changes → diff");
         let applied = apply(&Frame::Screen(a), &msg).expect("diff applies");
-        let Frame::Screen(applied) = applied else {
-            panic!("diff yields a screen")
-        };
+        let Frame::Screen(applied) = applied;
         assert_grid_equiv(&applied, &b);
     }
 
@@ -2433,26 +2394,13 @@ mod tests {
         let mut b = grid(&["log"]);
         b.cols = a.cols;
         let msg = diff_message(&a, &b).expect("shrink → diff");
-        let Frame::Screen(applied) = apply(&Frame::Screen(a), &msg).unwrap() else {
-            panic!("screen")
-        };
+        let Frame::Screen(applied) = apply(&Frame::Screen(a), &msg).unwrap();
         assert_grid_equiv(&applied, &b);
     }
 
     #[test]
-    fn diff_on_banner_is_dropped() {
-        let a = grid(&["abc"]);
-        let b = grid(&["abX"]);
-        let msg = diff_message(&a, &b).unwrap();
-        assert!(
-            apply(&Frame::Banner("waiting".into()), &msg).is_none(),
-            "a diff can't apply to a banner — must be dropped, not forwarded"
-        );
-    }
-
-    #[test]
     fn publish_wire_updates_current_and_forwards_verbatim() {
-        let live = Live::new(Arc::new(Frame::Banner("waiting".into())));
+        let live = Live::new(Arc::new(Frame::Screen(grid(&[]))));
         let mut rx = live.diffs.subscribe();
 
         let g = grid(&["hi"]);
@@ -2478,13 +2426,9 @@ mod tests {
         let (seq, fwd) = rx.try_recv().expect("diff forwarded");
         assert_eq!((seq, &*fwd), (2, dmsg.as_str()));
 
-        // Garbage and out-of-sync messages are dropped, not forwarded.
+        // Garbage (unparseable) messages are dropped, not forwarded.
         live.publish_wire("not json");
-        let live2 = Live::new(Arc::new(Frame::Banner("waiting".into())));
-        let mut rx2 = live2.diffs.subscribe();
-        live2.publish_wire(&dmsg); // diff while state is a banner
         assert!(rx.try_recv().is_err(), "garbage not forwarded");
-        assert!(rx2.try_recv().is_err(), "diff-on-banner not forwarded");
     }
 
     #[test]

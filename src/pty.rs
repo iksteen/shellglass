@@ -1233,9 +1233,7 @@ mod tests {
         let mut parser = new_parser(24, 80);
         let mut images = place(&mut parser, 4, 2);
         images[0].ready = None; // decode worker still owes the payload
-        let Frame::Screen(g) = &*frame_from(&parser, &mut images, &mut Vec::new()) else {
-            panic!("screen frame")
-        };
+        let Frame::Screen(g) = &*frame_from(&parser, &mut images, &mut Vec::new());
         assert!(g.images.is_empty(), "pending placement not emitted");
         assert!(g.image_data.is_empty(), "no payload to carry");
         assert_eq!(images.len(), 1, "but still tracked (cells live)");
@@ -1248,9 +1246,7 @@ mod tests {
                 bytes: bytes::Bytes::from_static(b"png-ish"),
             },
         ));
-        let Frame::Screen(g) = &*frame_from(&parser, &mut images, &mut Vec::new()) else {
-            panic!("screen frame")
-        };
+        let Frame::Screen(g) = &*frame_from(&parser, &mut images, &mut Vec::new());
         assert_eq!(g.images.len(), 1);
         assert_eq!(g.images[0].hash, "cd".repeat(32));
         assert!(g.image_data.contains_key(&"cd".repeat(32)));
@@ -1295,9 +1291,7 @@ mod tests {
         });
 
         // N's cells are gone, but N keeps showing (zombie) while N+1 pends.
-        let Frame::Screen(g) = &*frame_from(&parser, &mut images, &mut zombies) else {
-            panic!("screen frame")
-        };
+        let Frame::Screen(g) = &*frame_from(&parser, &mut images, &mut zombies);
         assert_eq!(g.images.len(), 1, "the old frame bridges the gap");
         assert_eq!(g.images[0].hash, "aa".repeat(32));
         assert!(
@@ -1313,18 +1307,14 @@ mod tests {
                 bytes: bytes::Bytes::from_static(b"N+1"),
             },
         ));
-        let Frame::Screen(g) = &*frame_from(&parser, &mut images, &mut zombies) else {
-            panic!("screen frame")
-        };
+        let Frame::Screen(g) = &*frame_from(&parser, &mut images, &mut zombies);
         assert_eq!(g.images.len(), 1, "swap complete");
         assert_eq!(g.images[0].hash, "bb".repeat(32));
         assert!(zombies.is_empty(), "zombie released");
 
         // A plain overwrite (no pending successor) vanishes immediately.
         parser.process(b"\x1b[2J");
-        let Frame::Screen(g) = &*frame_from(&parser, &mut images, &mut zombies) else {
-            panic!("screen frame")
-        };
+        let Frame::Screen(g) = &*frame_from(&parser, &mut images, &mut zombies);
         assert!(g.images.is_empty(), "cleared image gone, no zombie");
         assert!(zombies.is_empty());
     }
@@ -1338,30 +1328,22 @@ mod tests {
         parser.process(b"\r\n\r\n"); // cursor to the last row
         // Placing a 2-row image at the bottom scrolls once mid-placement.
         let mut imgs = place(&mut parser, 2, 2);
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new()) else {
-            panic!("screen")
-        };
+        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new());
         assert_eq!((g.images[0].row, g.images[0].col), (1, 0));
 
         // One scroll lifts the image → top row 0.
         parser.process(b"\r\nx");
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new()) else {
-            panic!("screen")
-        };
+        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new());
         assert_eq!(g.images[0].row, 0);
 
         // Another: top row scrolls off → top row -1, image still shown (clipped).
         parser.process(b"\r\ny");
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new()) else {
-            panic!("screen")
-        };
+        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new());
         assert_eq!(g.images[0].row, -1);
 
         // One more: the bottom row is gone too → the image is evicted.
         parser.process(b"\r\nz");
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new()) else {
-            panic!("screen")
-        };
+        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new());
         assert!(g.images.is_empty());
     }
 
@@ -1377,9 +1359,7 @@ mod tests {
 
         // A prompt repaints the bottom row, clobbering both of its image cells.
         parser.process(b"user@host$");
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new()) else {
-            panic!("screen")
-        };
+        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new());
         // Still tracked, via the top row's cells, at its true top row.
         assert_eq!(g.images.len(), 1);
         assert_eq!((g.images[0].row, g.images[0].col), (0, 0));
@@ -1396,9 +1376,7 @@ mod tests {
 
         // The prompt covers cols 0..11 — cells 11..20 survive.
         parser.process(b"user@host$ ");
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new()) else {
-            panic!("screen")
-        };
+        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new());
         assert_eq!(g.images.len(), 1);
         assert_eq!((g.images[0].row, g.images[0].col), (0, 0));
     }
@@ -1413,9 +1391,7 @@ mod tests {
         let mut imgs = place(&mut parser, 3, 1);
         // Overwrite the leftmost and rightmost image cells; the middle survives.
         parser.process(b"x\x1b[3Gy");
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new()) else {
-            panic!("screen")
-        };
+        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new());
         assert_eq!(g.images.len(), 1);
         assert_eq!((g.images[0].row, g.images[0].col), (0, 0));
     }
@@ -1428,9 +1404,7 @@ mod tests {
         let mut parser = new_parser(4, 30);
         parser.process("日本語 ".as_bytes()); // three wide glyphs + a space → col 7
         let mut imgs = place(&mut parser, 2, 2);
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new()) else {
-            panic!("screen")
-        };
+        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new());
         assert_eq!((g.images[0].row, g.images[0].col), (0, 7));
     }
 
@@ -1445,9 +1419,7 @@ mod tests {
 
         // An 11-char prompt paints across the entire image row.
         parser.process(b"user@host$ ");
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new()) else {
-            panic!("screen")
-        };
+        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new());
         assert!(g.images.is_empty());
         assert!(imgs.is_empty());
     }

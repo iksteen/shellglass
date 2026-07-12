@@ -17,11 +17,13 @@ import {
   sextantMask,
   patchCells,
   decodeBlock,
+  attrEscape,
   setConfig,
   setProto,
   setReloadPage,
   apply,
   type Cfg,
+  type Cell,
 } from "./viewer.ts";
 
 const CFG: Cfg = {
@@ -270,6 +272,24 @@ test("patchCells pads a growing row with blanks, never holes", () => {
   patchCells(state, { cur: null, rows: [{ r: 0, l: 4, cells: [{ t: "$" }] }] });
   assert.deepEqual(state.cells[0], [{ t: "s" }, { t: "h" }, { t: " " }, { t: " " }, { t: "$" }]);
   assert.equal(ghostText(state.cells[0]), "sh  $", "no holes ghostText can trip on");
+});
+
+test("attrEscape neutralizes an attribute breakout", () => {
+  // A real content address passes through untouched (no escapable chars).
+  assert.equal(attrEscape("a".repeat(64)), "a".repeat(64));
+  // The XSS vector: a placement hash the hub relayed verbatim from a pusher.
+  // After escaping it cannot close the src="" attribute or open a new tag.
+  const out = attrEscape('"><img src=x onerror=alert(1)>');
+  assert.ok(!/[<>"]/.test(out), "no raw quote or angle bracket survives");
+  assert.equal(out, "&quot;&gt;&lt;img src=x onerror=alert(1)&gt;");
+});
+
+test("patchCells ignores an out-of-range column (DoS clamp)", () => {
+  // The hub relays a pusher's `l` verbatim; a huge one must not drive an
+  // unbounded blank-pad. The row stays empty instead of growing to ~l.
+  const state = { cells: [[]] as Cell[][], cur: null as [number, number] | null };
+  patchCells(state, { cur: null, rows: [{ r: 0, l: 500_000_000, cells: [{ t: "x" }] }] });
+  assert.equal(state.cells[0].length, 0, "no growth from an out-of-range l");
 });
 
 test("patchCells tri-state cursor: undefined leaves it untouched", () => {

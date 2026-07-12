@@ -92,6 +92,35 @@ struct FontEntry {
     refs: usize,
 }
 
+/// The offline-stub frame: a blank 80×24 screen with a red `shellglass: <msg>`
+/// line at the top. An ordinary [`Frame::Screen`], NOT special-cased anywhere —
+/// the text renders as cells (safe by construction, no HTML), the web viewer's
+/// operator-offline overlay covers it, and the SSH view (cells-only) shows the
+/// line. Replaces the removed `Frame::Banner`.
+fn waiting_frame(msg: &str) -> Frame {
+    let line: Vec<crate::model::StyledCell> = format!("shellglass: {msg}")
+        .chars()
+        .map(|ch| crate::model::StyledCell {
+            text: ch.to_string(),
+            fg: crate::model::Color::Idx(9), // bright red
+            ..Default::default()
+        })
+        .collect();
+    let mut rows = vec![line];
+    rows.resize_with(24, Vec::new);
+    Frame::Screen(crate::model::Grid {
+        cols: 80,
+        rows,
+        cursor: None,
+        cursor_style: 0,
+        default_colors: (crate::model::Color::Default, crate::model::Color::Default),
+        title: String::new(),
+        links: std::collections::BTreeMap::new(),
+        images: Vec::new(),
+        image_data: HashMap::new(),
+    })
+}
+
 /// Apply a session's font-set change to the cache: `new` gains stakes (using
 /// `incoming` bytes for first insertion), `old` releases them, zero-ref
 /// entries evicted. Call with BOTH the sessions lock and the cache lock held
@@ -343,19 +372,19 @@ impl HubState {
         st
     }
 
+    // (waiting_frame is a free fn below.)
+
     /// Make sure `id` has at least a STUB session, so `/s/<slug>` and its SSE
     /// stream exist from the moment the session is registered (CLI or API):
-    /// a "waiting for operator…" banner on an offline `Live` — the viewer's
-    /// `operator` event machinery shows the same offline state as a live
-    /// session whose pusher dropped. A no-op when the session already exists.
+    /// an offline blank screen with a "waiting for operator…" line — the
+    /// viewer's `operator` event machinery shows the same offline state as a
+    /// live session whose pusher dropped. A no-op when the session already exists.
     fn ensure_stub(&self, id: &str) {
         let mut map = self.sessions.lock().unwrap();
         if map.contains_key(id) {
             return;
         }
-        let live = diff::Live::new(Arc::new(Frame::Banner(render::banner(
-            "waiting for operator…",
-        ))));
+        let live = diff::Live::new(Arc::new(waiting_frame("waiting for operator…")));
         live.set_online(false);
         let (kick, _) = broadcast::channel(1);
         map.insert(
@@ -1086,10 +1115,9 @@ fn store_blob(st: &HubState, id: &str, live: &diff::Live, msg: &str) {
         return;
     };
     let hash = proto::content_key(&m.blob.m, &bytes);
-    let protected: std::collections::HashSet<String> = match &*live.frame() {
-        Frame::Screen(g) => g.images.iter().map(|p| p.hash.clone()).collect(),
-        Frame::Banner(_) => std::collections::HashSet::new(),
-    };
+    let Frame::Screen(g) = &*live.frame();
+    let protected: std::collections::HashSet<String> =
+        g.images.iter().map(|p| p.hash.clone()).collect();
     let store = {
         let map = st.sessions.lock().unwrap();
         match map.get(id) {
@@ -1105,7 +1133,7 @@ fn store_blob(st: &HubState, id: &str, live: &diff::Live, msg: &str) {
 
 /// Create or refresh the session for `id` from a register message; returns its
 /// `Live` plus a receiver for the session's kick channel (fired when the
-/// management API deletes the session). New sessions get a "waiting…" banner
+/// management API deletes the session). New sessions get a "waiting…" screen
 /// (replaced by the first pushed frame) and announce their view URL once —
 /// reconnects hit the refresh branch, so no spam. `None` = the session was
 /// deleted between the upgrade's authorize and this register (the API raced
@@ -1164,9 +1192,7 @@ fn register_session(
     } else {
         // Fallback only: an authorized id always has a stub, but keep the
         // create path for the theoretical gap.
-        let live = diff::Live::new(Arc::new(Frame::Banner(render::banner(
-            "waiting for client…",
-        ))));
+        let live = diff::Live::new(Arc::new(waiting_frame("waiting for client…")));
         let (kick, kick_rx) = broadcast::channel(1);
         let mut cache = st.fonts.lock().unwrap();
         retarget_fonts(
