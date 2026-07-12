@@ -64,6 +64,13 @@ impl<T> Grid<T> {
     }
 
     pub fn set_size(&mut self, size: Size) {
+        // shellglass: a 0-row/0-col resize (a bogus SIGWINCH or a CSI 8 resize
+        // with a zero param) would underflow every `size.{rows,cols} - 1` below;
+        // enforce a 1x1 floor so the grid always has at least one cell.
+        let size = Size {
+            rows: size.rows.max(1),
+            cols: size.cols.max(1),
+        };
         if size.cols != self.size.cols {
             for row in &mut self.rows {
                 row.wrap(false);
@@ -548,7 +555,9 @@ impl<T> Grid<T> {
     }
 
     pub fn insert_lines(&mut self, count: u16) {
-        for _ in 0..count {
+        // shellglass: clamp like delete_lines — a 16-bit CSI count on a small
+        // grid would otherwise drive 65535 remove+insert+alloc passes.
+        for _ in 0..(count.min(self.size.rows - self.pos.row)) {
             self.rows.remove(usize::from(self.scroll_bottom));
             self.rows.insert(usize::from(self.pos.row), self.new_row());
             // self.scroll_bottom is maintained to always be a valid row
@@ -583,7 +592,9 @@ impl<T> Grid<T> {
     }
 
     pub fn scroll_down(&mut self, count: u16) {
-        for _ in 0..count {
+        // shellglass: clamp like scroll_up — an unbounded count would drive
+        // 65535 remove+insert+alloc passes on a small grid.
+        for _ in 0..(count.min(self.size.rows - self.scroll_top)) {
             self.rows.remove(usize::from(self.scroll_bottom));
             self.rows
                 .insert(usize::from(self.scroll_top), self.new_row());
@@ -686,7 +697,9 @@ impl<T> Grid<T> {
     }
 
     pub fn col_wrap(&mut self, width: u16, wrap: bool) {
-        if self.pos.col > self.size.cols - width {
+        // shellglass: saturating_sub — a wide char (width 2) wider than the
+        // terminal (cols 1) would underflow `size.cols - width`.
+        if self.pos.col > self.size.cols.saturating_sub(width) {
             let mut prev_pos = self.pos;
             self.pos.col = 0;
             let scrolled = self.row_inc_scroll(1);
@@ -733,8 +746,11 @@ impl<T> Grid<T> {
     }
 
     fn col_clamp(&mut self) {
-        if self.pos.col > self.size.cols - 1 {
-            self.pos.col = self.size.cols - 1;
+        // shellglass: saturating_sub guards a 0-col grid (set_size enforces a
+        // 1x1 floor, but this keeps the clamp sound on its own).
+        let max_col = self.size.cols.saturating_sub(1);
+        if self.pos.col > max_col {
+            self.pos.col = max_col;
         }
     }
 }

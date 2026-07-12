@@ -390,3 +390,43 @@ fn noop_arms_round4() {
     assert_eq!(vt.screen().contents(), "ab");
     assert_eq!(vt.screen().cursor_position(), (0, 2));
 }
+
+// shellglass: hardening against degenerate/hostile input. Release has no
+// overflow-checks, so these run under the debug test build where an unguarded
+// u16 subtraction WOULD panic — a regression here fails the test.
+#[test]
+fn hardening_wide_char_on_narrow_terminal() {
+    // A width-2 glyph on a 1-col terminal: `cols - width` would underflow.
+    let mut vt = vt100::Parser::new(4, 1, 0);
+    vt.process("宽".as_bytes()); // no panic, no wrap
+    assert_eq!(vt.screen().size(), (4, 1));
+}
+
+#[test]
+fn hardening_huge_scroll_and_insert_counts() {
+    // A 16-bit CSI count must clamp, not drive 65535 alloc passes.
+    let mut vt = vt100::Parser::new(24, 80, 0);
+    vt.process(b"hello\x1b[65535L"); // insert_lines (IL)
+    vt.process(b"\x1b[65535T"); // scroll_down (SD)
+    vt.process(b"\x1b[65535S"); // scroll_up (SU) — already clamped upstream
+    assert_eq!(vt.screen().size(), (24, 80));
+}
+
+#[test]
+fn hardening_zero_size_resize() {
+    // A 0-row/0-col resize (bogus CSI 8 t) must floor to 1x1, not underflow.
+    let mut vt = vt100::Parser::new(24, 80, 0);
+    vt.screen_mut().set_size(0, 0);
+    let (rows, cols) = vt.screen().size();
+    assert!(rows >= 1 && cols >= 1, "floored to at least 1x1");
+}
+
+#[test]
+fn truecolor_colon_form_fg_and_bg() {
+    // 38:2::r:g:b and 48:2::r:g:b — the colorspace-id colon form, matching 58.
+    let mut vt = vt100::Parser::new(4, 20, 0);
+    vt.process(b"\x1b[38:2::1:2:3m\x1b[48:2::9:8:7mX");
+    let c = vt.screen().cell(0, 0).unwrap();
+    assert_eq!(c.fgcolor(), vt100::Color::Rgb(1, 2, 3));
+    assert_eq!(c.bgcolor(), vt100::Color::Rgb(9, 8, 7));
+}

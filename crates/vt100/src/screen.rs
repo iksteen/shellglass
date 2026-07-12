@@ -953,6 +953,16 @@ impl<T> Screen<T> {
 
         self.last_graphic_char = Some(c);
 
+        // shellglass: a glyph wider than the whole terminal can't be placed —
+        // the wrap/placement path below assumes col_wrap reserved `width`
+        // columns, which is impossible when cols < width (a width-2 char on a
+        // 1-col terminal). Drop it rather than run the assumption off the end
+        // (an out-of-bounds unwrap); a terminal that narrow showing a
+        // double-width glyph is degenerate anyway.
+        if width > size.cols {
+            return;
+        }
+
         // it doesn't make any sense to wrap if the last column in a row
         // didn't already have contents. don't try to handle the case where a
         // character wraps because there was only one column left in the
@@ -964,18 +974,22 @@ impl<T> Screen<T> {
         // shellglass: with autowrap off (DECAWM, `CSI ? 7 l`) the cursor
         // clamps at the right margin and new text overwrites the edge cell,
         // like xterm — never spilling onto the next line.
+        // shellglass: saturating_sub — a wide char (width 2) wider than the
+        // whole terminal (cols 1) would underflow `size.cols - width` (a
+        // release-mode u16 wrap to ~65535, a debug panic on the parser thread).
+        let right_margin = size.cols.saturating_sub(width);
         if self.mode(MODE_NO_AUTOWRAP) {
-            if width > 0 && pos.col > size.cols - width {
-                self.grid_mut().col_set(size.cols - width);
+            if width > 0 && pos.col > right_margin {
+                self.grid_mut().col_set(right_margin);
             }
         } else {
             let mut wrap = false;
-            if pos.col > size.cols - width {
+            if pos.col > right_margin {
                 let last_cell = self
                     .grid()
                     .drawing_cell(crate::grid::Pos {
                         row: pos.row,
-                        col: size.cols - 1,
+                        col: size.cols.saturating_sub(1),
                     })
                     // pos.row is valid, since it comes directly from
                     // self.grid().pos() which we assume to always have a valid
@@ -1698,7 +1712,9 @@ impl<T> Screen<T> {
                 [n] if (30..=37).contains(n) => {
                     self.attrs.fgcolor = crate::Color::Idx(to_u8!(*n) - 30);
                 }
-                [38, 2, r, g, b] => {
+                // shellglass: [_, r, g, b] is the colon form 38:2::r:g:b with an
+                // (ignored) colorspace id, matching the 58 handling below.
+                [38, 2, r, g, b] | [38, 2, _, r, g, b] => {
                     self.attrs.fgcolor =
                         crate::Color::Rgb(to_u8!(*r), to_u8!(*g), to_u8!(*b));
                 }
@@ -1727,7 +1743,9 @@ impl<T> Screen<T> {
                 [n] if (40..=47).contains(n) => {
                     self.attrs.bgcolor = crate::Color::Idx(to_u8!(*n) - 40);
                 }
-                [48, 2, r, g, b] => {
+                // shellglass: [_, r, g, b] is the colon form 48:2::r:g:b with an
+                // (ignored) colorspace id, matching the 58 handling below.
+                [48, 2, r, g, b] | [48, 2, _, r, g, b] => {
                     self.attrs.bgcolor =
                         crate::Color::Rgb(to_u8!(*r), to_u8!(*g), to_u8!(*b));
                 }

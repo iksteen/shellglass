@@ -84,6 +84,15 @@
 #     7727 (urxvt application-ESC) — all keyboard/query protocol, zero render
 #     effect. Tests in tests/csi.rs (incl. noop_arms_round4),
 #     tests/escape.rs, tests/osc.rs.
+#   - screen.rs/grid.rs: hardening against hostile/degenerate input (release
+#     has no overflow-checks, so a bare u16 subtraction wraps instead of
+#     panicking). Guard the wide-char right-margin (`cols - width`,
+#     saturating_sub — a width-2 glyph on a 1-col terminal), clamp insert_lines
+#     and scroll_down counts like their siblings (a 65535 CSI count can't drive
+#     that many alloc passes), enforce a 1x1 floor in set_size (+ saturating_sub
+#     in col_clamp) so a 0-size resize can't underflow. Plus 38:2::r:g:b /
+#     48:2::r:g:b truecolor colon forms (the colorspace-id variant), mirroring
+#     the existing 58 handling. Tests in tests/csi.rs (hardening_*, truecolor_*).
 [package]
 name = "vt100"
 version = "0.16.2"
