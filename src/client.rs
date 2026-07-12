@@ -122,20 +122,9 @@ pub async fn run(
                 "hub rejected this key: register its session id on the hub \
                  (run `print-id --key <secret>`, add it to the hub's --allow)"
             ),
-            Err(ConnErr::Unreachable(e)) => {
+            Err(ConnErr::Retry(cause)) => {
                 if !down {
-                    report_down(notifier, &format!("hub unreachable ({e}); retrying"));
-                    down = true;
-                }
-                tokio::time::sleep(RECONNECT_BACKOFF).await;
-                continue;
-            }
-            Err(ConnErr::Rejected(s)) => {
-                if !down {
-                    report_down(
-                        notifier,
-                        &format!("hub rejected the request (HTTP {s}); retrying"),
-                    );
+                    report_down(notifier, cause);
                     down = true;
                 }
                 tokio::time::sleep(RECONNECT_BACKOFF).await;
@@ -160,12 +149,27 @@ pub async fn run(
     Ok(())
 }
 
-/// Report the hub as unreachable: pause+announce in the terminal (PTY running) or
-/// log to stderr (still ours before the first successful upgrade).
-fn report_down(notifier: Option<&crate::pty::Notifier>, msg: &str) {
+/// Report the hub as down: pause+announce in the terminal (PTY running) or log to
+/// stderr (still ours before the first successful upgrade). The message is built
+/// entirely from our own literals plus a `u16` — see [`Cause`]; no peer-supplied
+/// text ever reaches the terminal.
+fn report_down(notifier: Option<&crate::pty::Notifier>, cause: Cause) {
+    let msg = notice(cause);
     match notifier {
-        Some(n) => n.hub_down(msg),
+        Some(n) => n.hub_down(&msg),
         None => eprintln!("shellglass: {msg}"),
+    }
+}
+
+/// The operator-facing notice for a down cause — our own literals plus a `u16`, so
+/// it is control-char-free by construction (asserted in tests).
+fn notice(cause: Cause) -> String {
+    match cause {
+        Cause::Connect => "hub unreachable (could not connect); retrying".to_string(),
+        Cause::Timeout => "hub unreachable (timed out); retrying".to_string(),
+        Cause::BadHandshake => "hub unreachable (not a shellglass endpoint?); retrying".to_string(),
+        Cause::Rejected(s) => format!("hub rejected the request (HTTP {s}); retrying"),
+        Cause::Other => "hub unreachable; retrying".to_string(),
     }
 }
 
@@ -182,14 +186,34 @@ enum End {
 }
 
 /// Why a connect attempt failed. `Forbidden` is fatal (retrying can't fix a key the
-/// hub doesn't allow); the others are always retried — at startup that means the
-/// command doesn't launch until the hub is reachable. `Unreachable` means no usable
-/// HTTP response (hub down / network); `Rejected` means the hub answered the upgrade
-/// with a non-101, non-403 status (proxy, transient error).
+/// hub doesn't allow); `Retry` is always retried — at startup that means the command
+/// doesn't launch until the hub is reachable.
 enum ConnErr {
     Forbidden,
-    Unreachable(anyhow::Error),
+    Retry(Cause),
+}
+
+/// A fixed classification of a retryable connect failure, derived from the error's
+/// KIND — never its free-form text. The connect error can be seeded by the peer (a
+/// hub, or a MITM): a botched WebSocket upgrade carries the server's header/protocol
+/// values, a TLS failure the certificate fields. We render one of our own literals
+/// per variant and never the error's `Display`, so nothing peer-controlled can reach
+/// the operator's raw-mode terminal — prevention, not sanitization. `Rejected`'s
+/// `u16` is the only interpolated value and a number can't carry a control sequence.
+#[derive(Clone, Copy)]
+enum Cause {
+    /// Couldn't establish the connection (`reqwest::Error::is_connect`) — hub down,
+    /// wrong host/port, or a network/TLS failure.
+    Connect,
+    /// The attempt timed out (`is_timeout`).
+    Timeout,
+    /// The peer answered but not with a valid WebSocket upgrade — a wrong URL, a
+    /// proxy mangling the handshake, or simply not a shellglass `/push` endpoint.
+    BadHandshake,
+    /// The hub answered the upgrade with a non-101, non-403 status.
     Rejected(u16),
+    /// Any other transport failure.
+    Other,
 }
 
 /// Open the `/push` WebSocket, carrying the secret key in its header.
@@ -210,18 +234,26 @@ async fn connect(http: &reqwest::Client, base: &str, key: &str) -> Result<WebSoc
     match resp.status().as_u16() {
         101 => resp.into_websocket().await.map_err(classify),
         403 => Err(ConnErr::Forbidden),
-        s => Err(ConnErr::Rejected(s)),
+        s => Err(ConnErr::Retry(Cause::Rejected(s))),
     }
 }
 
+/// Map a connect error to a fixed [`Cause`] by inspecting its KIND only — the
+/// error's `Display` (which can embed peer-supplied header/protocol/cert text) is
+/// never read.
 fn classify(e: reqwest_websocket::Error) -> ConnErr {
-    if let reqwest_websocket::Error::Handshake(HandshakeError::UnexpectedStatusCode(code)) = &e {
-        return match code.as_u16() {
+    use reqwest_websocket::Error as WsErr;
+    match e {
+        WsErr::Handshake(HandshakeError::UnexpectedStatusCode(code)) => match code.as_u16() {
             403 => ConnErr::Forbidden,
-            s => ConnErr::Rejected(s),
-        };
+            s => ConnErr::Retry(Cause::Rejected(s)),
+        },
+        // The peer responded but the upgrade wasn't a valid WebSocket handshake.
+        WsErr::Handshake(_) => ConnErr::Retry(Cause::BadHandshake),
+        WsErr::Reqwest(re) if re.is_timeout() => ConnErr::Retry(Cause::Timeout),
+        WsErr::Reqwest(re) if re.is_connect() => ConnErr::Retry(Cause::Connect),
+        _ => ConnErr::Retry(Cause::Other),
     }
-    ConnErr::Unreachable(e.into())
 }
 
 /// Drive one connected session: register, send a full picture, then stream deltas,
@@ -379,7 +411,28 @@ async fn send(ws: &mut WebSocket, msg: Message, timeout: Duration) -> Result<(),
 
 #[cfg(test)]
 mod tests {
-    use super::SentBlobs;
+    use super::{Cause, SentBlobs, notice};
+
+    #[test]
+    fn notice_is_control_free_for_every_cause() {
+        // The security invariant: no down-notice can carry a terminal control
+        // sequence, whatever a hostile hub/MITM does — because it is built from our
+        // own literals plus a u16, never the peer's error text. u16::MAX exercises
+        // the only interpolated value.
+        for cause in [
+            Cause::Connect,
+            Cause::Timeout,
+            Cause::BadHandshake,
+            Cause::Rejected(u16::MAX),
+            Cause::Other,
+        ] {
+            let m = notice(cause);
+            assert!(
+                !m.chars().any(char::is_control),
+                "notice must be control-free: {m:?}"
+            );
+        }
+    }
 
     #[test]
     fn sent_blobs_dedups_and_fifo_caps() {
