@@ -250,7 +250,7 @@ async fn run_session(
     // reset per connect, because a restarted hub lost its stores. Blobs go
     // out before the frame that references them (WS FIFO makes that a hard
     // ordering guarantee for the hub and every viewer behind it).
-    let mut sent_blobs = std::collections::HashSet::new();
+    let mut sent_blobs = SentBlobs::default();
     let mut prev = rx.borrow_and_update().clone();
     if send_new_blobs(&mut ws, &prev, &mut sent_blobs)
         .await
@@ -316,11 +316,37 @@ async fn run_session(
 /// messages ahead of the frame itself. The frame's `image_data` covers every
 /// on-screen placement, so a full referencing hash H is always preceded (on
 /// this FIFO socket) by H's bytes.
-async fn send_new_blobs(
-    ws: &mut WebSocket,
-    frame: &Frame,
-    sent: &mut std::collections::HashSet<String>,
-) -> Result<(), ()> {
+/// The hashes uploaded on this connection, FIFO-capped so a long-running
+/// animation (a fresh image every frame) can't grow it without bound. Eviction
+/// just means a recurring hash is re-sent — harmless, and it also self-heals a
+/// hub-side store eviction of the same key.
+#[derive(Default)]
+struct SentBlobs {
+    set: std::collections::HashSet<String>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl SentBlobs {
+    /// Roughly the on-screen image working set plus grace; a hash is 64 bytes.
+    const CAP: usize = 4096;
+
+    fn contains(&self, hash: &str) -> bool {
+        self.set.contains(hash)
+    }
+
+    fn insert(&mut self, hash: String) {
+        if self.set.insert(hash.clone()) {
+            self.order.push_back(hash);
+            while self.order.len() > Self::CAP {
+                if let Some(old) = self.order.pop_front() {
+                    self.set.remove(&old);
+                }
+            }
+        }
+    }
+}
+
+async fn send_new_blobs(ws: &mut WebSocket, frame: &Frame, sent: &mut SentBlobs) -> Result<(), ()> {
     let Frame::Screen(grid) = frame;
     for (hash, blob) in &grid.image_data {
         if sent.contains(hash) {
@@ -348,5 +374,28 @@ async fn send(ws: &mut WebSocket, msg: Message, timeout: Duration) -> Result<(),
     match tokio::time::timeout(timeout, ws.send(msg)).await {
         Ok(Ok(())) => Ok(()),
         _ => Err(()), // timed out or sink error → connection is dead
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SentBlobs;
+
+    #[test]
+    fn sent_blobs_dedups_and_fifo_caps() {
+        let mut s = SentBlobs::default();
+        s.insert("a".into());
+        s.insert("a".into()); // dedup: no double-track
+        assert!(s.contains("a"));
+        // Overflow the cap: the oldest keys evict, newest survive.
+        for i in 0..SentBlobs::CAP + 10 {
+            s.insert(format!("k{i}"));
+        }
+        assert!(s.order.len() <= SentBlobs::CAP);
+        assert!(!s.contains("a"), "oldest evicted past the cap");
+        assert!(
+            s.contains(&format!("k{}", SentBlobs::CAP + 9)),
+            "newest kept"
+        );
     }
 }
