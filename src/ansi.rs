@@ -6,7 +6,9 @@
 //! returns and remembers `next` as the following call's `prev`.
 //!
 //! A viewer terminal smaller than the session gets a top-left crop plus a one-line
-//! inverse status notice on its bottom row; a bigger one sees the whole screen.
+//! inverse status notice on its bottom row; a bigger one sees the whole screen,
+//! centered in the extra space (per axis — a wider viewer centers horizontally, a
+//! taller one vertically; an axis that's cropped stays a top-left crop).
 
 use crate::model::{Color, Frame, Grid, StyledCell};
 use std::fmt::Write;
@@ -37,6 +39,13 @@ fn paint_screen(prev: Option<&Grid>, g: &Grid, view: (u16, u16)) -> String {
         vrows
     });
     let shown = g.rows.len().min(content_rows);
+    // Center the session in the viewer's extra space, per axis. Offsets are 0 on any
+    // axis where the viewer meets or is smaller than the session (that axis is exact
+    // or a top-left crop). A viewer resize forces a full repaint (see `ssh::view_loop`),
+    // so the offset can never go stale against a diff painted at the old margins.
+    let col_off = vcols.saturating_sub(g.cols) / 2;
+    let row_off = (content_rows - shown) / 2;
+    let content_cols = vcols - col_off; // paint width from the content's left edge
     let full = prev.is_none();
 
     let mut out = String::new();
@@ -47,7 +56,7 @@ fn paint_screen(prev: Option<&Grid>, g: &Grid, view: (u16, u16)) -> String {
         // ponytail: compare the full row even under crop — a change past view_cols
         // triggers a harmless extra repaint. Upgrade: per-span diff.
         if full || prev.is_some_and(|p| p.rows[r] != g.rows[r]) {
-            paint_row(&mut out, r, &g.rows[r], vcols);
+            paint_row(&mut out, row_off + r, col_off, &g.rows[r], content_cols);
         }
     }
     // Status line depends only on dims (constant within a connection), so paint it
@@ -85,7 +94,7 @@ fn paint_screen(prev: Option<&Grid>, g: &Grid, view: (u16, u16)) -> String {
             }
         }
     }
-    cursor_seq(&mut out, g, view, content_rows);
+    cursor_seq(&mut out, g, shown, col_off, row_off, content_cols);
     out
 }
 
@@ -93,16 +102,22 @@ fn paint_screen(prev: Option<&Grid>, g: &Grid, view: (u16, u16)) -> String {
 /// *before* painting (not with a trailing EL): a `\x1b[K` after a row that fills the
 /// full view width erases the rightmost glyph, which autowrap parks in the deferred-
 /// wrap column — the same hazard `status_line` dodges by truncating to `cols-1`.
-fn paint_row(out: &mut String, r: usize, cells: &[StyledCell], vcols: u16) {
+fn paint_row(out: &mut String, r: usize, col_off: u16, cells: &[StyledCell], width: u16) {
+    // Clear the WHOLE screen line (from col 1), then step in to the content's left
+    // edge. Clearing the full line — not just from `col_off` — wipes any centered
+    // content the previous frame left in what is now margin (e.g. after a resize).
     let _ = write!(out, "\x1b[{};1H\x1b[0m\x1b[K", r + 1);
+    if col_off > 0 {
+        let _ = write!(out, "\x1b[{}G", col_off + 1);
+    }
     let mut col: u16 = 0;
     let mut cur: Option<Style> = None; // None = SGR state unknown → first cell emits
     for cell in cells {
-        if col >= vcols {
+        if col >= width {
             break;
         }
         let w = if cell.wide { 2 } else { 1 };
-        if col + w > vcols {
+        if col + w > width {
             // A wide cell straddling the crop boundary → one space (keeps alignment).
             out.push_str("\x1b[0m ");
             break;
@@ -141,12 +156,24 @@ fn status_line(out: &mut String, g: &Grid, view: (u16, u16)) {
     let _ = write!(out, "\x1b[{vrows};1H\x1b[K\x1b[7m{text}\x1b[0m");
 }
 
-/// Show + position the cursor when it's inside the visible (cropped) area, else hide.
-fn cursor_seq(out: &mut String, g: &Grid, view: (u16, u16), content_rows: usize) {
-    let (vcols, _) = view;
+/// Show + position the cursor when it's inside the visible content (offset by the
+/// centering margins), else hide.
+fn cursor_seq(
+    out: &mut String,
+    g: &Grid,
+    shown: usize,
+    col_off: u16,
+    row_off: usize,
+    content_cols: u16,
+) {
     match g.cursor {
-        Some((r, c)) if usize::from(r) < content_rows && c < vcols => {
-            let _ = write!(out, "\x1b[{};{}H\x1b[?25h", r + 1, c + 1);
+        Some((r, c)) if usize::from(r) < shown && c < content_cols => {
+            let _ = write!(
+                out,
+                "\x1b[{};{}H\x1b[?25h",
+                row_off + usize::from(r) + 1,
+                col_off + c + 1
+            );
         }
         _ => out.push_str("\x1b[?25l"),
     }
@@ -377,6 +404,48 @@ mod tests {
         assert!(
             out.contains("session 8x4 — your terminal 60x3"),
             "status text: {out:?}"
+        );
+    }
+
+    #[test]
+    fn larger_viewer_centers_the_session() {
+        // 2x2 session in a 10-col x 6-row viewer → col_off=(10-2)/2=4, row_off=(6-2)/2=2.
+        let mut f = screen(&["ab", "cd"], 2);
+        let Frame::Screen(g) = &mut f;
+        g.cursor = Some((0, 0));
+        let out = paint(None, &f, (10, 6));
+        // Rows land at screen rows 3 & 4, each stepped in to column 5 (col_off+1).
+        assert!(
+            out.contains("\x1b[3;1H\x1b[0m\x1b[K\x1b[5G"),
+            "row 0 cleared full-width then centered: {out:?}"
+        );
+        assert!(
+            out.contains("\x1b[4;1H\x1b[0m\x1b[K\x1b[5G"),
+            "row 1 centered: {out:?}"
+        );
+        assert!(
+            !out.contains("\x1b[7m"),
+            "no status line when it fits: {out:?}"
+        );
+        // Cursor at grid (0,0) → screen (row 3, col 5).
+        assert!(
+            out.contains("\x1b[3;5H\x1b[?25h"),
+            "cursor offset into the centered content: {out:?}"
+        );
+    }
+
+    #[test]
+    fn centering_is_per_axis() {
+        // Wider but exact height: horizontal centering only (col_off=3), no row_off.
+        let f = screen(&["abcd", "efgh"], 4);
+        let out = paint(None, &f, (10, 2));
+        assert!(
+            out.contains("\x1b[1;1H\x1b[0m\x1b[K\x1b[4G"),
+            "row 0 h-centered, no v-offset: {out:?}"
+        );
+        assert!(
+            out.contains("\x1b[2;1H\x1b[0m\x1b[K\x1b[4G"),
+            "row 1 on screen row 2: {out:?}"
         );
     }
 
