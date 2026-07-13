@@ -406,6 +406,11 @@ supported (they share one renderer instance) — use `mode="iframe"` for those.
   key, and the hub hashes it). It is not a secret; set it once and keep it —
   changing it invalidates every registered id, which doubles as a deliberate
   mass-revocation lever.
+- Client/hub **wire-protocol compatibility is negotiated**, not tied to ids: the
+  push client sends the protocol version it speaks, and a hub that can't serve it
+  replies with a clear error naming its exact version and which side to upgrade.
+  Upgrading either side across a protocol change never rotates session ids or view
+  URLs — only a change to the id-derivation scheme itself (rare) does.
 - The secret travels in a header on the `/push` WebSocket upgrade. Terminate TLS
   so it isn't sent in the clear. The hub can do this itself:
 

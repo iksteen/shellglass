@@ -28,7 +28,7 @@ use axum::Router;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use base64::Engine;
@@ -1020,6 +1020,45 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 /// The push client's WebSocket. Authorize once at the upgrade (moving the argon2
 /// semaphore + fail2ban guards here — one hash per connection, not one per
 /// register *and* one per stream), then run the register-then-stream state machine.
+/// A `426 Upgrade Required` telling an authorized pusher this hub can't serve its
+/// wire protocol. The headers are the machine-readable contract the push client
+/// renders into an actionable message (this hub's exact version + the inclusive
+/// protocol range it serves); the body is a plain-text fallback for a human hitting
+/// `/push` directly. Replaces the old id-rotation 403 for wire skew.
+fn protocol_mismatch(client_proto: u32) -> Response {
+    let ver = env!("CARGO_PKG_VERSION");
+    let body = format!(
+        "shellglass hub {ver}: serves push protocol {min}-{max}; client requested {client_proto}.\n\
+         Update the {side} so their protocol versions overlap.\n",
+        min = proto::HUB_PROTOCOL_MIN,
+        max = proto::PROTOCOL_VERSION,
+        side = if client_proto > proto::PROTOCOL_VERSION {
+            "hub"
+        } else {
+            "push client"
+        },
+    );
+    (
+        StatusCode::UPGRADE_REQUIRED,
+        [
+            (
+                HeaderName::from_static(proto::HUB_VERSION_HEADER),
+                ver.to_string(),
+            ),
+            (
+                HeaderName::from_static(proto::PROTOCOL_MIN_HEADER),
+                proto::HUB_PROTOCOL_MIN.to_string(),
+            ),
+            (
+                HeaderName::from_static(proto::PROTOCOL_MAX_HEADER),
+                proto::PROTOCOL_VERSION.to_string(),
+            ),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 async fn ws_push(
     State(st): State<HubState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -1030,6 +1069,24 @@ async fn ws_push(
         Ok(id) => id,
         Err(code) => return code.into_response(),
     };
+    // Wire-protocol negotiation, AFTER auth (only a valid key learns the hub's
+    // version). SALT is frozen now, so a legit client authorizes even across
+    // protocol changes — this check, not an id rotation, is what catches a wire
+    // skew, and answers with an actionable 426 (which side to upgrade, to what
+    // minimum) instead of a misleading 403. Absent header ⇒ protocol 1 (baseline).
+    let client_proto = headers
+        .get(proto::PROTOCOL_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(1);
+    if !(proto::HUB_PROTOCOL_MIN..=proto::PROTOCOL_VERSION).contains(&client_proto) {
+        eprintln!(
+            "shellglass: push {id} rejected: protocol {client_proto} outside supported {}-{}",
+            proto::HUB_PROTOCOL_MIN,
+            proto::PROTOCOL_VERSION
+        );
+        return protocol_mismatch(client_proto);
+    }
     // The view URL to announce on first registration — computed now, while we still
     // have the upgrade request's proxy headers.
     let base = view_base(&headers, &st.base);
@@ -2128,6 +2185,54 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt as _;
+
+    // The 426 contract the push client parses on a wire-protocol mismatch: status
+    // 426, the hub's EXACT version, the inclusive range it serves, and a body that
+    // names which side is behind. This replaces the old id-rotation 403 — SALT is
+    // frozen, so a legit id still authorizes and reaches this check.
+    #[tokio::test]
+    async fn protocol_mismatch_reports_version_and_range() {
+        // A client protocol above our max: the HUB is too old to serve it.
+        let res = protocol_mismatch(999);
+        assert_eq!(res.status(), StatusCode::UPGRADE_REQUIRED);
+        let hv = |res: &Response, name: &str| {
+            res.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            hv(&res, proto::HUB_VERSION_HEADER).as_deref(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "reports the hub's exact version",
+        );
+        assert_eq!(
+            hv(&res, proto::PROTOCOL_MIN_HEADER),
+            Some(proto::HUB_PROTOCOL_MIN.to_string()),
+        );
+        assert_eq!(
+            hv(&res, proto::PROTOCOL_MAX_HEADER),
+            Some(proto::PROTOCOL_VERSION.to_string()),
+        );
+        let body = axum::body::to_bytes(res.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("Update the hub"),
+            "client too new → names the hub: {body}"
+        );
+
+        // A client protocol below our min: the PUSH CLIENT is too old.
+        let res = protocol_mismatch(0);
+        let body = axum::body::to_bytes(res.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("Update the push client"),
+            "client too old → names the push client",
+        );
+    }
 
     fn api_req(method: &str, uri: &str, bearer: Option<&str>, body: Option<&str>) -> Request<Body> {
         let mut b = Request::builder().method(method).uri(uri);

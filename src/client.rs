@@ -20,7 +20,10 @@ use crate::config::Config;
 use crate::diff;
 use crate::fonts::{self, FontFile, Resolver};
 use crate::model::Frame;
-use crate::proto::{KEY_HEADER, MAX_WS_MESSAGE, RegisterBody};
+use crate::proto::{
+    HUB_VERSION_HEADER, KEY_HEADER, MAX_WS_MESSAGE, PROTOCOL_HEADER, PROTOCOL_MAX_HEADER,
+    PROTOCOL_MIN_HEADER, PROTOCOL_VERSION, RegisterBody,
+};
 use crate::render;
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
@@ -123,6 +126,11 @@ pub async fn run(
                 "hub rejected this key: register its session id on the hub \
                  (run `print-id --key <secret>`, add it to the hub's --allow)"
             ),
+            // Wire-protocol mismatch (HTTP 426): fatal like a bad key — retrying
+            // can't reconcile versions, the operator must upgrade a side. The
+            // message is our own literals + integers + a NEUTERED hub version, so
+            // it is control-char-free and length-bounded (see `incompat_message`).
+            Err(ConnErr::Incompatible(msg)) => bail!("{msg}"),
             Err(ConnErr::Retry(cause)) => {
                 if !down {
                     report_down(notifier, cause);
@@ -191,6 +199,9 @@ enum End {
 /// doesn't launch until the hub is reachable.
 enum ConnErr {
     Forbidden,
+    /// The hub can't serve this client's wire protocol (HTTP 426). Carries the
+    /// operator-facing, already-safe message (our literals + a neutered version).
+    Incompatible(String),
     Retry(Cause),
 }
 
@@ -223,6 +234,10 @@ async fn connect(http: &reqwest::Client, base: &str, key: &str) -> Result<WebSoc
     let resp = match http
         .get(&url)
         .header(KEY_HEADER, key)
+        // The wire protocol we speak, alongside the secret — the hub 426s a version
+        // it can't serve (see `incompat_message`), so a wire skew no longer needs
+        // an id rotation to surface.
+        .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
         .upgrade()
         .send()
         .await
@@ -235,8 +250,59 @@ async fn connect(http: &reqwest::Client, base: &str, key: &str) -> Result<WebSoc
     match resp.status().as_u16() {
         101 => resp.into_websocket().await.map_err(classify),
         403 => Err(ConnErr::Forbidden),
+        // Protocol mismatch: read the hub's version + range from the response
+        // headers (this path has them; the classify path doesn't) for a precise
+        // message.
+        426 => Err(ConnErr::Incompatible(incompat_message(resp.headers()))),
         s => Err(ConnErr::Retry(Cause::Rejected(s))),
     }
+}
+
+/// Build the operator-facing message for a `426` protocol rejection from the hub's
+/// response headers. The hub version is content the operator wants, so it is echoed
+/// — neutered through [`crate::proto::neuter`] (strip control chars + cap length),
+/// the same guard the `sessions` CLI uses on hub-supplied text. The protocol bounds
+/// are integers. Missing bounds (e.g. the header-less `classify` path) ⇒ the
+/// version-agnostic fallback.
+fn incompat_message(headers: &reqwest::header::HeaderMap) -> String {
+    let num = |name: &str| -> Option<u32> {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse().ok())
+    };
+    let (Some(min), Some(max)) = (num(PROTOCOL_MIN_HEADER), num(PROTOCOL_MAX_HEADER)) else {
+        return generic_incompat_message();
+    };
+    let ver = headers
+        .get(HUB_VERSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(crate::proto::neuter)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    if PROTOCOL_VERSION > max {
+        format!(
+            "push-protocol mismatch: this client speaks protocol {PROTOCOL_VERSION}, \
+             but hub {ver} serves only {min}-{max}. Update the HUB to a build \
+             speaking protocol >= {PROTOCOL_VERSION}."
+        )
+    } else {
+        format!(
+            "push-protocol mismatch: this client speaks protocol {PROTOCOL_VERSION}, \
+             but hub {ver} serves {min}-{max}. Update this PUSH CLIENT to a build \
+             speaking protocol >= {min}."
+        )
+    }
+}
+
+/// The version-agnostic fallback when the hub's 426 lacked usable version headers
+/// (e.g. the status surfaced through `classify`, which has no response headers).
+fn generic_incompat_message() -> String {
+    format!(
+        "push-protocol mismatch (HTTP 426): this client speaks protocol \
+         {PROTOCOL_VERSION} and the hub can't serve it. Update the hub or the push \
+         client so their protocol versions overlap."
+    )
 }
 
 /// Map a connect error to a fixed [`Cause`] by inspecting its KIND only — the
@@ -247,6 +313,8 @@ fn classify(e: reqwest_websocket::Error) -> ConnErr {
     match e {
         WsErr::Handshake(HandshakeError::UnexpectedStatusCode(code)) => match code.as_u16() {
             403 => ConnErr::Forbidden,
+            // No response headers on this path — a version-less protocol message.
+            426 => ConnErr::Incompatible(generic_incompat_message()),
             s => ConnErr::Retry(Cause::Rejected(s)),
         },
         // The peer responded but the upgrade wasn't a valid WebSocket handshake.
@@ -412,7 +480,52 @@ async fn send(ws: &mut WebSocket, msg: Message, timeout: Duration) -> Result<(),
 
 #[cfg(test)]
 mod tests {
-    use super::{Cause, SentBlobs, notice};
+    use super::{Cause, SentBlobs, generic_incompat_message, incompat_message, notice};
+
+    // The 426 message names which side is behind and echoes the hub's version —
+    // neutered through `proto::neuter` (control-strip + length cap, tested there),
+    // so a hostile hub can neither inject a control sequence nor flood the screen.
+    #[test]
+    fn incompat_message_names_the_side_and_stays_safe() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let hdrs = |ver: &str, min: &'static str, max: &'static str| {
+            let mut h = HeaderMap::new();
+            h.insert(
+                super::HUB_VERSION_HEADER,
+                HeaderValue::from_str(ver).unwrap(),
+            );
+            h.insert(super::PROTOCOL_MIN_HEADER, HeaderValue::from_static(min));
+            h.insert(super::PROTOCOL_MAX_HEADER, HeaderValue::from_static(max));
+            h
+        };
+
+        // Hub strictly newer than us (its min/max exceed our PROTOCOL_VERSION) →
+        // the CLIENT is behind; the hub version is echoed.
+        let m = incompat_message(&hdrs("9.9.9", "999", "999"));
+        assert!(m.contains("PUSH CLIENT"), "names the client: {m}");
+        assert!(m.contains("9.9.9"), "echoes the hub version: {m}");
+        assert!(!m.chars().any(char::is_control));
+
+        // Hub strictly older than us (max below our PROTOCOL_VERSION) → the HUB is
+        // behind.
+        let m = incompat_message(&hdrs("0.1.0", "0", "0"));
+        assert!(m.contains("HUB"), "names the hub: {m}");
+        assert!(!m.chars().any(char::is_control));
+
+        // A giant version header is bounded by neuter — no screen flood.
+        let big = "9".repeat(10_000);
+        let m = incompat_message(&hdrs(&big, "999", "999"));
+        assert!(
+            !m.contains(&big),
+            "oversized version is capped, not echoed whole"
+        );
+        assert!(m.len() < 512, "message stays bounded: {} chars", m.len());
+        assert!(!m.chars().any(char::is_control));
+
+        // Missing bounds (e.g. the header-less classify path) → generic message.
+        assert!(!generic_incompat_message().chars().any(char::is_control));
+        assert!(incompat_message(&HeaderMap::new()).contains("426"));
+    }
 
     #[test]
     fn notice_is_control_free_for_every_cause() {
