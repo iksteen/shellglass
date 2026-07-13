@@ -24,6 +24,16 @@ use tokio::sync::watch;
 /// Frame cap: coalesce bursts of PTY output into at most ~30 renders per second.
 const MIN_FRAME: Duration = Duration::from_millis(33);
 
+/// Debounce a cursor-hidden transient for this long. Apps bracket each redraw in
+/// `?25l … ?25h` (hide, repaint, show); the local terminal applies the burst as
+/// one refresh so the cursor is never composited hidden, but our 30fps sampling
+/// catches the sub-frame hidden gap as its own frame and the mirrored cursor
+/// blinks (a spinner does this ~14×/s). Keep showing the last position until the
+/// app has held the cursor hidden this long, then let it truly hide — so a
+/// redraw-transient hide never ships, while a genuine hide still does, one grace
+/// window late (imperceptible for a non-interactive cursor).
+const CURSOR_HIDE_GRACE: Duration = Duration::from_millis(150);
+
 /// One cell's share of an inline-image placement, stored in the vendored
 /// vt100's generic per-cell data slot (`Cell<T>`): the placement id plus this
 /// cell's offset within the image, so any surviving cell reconstructs the
@@ -171,6 +181,7 @@ pub fn start(
         &new_parser(rows, cols),
         &mut Vec::new(),
         &mut Vec::new(),
+        &mut CursorBridge::default(),
     ));
 
     // PTY reader → screen thread.
@@ -354,18 +365,29 @@ fn screen_thread(
     // (see resolve_images): shown until their pending successor's bytes land.
     let mut zombies: Vec<Placed> = Vec::new();
     let mut image_seq = std::num::NonZeroU32::MIN;
+    let mut bridge = CursorBridge::default();
     loop {
-        let msg = if dirty {
-            match msg_rx.recv_timeout(MIN_FRAME) {
+        // Wake at the soonest of: the frame interval (when dirty) and the
+        // cursor-hide grace expiry (when bridging a hidden cursor, so the real
+        // hide still ships even if the app then goes quiet). Neither ⇒ block.
+        let wait = {
+            let mut d = dirty.then(|| MIN_FRAME.saturating_sub(last_frame.elapsed()));
+            if let Some(t) = bridge.hidden_since.filter(|_| bridge.shown.is_some()) {
+                let rem = CURSOR_HIDE_GRACE.saturating_sub(t.elapsed());
+                d = Some(d.map_or(rem, |x| x.min(rem)));
+            }
+            d
+        };
+        let msg = match wait {
+            Some(d) => match msg_rx.recv_timeout(d) {
                 Ok(m) => Some(m),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        } else {
-            match msg_rx.recv() {
+            },
+            None => match msg_rx.recv() {
                 Ok(m) => Some(m),
                 Err(_) => break,
-            }
+            },
         };
         match msg {
             Some(Msg::Data(b)) => {
@@ -484,8 +506,14 @@ fn screen_thread(
             Some(_) => {} // redundant HubDown/HubUp — ignore
             None => {}    // frame due
         }
-        if dirty && last_frame.elapsed() >= MIN_FRAME && !sync.hold(parser.screen()) {
-            let _ = frame_tx.send(frame_from(&parser, &mut images, &mut zombies));
+        // A bridged hidden cursor whose grace has now expired must publish the
+        // real hide even with no new data (dirty=false).
+        let hide_due = bridge.shown.is_some()
+            && bridge
+                .hidden_since
+                .is_some_and(|t| t.elapsed() >= CURSOR_HIDE_GRACE);
+        if (dirty || hide_due) && last_frame.elapsed() >= MIN_FRAME && !sync.hold(parser.screen()) {
+            let _ = frame_tx.send(frame_from(&parser, &mut images, &mut zombies, &mut bridge));
             dirty = false;
             last_frame = Instant::now();
         }
@@ -770,12 +798,54 @@ fn stamp_image(
 /// Snapshot the PTY screen as a [`Frame`], resolving each tracked image's tagged
 /// cells to its current position and dropping images with no covered cell left
 /// (scrolled off the top, cleared, or overwritten).
+/// Cursor-hidden debounce state (see [`CURSOR_HIDE_GRACE`]). Tracks the last
+/// position seen while the cursor was shown and when the app most recently hid
+/// it, so a brief redraw-transient hide keeps showing the last cursor instead of
+/// blinking the mirror.
+#[derive(Default)]
+struct CursorBridge {
+    shown: Option<(u16, u16)>,     // last position while the cursor was visible
+    style: u8,                     // its DECSCUSR style, to restore alongside
+    hidden_since: Option<Instant>, // when the app last hid the cursor (None ⇒ shown)
+}
+
+impl CursorBridge {
+    /// Apply the debounce to a freshly built grid: while the cursor is shown,
+    /// remember it; while it's hidden but within the grace window, override the
+    /// grid back to the last-shown cursor. Returns the instant the hide began
+    /// while still bridging (so the caller can schedule a wake to publish the
+    /// real hide at grace expiry), else `None`.
+    fn apply(&mut self, grid: &mut crate::model::Grid, now: Instant) -> Option<Instant> {
+        match grid.cursor {
+            Some(pos) => {
+                self.shown = Some(pos);
+                self.style = grid.cursor_style;
+                self.hidden_since = None;
+                None
+            }
+            None => {
+                let since = *self.hidden_since.get_or_insert(now);
+                if now.saturating_duration_since(since) < CURSOR_HIDE_GRACE {
+                    grid.cursor = self.shown; // keep the last-shown cursor visible
+                    grid.cursor_style = self.style;
+                    self.shown.map(|_| since) // still bridging (only if we had a cursor to hold)
+                } else {
+                    self.shown = None; // grace elapsed: the hide is genuine
+                    None
+                }
+            }
+        }
+    }
+}
+
 fn frame_from(
     parser: &SgParser,
     images: &mut Vec<Placed>,
     zombies: &mut Vec<Placed>,
+    bridge: &mut CursorBridge,
 ) -> Arc<Frame> {
     let mut grid = crate::parse::grid_from_screen(parser.screen());
+    bridge.apply(&mut grid, Instant::now());
     grid.images = resolve_images(parser.screen(), images, zombies);
     grid.image_data = images
         .iter()
@@ -1181,6 +1251,76 @@ impl RawMode {
 mod tests {
     use super::*;
 
+    fn grid_with_cursor(cursor: Option<(u16, u16)>) -> crate::model::Grid {
+        crate::model::Grid {
+            cols: 80,
+            rows: Vec::new(),
+            cursor,
+            cursor_style: 1,
+            default_colors: (crate::model::Color::Default, crate::model::Color::Default),
+            title: String::new(),
+            links: Default::default(),
+            images: Vec::new(),
+            image_data: Default::default(),
+        }
+    }
+
+    #[test]
+    fn cursor_bridge_debounces_transient_hide() {
+        let mut b = CursorBridge::default();
+        let t = Instant::now();
+
+        // Cursor shown → remembered, no bridging.
+        let mut g = grid_with_cursor(Some((63, 2)));
+        assert_eq!(b.apply(&mut g, t), None);
+        assert_eq!(g.cursor, Some((63, 2)));
+
+        // App hides it (redraw start); within grace we keep showing the last pos.
+        let mut g = grid_with_cursor(None);
+        assert!(b.apply(&mut g, t + Duration::from_millis(20)).is_some());
+        assert_eq!(
+            g.cursor,
+            Some((63, 2)),
+            "transient hide bridged to last cursor"
+        );
+
+        // App re-shows it (redraw end) before grace expires: no hide ever shipped.
+        let mut g = grid_with_cursor(Some((63, 2)));
+        assert_eq!(b.apply(&mut g, t + Duration::from_millis(40)), None);
+        assert_eq!(g.cursor, Some((63, 2)));
+    }
+
+    #[test]
+    fn cursor_bridge_honors_a_genuine_hide() {
+        let mut b = CursorBridge::default();
+        let t = Instant::now();
+        b.apply(&mut grid_with_cursor(Some((5, 5))), t); // establish a shown cursor
+
+        // Hidden and stays hidden past the grace window → the real hide ships.
+        let hidden_at = t + Duration::from_millis(10);
+        let mut g = grid_with_cursor(None);
+        b.apply(&mut g, hidden_at); // bridged; the hide clock starts here
+        assert_eq!(g.cursor, Some((5, 5)));
+        let mut g = grid_with_cursor(None);
+        assert_eq!(
+            b.apply(
+                &mut g,
+                hidden_at + CURSOR_HIDE_GRACE + Duration::from_millis(1)
+            ),
+            None
+        );
+        assert_eq!(g.cursor, None, "genuine hide honored after grace");
+    }
+
+    #[test]
+    fn cursor_bridge_does_not_invent_a_cursor() {
+        // Hidden from the start (never shown) → nothing to bridge to.
+        let mut b = CursorBridge::default();
+        let mut g = grid_with_cursor(None);
+        assert_eq!(b.apply(&mut g, Instant::now()), None);
+        assert_eq!(g.cursor, None);
+    }
+
     #[test]
     fn da_rewriter_advertises_sixel() {
         let mut da = DaRewriter::default();
@@ -1381,7 +1521,12 @@ mod tests {
         let mut parser = new_parser(24, 80);
         let mut images = place(&mut parser, 4, 2);
         images[0].ready = None; // decode worker still owes the payload
-        let Frame::Screen(g) = &*frame_from(&parser, &mut images, &mut Vec::new());
+        let Frame::Screen(g) = &*frame_from(
+            &parser,
+            &mut images,
+            &mut Vec::new(),
+            &mut CursorBridge::default(),
+        );
         assert!(g.images.is_empty(), "pending placement not emitted");
         assert!(g.image_data.is_empty(), "no payload to carry");
         assert_eq!(images.len(), 1, "but still tracked (cells live)");
@@ -1394,7 +1539,12 @@ mod tests {
                 bytes: bytes::Bytes::from_static(b"png-ish"),
             },
         ));
-        let Frame::Screen(g) = &*frame_from(&parser, &mut images, &mut Vec::new());
+        let Frame::Screen(g) = &*frame_from(
+            &parser,
+            &mut images,
+            &mut Vec::new(),
+            &mut CursorBridge::default(),
+        );
         assert_eq!(g.images.len(), 1);
         assert_eq!(g.images[0].hash, "cd".repeat(32));
         assert!(g.image_data.contains_key(&"cd".repeat(32)));
@@ -1439,7 +1589,12 @@ mod tests {
         });
 
         // N's cells are gone, but N keeps showing (zombie) while N+1 pends.
-        let Frame::Screen(g) = &*frame_from(&parser, &mut images, &mut zombies);
+        let Frame::Screen(g) = &*frame_from(
+            &parser,
+            &mut images,
+            &mut zombies,
+            &mut CursorBridge::default(),
+        );
         assert_eq!(g.images.len(), 1, "the old frame bridges the gap");
         assert_eq!(g.images[0].hash, "aa".repeat(32));
         assert!(
@@ -1455,14 +1610,24 @@ mod tests {
                 bytes: bytes::Bytes::from_static(b"N+1"),
             },
         ));
-        let Frame::Screen(g) = &*frame_from(&parser, &mut images, &mut zombies);
+        let Frame::Screen(g) = &*frame_from(
+            &parser,
+            &mut images,
+            &mut zombies,
+            &mut CursorBridge::default(),
+        );
         assert_eq!(g.images.len(), 1, "swap complete");
         assert_eq!(g.images[0].hash, "bb".repeat(32));
         assert!(zombies.is_empty(), "zombie released");
 
         // A plain overwrite (no pending successor) vanishes immediately.
         parser.process(b"\x1b[2J");
-        let Frame::Screen(g) = &*frame_from(&parser, &mut images, &mut zombies);
+        let Frame::Screen(g) = &*frame_from(
+            &parser,
+            &mut images,
+            &mut zombies,
+            &mut CursorBridge::default(),
+        );
         assert!(g.images.is_empty(), "cleared image gone, no zombie");
         assert!(zombies.is_empty());
     }
@@ -1476,22 +1641,42 @@ mod tests {
         parser.process(b"\r\n\r\n"); // cursor to the last row
         // Placing a 2-row image at the bottom scrolls once mid-placement.
         let mut imgs = place(&mut parser, 2, 2);
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new());
+        let Frame::Screen(g) = &*frame_from(
+            &parser,
+            &mut imgs,
+            &mut Vec::new(),
+            &mut CursorBridge::default(),
+        );
         assert_eq!((g.images[0].row, g.images[0].col), (1, 0));
 
         // One scroll lifts the image → top row 0.
         parser.process(b"\r\nx");
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new());
+        let Frame::Screen(g) = &*frame_from(
+            &parser,
+            &mut imgs,
+            &mut Vec::new(),
+            &mut CursorBridge::default(),
+        );
         assert_eq!(g.images[0].row, 0);
 
         // Another: top row scrolls off → top row -1, image still shown (clipped).
         parser.process(b"\r\ny");
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new());
+        let Frame::Screen(g) = &*frame_from(
+            &parser,
+            &mut imgs,
+            &mut Vec::new(),
+            &mut CursorBridge::default(),
+        );
         assert_eq!(g.images[0].row, -1);
 
         // One more: the bottom row is gone too → the image is evicted.
         parser.process(b"\r\nz");
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new());
+        let Frame::Screen(g) = &*frame_from(
+            &parser,
+            &mut imgs,
+            &mut Vec::new(),
+            &mut CursorBridge::default(),
+        );
         assert!(g.images.is_empty());
     }
 
@@ -1507,7 +1692,12 @@ mod tests {
 
         // A prompt repaints the bottom row, clobbering both of its image cells.
         parser.process(b"user@host$");
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new());
+        let Frame::Screen(g) = &*frame_from(
+            &parser,
+            &mut imgs,
+            &mut Vec::new(),
+            &mut CursorBridge::default(),
+        );
         // Still tracked, via the top row's cells, at its true top row.
         assert_eq!(g.images.len(), 1);
         assert_eq!((g.images[0].row, g.images[0].col), (0, 0));
@@ -1524,7 +1714,12 @@ mod tests {
 
         // The prompt covers cols 0..11 — cells 11..20 survive.
         parser.process(b"user@host$ ");
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new());
+        let Frame::Screen(g) = &*frame_from(
+            &parser,
+            &mut imgs,
+            &mut Vec::new(),
+            &mut CursorBridge::default(),
+        );
         assert_eq!(g.images.len(), 1);
         assert_eq!((g.images[0].row, g.images[0].col), (0, 0));
     }
@@ -1539,7 +1734,12 @@ mod tests {
         let mut imgs = place(&mut parser, 3, 1);
         // Overwrite the leftmost and rightmost image cells; the middle survives.
         parser.process(b"x\x1b[3Gy");
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new());
+        let Frame::Screen(g) = &*frame_from(
+            &parser,
+            &mut imgs,
+            &mut Vec::new(),
+            &mut CursorBridge::default(),
+        );
         assert_eq!(g.images.len(), 1);
         assert_eq!((g.images[0].row, g.images[0].col), (0, 0));
     }
@@ -1552,7 +1752,12 @@ mod tests {
         let mut parser = new_parser(4, 30);
         parser.process("日本語 ".as_bytes()); // three wide glyphs + a space → col 7
         let mut imgs = place(&mut parser, 2, 2);
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new());
+        let Frame::Screen(g) = &*frame_from(
+            &parser,
+            &mut imgs,
+            &mut Vec::new(),
+            &mut CursorBridge::default(),
+        );
         assert_eq!((g.images[0].row, g.images[0].col), (0, 7));
     }
 
@@ -1567,7 +1772,12 @@ mod tests {
 
         // An 11-char prompt paints across the entire image row.
         parser.process(b"user@host$ ");
-        let Frame::Screen(g) = &*frame_from(&parser, &mut imgs, &mut Vec::new());
+        let Frame::Screen(g) = &*frame_from(
+            &parser,
+            &mut imgs,
+            &mut Vec::new(),
+            &mut CursorBridge::default(),
+        );
         assert!(g.images.is_empty());
         assert!(imgs.is_empty());
     }
