@@ -250,7 +250,7 @@ body[data-offline="operator"] .offline .off-op { display:block; }
 <script>
 // Fit + zoom + pan. The terminal is scaled with CSS `zoom` (it affects layout —
 // unlike transform — so the panel tightens around the result): the base factor
-// shrinks it to fit the stage between nav and footer (never enlarges), and the
+// scales it to fit the stage between nav and footer (up or down), and the
 // user factor (pinch / ctrl+wheel, 1..8, anchored at the cursor) magnifies on
 // top. Zoomed-in content overflows *inside* the panel (overflow:auto, capped at
 // the stage via max-width/height:100%), so the tube never grows past nav or
@@ -267,7 +267,7 @@ body[data-offline="operator"] .offline .off-op { display:block; }
   const tube = document.querySelector('.tube');
   const stage = document.querySelector('.stage');
   const panel = document.querySelector('.panel');
-  let fitZ = 1; // shrink-to-fit factor (≤ 1), from the layout
+  let fitZ = 1; // fit-to-stage factor (grows or shrinks), from the layout
   let userZ = 1; // user magnification (≥ 1), from pinch / ctrl+wheel
   const pads = (el, a, b) => {
     const cs = getComputedStyle(el);
@@ -295,10 +295,12 @@ body[data-offline="operator"] .offline .off-op { display:block; }
       - pads(panel, 'paddingTop', 'paddingBottom');
     // Fractional measurement (offsetWidth rounds), and a hair under the exact
     // fit — the panel cap binds exactly, so a sub-pixel overshoot would flash
-    // scrollbars. At natural size (no shrink) keep zoom exactly 1 for crispness.
+    // scrollbars. Grows as well as shrinks: a terminal smaller than the stage
+    // is scaled UP to fill it, not left at natural size. The canvas re-rasterizes
+    // crisp at the new scale on sg-zoom, so upscaling isn't a blurry bitmap.
     const b = box.getBoundingClientRect();
     const z = Math.min(availW / b.width, availH / b.height);
-    fitZ = z >= 1 ? 1 : z * 0.999;
+    fitZ = z * 0.999;
     apply();
     panel.scrollLeft = sl;
     panel.scrollTop = st;
