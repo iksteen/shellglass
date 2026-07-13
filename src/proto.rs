@@ -102,13 +102,18 @@ pub const KEY_HEADER: &str = "x-shellglass-key";
 /// brute force here.
 ///
 /// The version suffix versions the id-DERIVATION scheme only. Historically it
-/// ALSO doubled as the wire-protocol-skew guard — a breaking change to the wire
-/// messages ([`crate::diff`]) bumped it, which moved every session id, so a
-/// stale client/hub disagreed on `key → id` and failed loudly (403) at the
-/// upgrade instead of silently dropping frames. That worked but rotated every
-/// operator's ids on what was often a cosmetic wire tweak.
+/// was ALSO bumped on breaking wire-message changes ([`crate::diff`]), believed
+/// to guard against protocol skew — but for the push path that guard was
+/// illusory. The push client never derives the id: it sends the raw key and the
+/// HUB derives the id (see `hub::authorize`), so the client's VERSION never
+/// enters the computation. A salt bump can't reject a skewed client; it only
+/// forces the OPERATOR to re-derive ids (`print-id` / `gen-key`) and update
+/// `--allow` + view URLs. Right after a bump every client 403s until `--allow` is
+/// re-derived — indiscriminately, not by client version — and once it is, any
+/// client with the right key connects regardless of version. So the "loud 403"
+/// was a coordination side effect, never a wire-skew gate.
 ///
-/// **As of v6 that job has moved to explicit negotiation** ([`PROTOCOL_VERSION`]):
+/// **The real wire-skew guard, as of v6, is explicit negotiation** ([`PROTOCOL_VERSION`]):
 /// the client sends the wire protocol it speaks in the [`PROTOCOL_HEADER`], and a
 /// hub that can't serve it answers `426` with its version + supported range (see
 /// [`HUB_PROTOCOL_MIN`]). So **do NOT bump this salt on a wire-message change** —
@@ -157,9 +162,9 @@ pub const PROTOCOL_HEADER: &str = "x-shellglass-protocol";
 
 /// Response headers on a `426` protocol rejection: the hub's exact version and the
 /// inclusive protocol range it serves, so the client can tell the operator which
-/// side to upgrade and to what minimum. The client VALIDATES the version before
-/// echoing it (control-char-free by construction) — a `426` body/headers are still
-/// peer-supplied.
+/// side to upgrade and to what minimum. The client NEUTERS the version before
+/// echoing it ([`neuter`] — strip control chars + cap length) since a `426`'s
+/// body/headers are peer-supplied.
 pub const HUB_VERSION_HEADER: &str = "x-shellglass-hub-version";
 pub const PROTOCOL_MIN_HEADER: &str = "x-shellglass-protocol-min";
 pub const PROTOCOL_MAX_HEADER: &str = "x-shellglass-protocol-max";
