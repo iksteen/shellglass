@@ -88,7 +88,8 @@ pub struct SessionsArgs {
 #[cfg(feature = "sessions")]
 #[derive(clap::Subcommand, Debug)]
 enum SessionsCmd {
-    /// List registered sessions (slug, live/offline, session id).
+    /// List registered sessions (slug, live/offline, per-transport viewer counts,
+    /// session id).
     List,
     /// Register a session by its public session id (from `print-id`, never a
     /// key), optionally aliased to a view-URL slug.

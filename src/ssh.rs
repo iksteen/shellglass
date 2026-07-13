@@ -351,6 +351,8 @@ async fn view_loop(
     if w.write_all(b"\x1b[?1049h\x1b[?25l\x1b[2J").await.is_err() {
         return;
     }
+    // Count this SSH viewer until the loop returns (client quit / disconnect).
+    let _viewer = live.viewer(diff::Transport::Ssh);
     let mut ticks = live.ticks();
     {
         let mut reader = Box::pin(channel.make_reader());

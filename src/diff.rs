@@ -54,6 +54,8 @@ use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[cfg(any(feature = "serve", feature = "hub"))]
 use std::convert::Infallible;
+#[cfg(any(feature = "serve", feature = "hub"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{broadcast, watch};
 #[cfg(any(feature = "serve", feature = "hub"))]
@@ -127,6 +129,55 @@ pub struct Live {
     /// operator IS the process, and its death drops the SSE stream instead. A `watch`
     /// so a viewer connecting mid-outage reads the current value, not just changes.
     online: watch::Sender<bool>,
+    /// Live viewer count per [`Transport`] (index = `transport as usize`). Every
+    /// transport subscribes to the same `diffs` channel, so its `receiver_count`
+    /// can't tell them apart — this tracks each explicitly, bumped on connect and
+    /// decremented when the connection's [`ViewerGuard`] drops. Surfaced by the
+    /// management API's session listing. (HTTP-serving builds only — the push client
+    /// compiles `Live` but never serves viewers.)
+    #[cfg(any(feature = "serve", feature = "hub"))]
+    viewers: [AtomicUsize; Transport::ALL.len()],
+}
+
+/// A viewer transport, for the per-channel live counts. To count a new kind of
+/// viewer, add a variant (and to `ALL`): the counter array, the guard, and the API
+/// listing all extend from this one enum — no new field or accessor per channel.
+#[cfg(any(feature = "serve", feature = "hub"))]
+#[derive(Clone, Copy)]
+pub enum Transport {
+    Web,
+    Ssh,
+}
+
+#[cfg(any(feature = "serve", feature = "hub"))]
+impl Transport {
+    /// Every variant, in `as usize` index order (the counter-array layout). Keep in
+    /// sync with the enum.
+    pub const ALL: [Transport; 2] = [Transport::Web, Transport::Ssh];
+
+    /// Stable short name for the management API (its JSON key is `<name>Viewers`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Transport::Web => "web",
+            Transport::Ssh => "ssh",
+        }
+    }
+}
+
+/// Counts a viewer on one [`Transport`] while held, decrementing on drop — so the
+/// count reflects live connections, falling as viewers disconnect. The web SSE
+/// response owns one inside its stream; the SSH view loop holds one for its duration.
+#[cfg(any(feature = "serve", feature = "hub"))]
+pub struct ViewerGuard {
+    live: Arc<Live>,
+    transport: Transport,
+}
+
+#[cfg(any(feature = "serve", feature = "hub"))]
+impl Drop for ViewerGuard {
+    fn drop(&mut self) {
+        self.live.viewers[self.transport as usize].fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Live {
@@ -144,6 +195,8 @@ impl Live {
             writer: Mutex::new(()),
             diffs,
             online,
+            #[cfg(any(feature = "serve", feature = "hub"))]
+            viewers: std::array::from_fn(|_| AtomicUsize::new(0)),
         })
     }
 
@@ -236,6 +289,23 @@ impl Live {
         *self.online.borrow()
     }
 
+    /// Count a viewer on `transport` for as long as the returned guard lives. Held by
+    /// the SSE stream ([`Live::connect`]) / the SSH view loop ([`crate::ssh`]).
+    #[cfg(any(feature = "serve", feature = "hub"))]
+    pub fn viewer(self: &Arc<Self>, transport: Transport) -> ViewerGuard {
+        self.viewers[transport as usize].fetch_add(1, Ordering::Relaxed);
+        ViewerGuard {
+            live: Arc::clone(self),
+            transport,
+        }
+    }
+
+    /// Current live viewer count on `transport`.
+    #[cfg(any(feature = "serve", feature = "hub"))]
+    pub fn viewer_count(&self, transport: Transport) -> usize {
+        self.viewers[transport as usize].load(Ordering::Relaxed)
+    }
+
     /// Subscribe a viewer: an SSE response that emits a full snapshot first, then
     /// each broadcast delta. **Takes no locks** — subscribe first, snapshot second,
     /// and skip deltas the snapshot already covers (seq ≤ snapshot's). On `Lagged`
@@ -254,7 +324,12 @@ impl Live {
             Event::default().id(snap.seq.to_string()).data(&*full),
         ));
         let me = Arc::clone(self);
+        // Count this web viewer for the life of the stream: the guard is moved into
+        // the tail closure, so it drops (decrementing) when the SSE response is
+        // dropped on client disconnect.
+        let guard = self.viewer(Transport::Web);
         let tail = BroadcastStream::new(rx).filter_map(move |r| {
+            let _keep = &guard;
             let (seq, data) = match r {
                 Ok((seq, msg)) => {
                     if seq <= threshold {
@@ -2504,5 +2579,35 @@ mod tests {
         // An unchanged publish is a no-op (no seq bump, no message).
         live.publish(Arc::new(Frame::Screen(grid(&["c"]))));
         assert_eq!(live.state.load().seq, 2);
+    }
+
+    // tokio runtime: connect()'s SSE keep-alive builds a timer that needs a reactor.
+    #[cfg(any(feature = "serve", feature = "hub"))]
+    #[tokio::test]
+    async fn viewer_counts_track_web_and_ssh_connections() {
+        use Transport::{Ssh, Web};
+        let live = Live::new(Arc::new(Frame::Screen(grid(&["a"]))));
+        assert_eq!((live.viewer_count(Web), live.viewer_count(Ssh)), (0, 0));
+
+        // A web (SSE) connection is counted until its response stream drops.
+        let resp = live.connect();
+        assert_eq!(live.viewer_count(Web), 1, "web viewer counted");
+        assert_eq!(live.viewer_count(Ssh), 0, "and not as an ssh viewer");
+
+        // SSH viewers are a separate bucket.
+        let s1 = live.viewer(Ssh);
+        let s2 = live.viewer(Ssh);
+        assert_eq!((live.viewer_count(Web), live.viewer_count(Ssh)), (1, 2));
+
+        drop(resp);
+        assert_eq!(
+            live.viewer_count(Web),
+            0,
+            "web viewer gone when the stream drops"
+        );
+        drop(s1);
+        assert_eq!(live.viewer_count(Ssh), 1);
+        drop(s2);
+        assert_eq!(live.viewer_count(Ssh), 0, "all ssh viewers gone");
     }
 }

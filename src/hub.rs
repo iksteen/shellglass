@@ -80,6 +80,17 @@ struct Session {
     registered: bool,
 }
 
+/// One session's status for the management API listing (`GET /api/sessions`).
+pub struct SessionStatus {
+    pub id: String,
+    pub slug: String,
+    /// An operator is currently pushing frames for this session.
+    pub live: bool,
+    /// Live viewer count per transport, as `(name, count)` — one entry per
+    /// [`diff::Transport`], so a new transport flows through without touching this.
+    pub viewers: Vec<(&'static str, usize)>,
+}
+
 /// Hub-wide content-addressed font store: one copy per distinct font, however
 /// many sessions push it. The key is [`proto::content_key`], computed by the HUB
 /// from the pushed bytes — there is no client-claimed key anywhere, so a
@@ -551,17 +562,26 @@ impl HubState {
         Some(id)
     }
 
-    /// Every registered session as `(id, slug, live)` — `live` meaning an
-    /// operator is currently pushing. For the management API's reconciliation
-    /// listing.
-    pub fn list_sessions(&self) -> Vec<(String, String, bool)> {
+    /// Every registered session for the management API's reconciliation listing.
+    /// `live` = an operator is currently pushing; `web`/`ssh` = live viewer counts
+    /// per transport. A registry STUB (allowed but never registered) has no `Session`
+    /// yet, so it reports `live=false` with zero viewers.
+    pub fn list_sessions(&self) -> Vec<SessionStatus> {
         let reg = self.registry.read().unwrap();
         let map = self.sessions.lock().unwrap();
         reg.by_id
             .iter()
             .map(|(id, slug)| {
-                let live = map.get(id).is_some_and(|s| s.live.is_online());
-                (id.clone(), slug.clone(), live)
+                let s = map.get(id);
+                SessionStatus {
+                    id: id.clone(),
+                    slug: slug.clone(),
+                    live: s.is_some_and(|s| s.live.is_online()),
+                    viewers: diff::Transport::ALL
+                        .iter()
+                        .map(|&t| (t.name(), s.map_or(0, |s| s.live.viewer_count(t))))
+                        .collect(),
+                }
             })
             .collect()
     }
@@ -935,7 +955,17 @@ async fn api_list(
     let sessions: Vec<serde_json::Value> = st
         .list_sessions()
         .into_iter()
-        .map(|(id, slug, live)| serde_json::json!({ "id": id, "slug": slug, "live": live }))
+        .map(|s| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("id".into(), s.id.into());
+            obj.insert("slug".into(), s.slug.into());
+            obj.insert("live".into(), s.live.into());
+            // One `<name>Viewers` key per transport (e.g. `webViewers`, `sshViewers`).
+            for (name, count) in s.viewers {
+                obj.insert(format!("{name}Viewers"), count.into());
+            }
+            serde_json::Value::Object(obj)
+        })
         .collect();
     api_json(StatusCode::OK, &serde_json::Value::Array(sessions))
 }
@@ -1661,10 +1691,15 @@ mod tests {
         st.add_session(&a, Some("alpha")).unwrap();
         let list = st.list_sessions();
         assert_eq!(list.len(), 1);
-        let (id, slug, live) = &list[0];
-        assert_eq!(id, &a);
-        assert_eq!(slug, "alpha");
-        assert!(!live, "no pusher has registered");
+        let s = &list[0];
+        assert_eq!(s.id, a);
+        assert_eq!(s.slug, "alpha");
+        assert!(!s.live, "no pusher has registered");
+        assert_eq!(
+            s.viewers,
+            vec![("web", 0), ("ssh", 0)],
+            "a stub has no viewers, one entry per transport"
+        );
     }
 
     #[test]

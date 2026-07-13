@@ -92,16 +92,38 @@ pub async fn list(hub: &str, key: &str) -> Result<()> {
         println!("no sessions registered");
         return Ok(());
     }
-    println!("{:<24} {:<8} SESSION ID", "SLUG", "STATE");
+    println!("{:<24} {:<8} {:<16} SESSION ID", "SLUG", "STATE", "VIEWERS");
     for s in sessions {
+        // Render every `<name>Viewers` count the hub reports (e.g. `web 2 ssh 1`),
+        // so a new viewer transport appears here without a CLI change. Names are
+        // `clean`ed — the hub is untrusted (see module docs).
+        let mut viewers: Vec<String> = s
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, v)| {
+                Some(format!(
+                    "{} {}",
+                    clean(k.strip_suffix("Viewers")?),
+                    v.as_u64()?
+                ))
+            })
+            .collect();
+        viewers.sort();
+        let viewers = if viewers.is_empty() {
+            "-".to_string()
+        } else {
+            viewers.join(" ")
+        };
         println!(
-            "{:<24} {:<8} {}",
+            "{:<24} {:<8} {:<16} {}",
             clean(s["slug"].as_str().unwrap_or("?")),
             if s["live"].as_bool().unwrap_or(false) {
                 "live"
             } else {
                 "offline"
             },
+            viewers,
             clean(s["id"].as_str().unwrap_or("?")),
         );
     }
