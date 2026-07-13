@@ -2458,8 +2458,8 @@ mod tests {
         g.images.push(ImagePlacement {
             row: 1,
             col: 2,
-            cols: Some(3),
-            rows: Some(1),
+            cols: Some(3.0),
+            rows: Some(1.0),
             hash: "ab".repeat(32),
         });
         let prev = Frame::Screen(grid(&[]));

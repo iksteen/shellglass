@@ -121,7 +121,7 @@ pub(crate) fn is_false(b: &bool) -> bool {
 /// in-frame base64 could never be cached and multiplied by every viewer).
 /// The bytes themselves live in [`Grid::image_data`] on the producing side
 /// and travel client→hub as blob messages, never inside frames.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImagePlacement {
     /// Top-left cell of the image. May be negative when the image has partially
     /// scrolled off the top: the viewer clips it above the screen edge.
@@ -129,12 +129,15 @@ pub struct ImagePlacement {
     pub row: i16,
     #[serde(rename = "c")]
     pub col: u16,
-    /// Display size in cells, if the app specified one (else the browser uses the
-    /// image's natural pixel size).
+    /// Display size in cells — **fractional**. When the app specified a size
+    /// it is that exact integer; when derived from the image's pixels it is
+    /// `pixels ÷ cell-size` un-rounded, so the viewer draws the image at the
+    /// same grid fraction the terminal did (the partial last row stays partly
+    /// empty, instead of a ceil'd full row the cursor would then overlap).
     #[serde(rename = "w", default, skip_serializing_if = "Option::is_none")]
-    pub cols: Option<u16>,
+    pub cols: Option<f32>,
     #[serde(rename = "h", default, skip_serializing_if = "Option::is_none")]
-    pub rows: Option<u16>,
+    pub rows: Option<f32>,
     /// Content address of the image bytes ([`crate::proto::content_key`]).
     #[serde(rename = "k")]
     pub hash: String,

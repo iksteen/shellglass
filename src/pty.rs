@@ -726,9 +726,9 @@ struct Placed {
     /// Resolved top-left, updated each frame from the surviving cell tags.
     row: i16,
     col: u16,
-    /// Stamped display size in cells.
-    cols: Option<u16>,
-    rows: Option<u16>,
+    /// Stamped display size in cells (fractional; see [`crate::model::ImagePlacement`]).
+    cols: Option<f32>,
+    rows: Option<f32>,
     /// Content address + payload. `None` while the decode worker still owes
     /// it: the placement is stamped (cursor semantics are exact from the
     /// moment the sequence arrives) but skipped in frames until the bytes
@@ -762,27 +762,38 @@ fn stamp_image(
     ready: Option<(String, crate::model::ImageBlob)>,
 ) -> std::num::NonZeroU32 {
     let (row, col) = parser.screen().cursor_position();
-    let cells = cells.or_else(|| {
-        px.map(|(w, h)| {
-            (
-                (w.div_ceil(u32::from(cell.0)) as u16).max(1),
-                (h.div_ceil(u32::from(cell.1)) as u16).max(1),
-            )
-        })
+    // Display size in cells. An app-specified footprint is exact; a derived one
+    // is the TRUE fractional extent (pixels ÷ cell size, NOT rounded up) so the
+    // viewer draws the image at the same grid fraction the terminal did — the
+    // partial last row stays partly empty instead of a ceil'd full row that the
+    // cursor (left on the image's last row) would then print text over.
+    let disp = cells
+        .map(|(c, r)| (f32::from(c), f32::from(r)))
+        .or_else(|| {
+            px.map(|(w, h)| {
+                (
+                    (w as f32 / f32::from(cell.0)).max(1.0),
+                    (h as f32 / f32::from(cell.1)).max(1.0),
+                )
+            })
+        });
+    let (cols, rows) = disp.map_or((None, None), |(c, r)| (Some(c), Some(r)));
+    // The parser tags whole cells (the image's grid lifetime), so it gets the
+    // CEIL of the display extent: every cell the image touches is tracked and
+    // managed by vt100's scroll/erase like a cell-based sixel terminal.
+    let (fw, fh) = disp.map_or((1, 1), |(c, r)| {
+        ((c.ceil() as u16).max(1), (r.ceil() as u16).max(1))
     });
-    let (cols, rows) = cells.map_or((None, None), |(c, r)| (Some(c), Some(r)));
     let id = *image_seq;
     *image_seq = image_seq
         .checked_add(1)
         .unwrap_or(std::num::NonZeroU32::MIN);
     parser
         .screen_mut()
-        .place_data(cols.unwrap_or(1), rows.unwrap_or(1), |row_off, col_off| {
-            ImgCell {
-                id,
-                row_off,
-                col_off,
-            }
+        .place_data(fw, fh, |row_off, col_off| ImgCell {
+            id,
+            row_off,
+            col_off,
         });
     images.push(Placed {
         id,
@@ -862,13 +873,15 @@ fn frame_from(
 fn rects_overlap(a: &Placed, b: &Placed) -> bool {
     let (ar, ac) = (i32::from(a.row), i32::from(a.col));
     let (br, bc) = (i32::from(b.row), i32::from(b.col));
+    // Ceil to whole cells: overlap is a grid-cell question (which cells a
+    // pending successor shares with a zombie), the fractional tail rounds up.
     let (aw, ah) = (
-        i32::from(a.cols.unwrap_or(1)),
-        i32::from(a.rows.unwrap_or(1)),
+        a.cols.map_or(1, |c| c.ceil() as i32),
+        a.rows.map_or(1, |r| r.ceil() as i32),
     );
     let (bw, bh) = (
-        i32::from(b.cols.unwrap_or(1)),
-        i32::from(b.rows.unwrap_or(1)),
+        b.cols.map_or(1, |c| c.ceil() as i32),
+        b.rows.map_or(1, |r| r.ceil() as i32),
     );
     ar < br + bh && br < ar + ah && ac < bc + bw && bc < ac + aw
 }
@@ -1484,6 +1497,53 @@ mod tests {
         assert_eq!(parser.screen().cursor_position(), (0, 4));
     }
 
+    // A derived footprint (no app-specified cells) carries the TRUE fractional
+    // extent for display, while the parser tags the CEIL in whole cells. This
+    // is the image/prompt-overlap fix: a 400×402 image on 9×21 cells is 44.4 ×
+    // 19.14 cells; the viewer draws it 19.14 rows tall so the partial last row
+    // stays empty for the prompt, instead of a ceil'd 20th row it would sit on.
+    #[test]
+    fn derived_footprint_is_fractional_but_tags_whole_cells() {
+        let mut parser = new_parser(24, 80);
+        let mut images = Vec::new();
+        let mut seq = std::num::NonZeroU32::MIN;
+        stamp_image(
+            &mut parser,
+            &mut images,
+            &mut seq,
+            (9, 21),          // cell px
+            None,             // no app-specified cells → derive from px
+            Some((400, 402)), // image px
+            None,
+        );
+        let p = &images[0];
+        assert!(
+            (p.cols.unwrap() - 400.0 / 9.0).abs() < 1e-3,
+            "fractional cols"
+        );
+        assert!(
+            (p.rows.unwrap() - 402.0 / 21.0).abs() < 1e-3,
+            "fractional rows"
+        );
+        // The grid tags the ceil (45 × 20): the last col/row are covered.
+        let s = parser.screen();
+        assert!(
+            s.cell(0, 44).and_then(vt100::Cell::data).is_some(),
+            "45th col tagged"
+        );
+        assert!(
+            s.cell(19, 0).and_then(vt100::Cell::data).is_some(),
+            "20th row tagged"
+        );
+        assert!(
+            s.cell(20, 0).and_then(vt100::Cell::data).is_none(),
+            "21st row is free"
+        );
+        // Cursor is left on the image's last (20th) row, where text will print —
+        // the row the fractional display leaves mostly empty on the viewer.
+        assert_eq!(parser.screen().cursor_position().0, 19);
+    }
+
     /// Place a `w`×`h` image at the parser's cursor, exactly as the screen
     /// thread does: stamp the cell tags and record the placement.
     fn place(parser: &mut SgParser, w: u16, h: u16) -> Vec<Placed> {
@@ -1500,8 +1560,8 @@ mod tests {
             id,
             row: i16::try_from(row).unwrap_or(0),
             col,
-            cols: Some(w),
-            rows: Some(h),
+            cols: Some(f32::from(w)),
+            rows: Some(f32::from(h)),
             ready: Some((
                 "ab".repeat(32),
                 crate::model::ImageBlob {
@@ -1583,8 +1643,8 @@ mod tests {
             id: id2,
             row: 0,
             col: 0,
-            cols: Some(4),
-            rows: Some(2),
+            cols: Some(4.0),
+            rows: Some(2.0),
             ready: None,
         });
 

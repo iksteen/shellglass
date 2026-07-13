@@ -118,7 +118,12 @@ pub const KEY_HEADER: &str = "x-shellglass-key";
 /// URLs (`fonts/<i>`) and the hub stores it verbatim, no rewriting. A v4
 /// client's absolute `/s/<id>/fonts/` URLs would be served untouched and 404
 /// (aliased sessions, subpath mounts), so v4 pairs must fail loudly instead.
-const SALT: &[u8] = b"shellglass/session-id/v5";
+///
+/// v6: an inline image's `w`/`h` (display size in cells) changed from integer
+/// to FRACTIONAL (the true pixel÷cell extent, un-rounded). A v5 hub deserializes
+/// the placement into `Option<u16>` and drops the whole frame on a value like
+/// `19.14`, so a v6 client → v5 hub would silently stop mirroring images.
+const SALT: &[u8] = b"shellglass/session-id/v6";
 
 /// The management-API identity domain. Same derivation as [`session_id`],
 /// DIFFERENT salt: domain separation. A leaked session key can never
