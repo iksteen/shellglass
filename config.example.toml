@@ -18,8 +18,13 @@ line_height  = 1.2
 
 # Kitty-style symbol_map: map Unicode codepoint ranges to a specific font.
 # First matching entry wins. Ranges accept "U+XXXX", "U+XXXX-U+YYYY", or "0xXXXX".
+# Skip the E0B0-E0B3 arrows: the viewer draws those as canvas geometry that
+# bleeds 1px past the cell edge to stay seamless with the segment bar. Mapping
+# them to a font locks each glyph inside one cell (no bleed) and reintroduces a
+# sub-pixel seam — the caret visibly detaches. Everything else (branch/padlock
+# E0A0-E0AF, rounded/flame separators E0B4-E0D4) has no geometry, so map it.
 [[symbol_map]]
-ranges = ["U+E0A0-U+E0D4", "U+E0B0-U+E0BF"]  # Powerline glyphs
+ranges = ["U+E0A0-U+E0AF", "U+E0B4-U+E0D4"]  # Powerline extras (arrows are canvas-drawn)
 font   = "Symbols Nerd Font"
 
 [[symbol_map]]
