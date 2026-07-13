@@ -438,6 +438,57 @@ at 0 in `Parser::new`.)
     win (faster but fidelity gaps) keeps it as a third mode, which is
     probably not worth carrying.
 
+## Interceptor/injector track — session recording + privacy pause
+
+Producer-side features on the `screen` thread's interceptor tee. **Customer
+request** drives the recording half; the pause half is coupled to it (both
+gate on one flag) so they land together or recording-first with the seam
+already in. Neither touches the wire, the hub, or mirror fidelity — the hub
+renders nothing and has no byte stream, so recording lives where the bytes
+are (serve *and* push both run `pty::start`). No salt bump.
+
+1. **Session recording (asciinema v2 cast).** `--record <path>` on the shared
+   source args (serve + push). Tap point is `Step::tee()` in the screen
+   thread's `Msg::Data` loop — the post-interception bytes the *local terminal
+   actually received* (so the transcoded sixel→kitty placements and the
+   kitty-reject suppression are in the cast faithfully; the raw pre-interceptor
+   read is NOT the recording, it holds sequences the screen never showed). The
+   web/vt100 side can't source a cast at all — it's grid + image *placements*,
+   not bytes. Writer: asciinema v2 = a header line
+   (`{"version":2,"width":cols,"height":rows,"timestamp":…}`) then JSONL
+   `[t,"o",<data>]` output events, `t` a relative `Instant::now()` elapsed
+   (the no-`Date` rule is workflow-scripts only; app code uses `Instant`
+   freely); SIGWINCH emits a `[t,"r","<cols>x<rows>"]` resize event (the
+   screen thread already owns the resize path). Bytes ride verbatim — asciinema
+   handles arbitrary escapes/UTF-8, no filtering. Timestamp for the header is
+   the one wall-clock read (`SystemTime::now()`), header only. Verify: record a
+   scripted session, assert the header dims, that concatenating the `"o"`
+   payloads reproduces the teed bytes exactly, and that `asciinema play` (or a
+   parser) replays it; a resize mid-session produces one `"r"` event.
+
+2. **Privacy pause.** A hotkey toggles a shared `paused: AtomicBool` the
+   screen thread reads. `paused` ⇒ { web frozen (skip `Passthrough`→parser,
+   the existing `connected`-gate shape), recorder skips its append } while the
+   **tee still flows to the local terminal** — the operator always sees their
+   own screen; nothing private lands in the web mirror OR the downloadable
+   cast. That last point is the customer-relevant coupling: a recording is
+   meant to be replayed/downloaded, so the pause MUST gate it, and it does
+   because both consult the one flag. Build the seam in item 1 (recorder reads
+   `paused`, always-false until this lands) so pause slots in with no rework.
+   Hotkey: pick a key the child never needs (the stdin thread already sees raw
+   input before the PTY writer — intercept there, don't forward it); a
+   brief on-terminal indicator on toggle (respecting the raw-mode/no-stray-
+   line constraint from phase-1 telemetry — a status-line write, restored on
+   resume). Verify: with `--record`, toggle pause, feed distinctive bytes,
+   assert they appear on the (mocked) terminal tee but NOT in the cast and NOT
+   in a published frame; resume and confirm flow returns.
+
+Open question for build time: whether a pause should also punctuate the cast
+with an asciinema marker (`[t,"m","paused"]`) so a replay shows the gap
+honestly, or stay invisible. Default invisible (simpler, and the gap in `t`
+already shows elapsed real time); add the marker only if a viewer of the
+replay needs to know a cut happened.
+
 ## Hub management API ✅ (landed 2026-07-11, `hub-api`: b296ff7 + 4f0baf8 + fc8f04e + 964a431)
 
 An external tool manages the hub's session registry at runtime: add a
