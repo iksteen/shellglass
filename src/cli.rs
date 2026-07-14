@@ -236,8 +236,9 @@ pub struct PushArgs {
 #[cfg(feature = "mirror")]
 #[derive(clap::Args, Debug)]
 struct SourceArgs {
-    /// Path to a TOML config (fonts + `symbol_map`). Optional.
-    #[arg(short, long)]
+    /// Path to a TOML config (fonts + `symbol_map`). Optional; falls back to
+    /// $SHELLGLASS_CONFIG.
+    #[arg(short, long, env = "SHELLGLASS_CONFIG")]
     config: Option<PathBuf>,
 
     /// EXPERIMENTAL: on a terminal that renders kitty/iTerm2 graphics but not sixel,

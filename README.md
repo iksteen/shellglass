@@ -89,7 +89,7 @@ Flags by command:
 | Flag | Commands | Meaning |
 |------|----------|---------|
 | `[CMD]…` (positional) | serve, push | interactive command to mirror in a PTY; put it last (after `--`). Omit for your `$SHELL` |
-| `--config <path>` | serve, push | TOML config (fonts, `symbol_map`, `template`); omit for defaults |
+| `--config <path>` | serve, push | TOML config (fonts, `symbol_map`, `template`); omit for defaults. Falls back to `$SHELLGLASS_CONFIG` |
 | `--bind <addr>` | serve, hub | HTTP listen address (default `127.0.0.1:8080`) |
 | `--ssh-bind <addr>` | serve, hub | also serve a read-only ANSI view over SSH here |
 | `--ssh-host-key <path>` | serve, hub | OpenSSH host key for the SSH view (generated + persisted 0600 if absent) |
