@@ -7,42 +7,22 @@
 //! the session id. Authenticates with `Authorization: Bearer <key>` in the
 //! API salt domain (the key's `api_id` must be on the hub's `--api-allow`).
 
+use crate::cliutil::{body_capped, checked_name, client, print_recordings, save_stream};
 use anyhow::{Context, Result, bail};
 use reqwest::StatusCode;
-
-fn client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .build()
-        .context("building HTTP client")
-}
+use std::path::Path;
 
 fn base(hub: &str) -> String {
     format!("{}/api/sessions", hub.trim_end_matches('/'))
 }
 
-/// Read a hub response body into a String, capped so a hostile/MITM hub can't OOM
-/// the CLI with an unbounded (or lying-`Content-Length`) body — `Response::text`
-/// buffers the whole thing with no ceiling. API responses are tiny; the cap is
-/// generous for any real session list.
-async fn body_capped(mut res: reqwest::Response) -> Result<String> {
-    const MAX: usize = 8 << 20;
-    let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = res.chunk().await.context("reading the hub response")? {
-        if buf.len() + chunk.len() > MAX {
-            bail!("hub response body exceeds {} MiB — refusing", MAX >> 20);
-        }
-        buf.extend_from_slice(&chunk);
-    }
-    String::from_utf8(buf).context("hub response body is not valid UTF-8")
-}
-
-/// Read the (capped) response body, returning it on success. On a non-success
-/// status, turn the body into a readable error instead — the API's own
-/// `{"error": …}` message when present, the raw body otherwise.
-async fn check(res: reqwest::Response) -> Result<String> {
+/// Pass a successful response through for the caller to consume. On a
+/// non-success status, turn the (capped) body into a readable error instead —
+/// the API's own `{"error": …}` message when present, the raw body otherwise.
+async fn check_ok(res: reqwest::Response) -> Result<reqwest::Response> {
     let status = res.status();
     if status.is_success() {
-        return body_capped(res).await;
+        return Ok(res);
     }
     // Tolerant on the error path: a body we can't read just yields the status line.
     let body = body_capped(res).await.unwrap_or_default();
@@ -64,6 +44,12 @@ async fn check(res: reqwest::Response) -> Result<String> {
         _ if msg.is_empty() => bail!("{status}"),
         _ => bail!("{status}: {msg}"),
     }
+}
+
+/// [`check_ok`], then the (capped) body — for the small control-plane
+/// responses. Recording downloads stream instead (see [`recording_get`]).
+async fn check(res: reqwest::Response) -> Result<String> {
+    body_capped(check_ok(res).await?).await
 }
 
 /// `GET /api/sessions` — print every registered session.
@@ -167,5 +153,76 @@ pub async fn remove_by_slug(hub: &str, key: &str, slug: &str) -> Result<()> {
         .context("removing the session")?;
     check(res).await?;
     println!("removed session with slug {slug}");
+    Ok(())
+}
+
+/// Which session a recordings operation targets, mirroring the API's two
+/// explicit route namespaces — an un-aliased slug IS the session id, so
+/// there is no guessing form (same doctrine as session removal).
+pub enum RecTarget<'a> {
+    Id(&'a str),
+    Slug(&'a str),
+}
+
+impl RecTarget<'_> {
+    /// The target's `…/recordings` collection URL.
+    fn url(&self, hub: &str) -> String {
+        let (ns, v) = match self {
+            RecTarget::Id(v) => ("by-id", v),
+            RecTarget::Slug(v) => ("by-slug", v),
+        };
+        format!("{}/{ns}/{v}/recordings", base(hub))
+    }
+}
+
+/// `GET /api/sessions/by-{id,slug}/…/recordings` — print the session's
+/// recordings, oldest first.
+pub async fn recordings_list(hub: &str, key: &str, target: &RecTarget<'_>) -> Result<()> {
+    let res = client()?
+        .get(target.url(hub))
+        .bearer_auth(key)
+        .send()
+        .await
+        .context("requesting the recording list")?;
+    print_recordings(&check(res).await?)
+}
+
+/// `GET /api/sessions/by-{id,slug}/…/recordings/<name>` — download one
+/// recording, streamed. See [`crate::cliutil::save_stream`] for the output
+/// semantics.
+pub async fn recording_get(
+    hub: &str,
+    key: &str,
+    target: &RecTarget<'_>,
+    name: &str,
+    output: Option<&Path>,
+) -> Result<()> {
+    let name = checked_name(name)?;
+    let res = client()?
+        .get(format!("{}/{name}", target.url(hub)))
+        .bearer_auth(key)
+        .send()
+        .await
+        .context("requesting the recording")?;
+    save_stream(check_ok(res).await?, name, output).await
+}
+
+/// `DELETE /api/sessions/by-{id,slug}/…/recordings/<name>` — delete one
+/// recording.
+pub async fn recording_delete(
+    hub: &str,
+    key: &str,
+    target: &RecTarget<'_>,
+    name: &str,
+) -> Result<()> {
+    let name = checked_name(name)?;
+    let res = client()?
+        .delete(format!("{}/{name}", target.url(hub)))
+        .bearer_auth(key)
+        .send()
+        .await
+        .context("deleting the recording")?;
+    check(res).await?;
+    println!("deleted {name}");
     Ok(())
 }

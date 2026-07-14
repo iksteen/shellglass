@@ -7,7 +7,7 @@ use clap::Parser;
 #[command(
     name = "shellglass-sessions",
     version,
-    about = "Manage a hub's sessions over its management API: list, add, remove"
+    about = "Manage a hub's sessions over its management API: list, add, remove, recordings"
 )]
 struct Cli {
     #[command(flatten)]

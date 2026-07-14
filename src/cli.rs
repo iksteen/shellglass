@@ -22,7 +22,12 @@ use crate::{config::Config, fonts, fonts::FontFile, fonts::Resolver, pty};
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
-#[cfg(any(feature = "mirror", feature = "hub", feature = "recordings"))]
+#[cfg(any(
+    feature = "mirror",
+    feature = "hub",
+    feature = "recordings",
+    feature = "sessions"
+))]
 use std::path::PathBuf;
 #[cfg(feature = "mirror")]
 use std::sync::Arc;
@@ -112,6 +117,71 @@ enum SessionsCmd {
         #[arg(long, group = "target")]
         slug: Option<String>,
     },
+    /// Manage any session's recordings: list, get, delete. (Session owners
+    /// can use `shellglass recordings` with their session key instead.)
+    Recordings {
+        #[command(subcommand)]
+        cmd: SessionsRecCmd,
+    },
+}
+
+/// Recordings operations under `sessions` — each targets a session by exactly
+/// one of `--id` or `--slug`, the same explicit-namespace rule as `remove`.
+#[cfg(feature = "sessions")]
+#[derive(clap::Subcommand, Debug)]
+enum SessionsRecCmd {
+    /// List the session's recordings (name, size), oldest first.
+    #[command(group(clap::ArgGroup::new("target").required(true).multiple(false)))]
+    List {
+        /// Target by SESSION ID.
+        #[arg(long, group = "target")]
+        id: Option<String>,
+        /// Target by VIEW SLUG.
+        #[arg(long, group = "target")]
+        slug: Option<String>,
+    },
+    /// Download one recording (streamed).
+    #[command(group(clap::ArgGroup::new("target").required(true).multiple(false)))]
+    Get {
+        /// Target by SESSION ID.
+        #[arg(long, group = "target")]
+        id: Option<String>,
+        /// Target by VIEW SLUG.
+        #[arg(long, group = "target")]
+        slug: Option<String>,
+        /// The recording's name from `list` (`<millis>.sgs`).
+        name: String,
+        /// Where to write it: a path (created fresh, never clobbered) or `-`
+        /// for stdout. Defaults to the recording's name in the current
+        /// directory.
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+    },
+    /// Delete one recording.
+    #[command(group(clap::ArgGroup::new("target").required(true).multiple(false)))]
+    Delete {
+        /// Target by SESSION ID.
+        #[arg(long, group = "target")]
+        id: Option<String>,
+        /// Target by VIEW SLUG.
+        #[arg(long, group = "target")]
+        slug: Option<String>,
+        /// The recording's name from `list` (`<millis>.sgs`).
+        name: String,
+    },
+}
+
+/// Resolve a recordings target from the `--id` XOR `--slug` clap group.
+#[cfg(feature = "sessions")]
+fn rec_target<'a>(
+    id: &'a Option<String>,
+    slug: &'a Option<String>,
+) -> crate::apictl::RecTarget<'a> {
+    match (id, slug) {
+        (Some(id), _) => crate::apictl::RecTarget::Id(id),
+        (_, Some(slug)) => crate::apictl::RecTarget::Slug(slug),
+        _ => unreachable!("clap group requires --id or --slug"),
+    }
 }
 
 #[cfg(feature = "sessions")]
@@ -134,6 +204,36 @@ impl SessionsArgs {
                 slug: Some(slug), ..
             } => crate::apictl::remove_by_slug(&self.url, &self.key, slug).await,
             SessionsCmd::Remove { .. } => unreachable!("clap group requires --id or --slug"),
+            SessionsCmd::Recordings { cmd } => match cmd {
+                SessionsRecCmd::List { id, slug } => {
+                    crate::apictl::recordings_list(&self.url, &self.key, &rec_target(id, slug))
+                        .await
+                }
+                SessionsRecCmd::Get {
+                    id,
+                    slug,
+                    name,
+                    output,
+                } => {
+                    crate::apictl::recording_get(
+                        &self.url,
+                        &self.key,
+                        &rec_target(id, slug),
+                        name,
+                        output.as_deref(),
+                    )
+                    .await
+                }
+                SessionsRecCmd::Delete { id, slug, name } => {
+                    crate::apictl::recording_delete(
+                        &self.url,
+                        &self.key,
+                        &rec_target(id, slug),
+                        name,
+                    )
+                    .await
+                }
+            },
         }
     }
 }
@@ -236,7 +336,8 @@ enum Action {
     #[cfg(feature = "hub")]
     Hub(HubArgs),
 
-    /// Manage a hub's sessions over its management API: list, add, remove.
+    /// Manage a hub's sessions over its management API: list, add, remove,
+    /// and any session's recordings.
     #[cfg(feature = "sessions")]
     Sessions(SessionsArgs),
 
