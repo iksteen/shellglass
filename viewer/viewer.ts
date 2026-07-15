@@ -2319,7 +2319,14 @@ function injectViewerCss(): void {
     // layout here (scoped, so a light-DOM embed can't leak them onto the host).
     // `--lh` and the base font come from the mount container (inline on the baked
     // #screen, or set from the render config by embed.js).
-    `${s}.screen{position:relative;white-space:pre;overflow:hidden}` +
+    // text-size-adjust: iOS Safari's autosizer inflates wide text blocks
+    // (landscape phones) — the ghost rows are its prime target, and they SIZE
+    // the fit-content screen box, so a boost distorts the whole terminal's
+    // aspect and unseats the canvas glyphs from the grid. The served head CSS
+    // opts out too; owning it here covers custom templates and sessions
+    // pushed by older clients (the hub always serves the current viewer.js).
+    `${s}.screen{position:relative;white-space:pre;overflow:hidden;` +
+    "-webkit-text-size-adjust:100%;text-size-adjust:100%}" +
     `${s}.row{position:relative;height:var(--lh);contain:layout style}` +
     // Ghost rows: transparent selectable text under the canvas. The explicit
     // ::selection background is the visible highlight — the UA default is

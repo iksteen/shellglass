@@ -1534,7 +1534,8 @@ function injectViewerCss() {
     const css = document.createElement("style");
     const s = cssScope;
     css.textContent =
-        `${s}.screen{position:relative;white-space:pre;overflow:hidden}` +
+        `${s}.screen{position:relative;white-space:pre;overflow:hidden;` +
+            "-webkit-text-size-adjust:100%;text-size-adjust:100%}" +
             `${s}.row{position:relative;height:var(--lh);contain:layout style}` +
             `${s}.row.ghost{color:transparent;text-shadow:none}` +
             `${s}.row.ghost::selection{background:rgba(110,170,255,.4)}` +

@@ -95,10 +95,17 @@ pub const EMBED_JS: &str = include_str!("embed.js");
 pub fn head_css(font_css: &str, config: &Config) -> String {
     // The terminal backdrop lives on #screen (not body) so a template controls the
     // surrounding page background; #screen stays black wherever it's placed.
+    // text-size-adjust: iOS Safari inflates the used font-size of wide text
+    // blocks (phones in landscape especially) — the ghost rows are its prime
+    // target, and #screen is fit-content sized BY those rows, so the boost
+    // widens the whole terminal box (~2x aspect distortion) while the px
+    // line-height pins row height, and the canvas glyphs land ~2x too big
+    // for the grid. 100% opts the terminal out without disabling user zoom.
     let base_css = format!(
         "html,body {{ margin:0; }}\n\
          #screen {{ font-family:{stack}; font-size:{fs}px; --lh:{lh}px; \
-         line-height:var(--lh); color:{fg}; background:#000; }}\n\
+         line-height:var(--lh); color:{fg}; background:#000; \
+         -webkit-text-size-adjust:100%; text-size-adjust:100%; }}\n\
          .screen {{ position:relative; white-space:pre; overflow:hidden; }}\n\
          .row {{ position:relative; height:var(--lh); contain:layout style; }}\n",
         stack = font_stack(config),
@@ -117,7 +124,8 @@ pub fn head_css(font_css: &str, config: &Config) -> String {
 pub fn default_head_css() -> String {
     "html,body { margin:0; }\n\
      #screen { font-family:monospace; font-size:14px; --lh:16.8px; \
-     line-height:var(--lh); color:#d0d0d0; background:#000; }\n\
+     line-height:var(--lh); color:#d0d0d0; background:#000; \
+     -webkit-text-size-adjust:100%; text-size-adjust:100%; }\n\
      .screen { position:relative; white-space:pre; overflow:hidden; }\n\
      .row { position:relative; height:var(--lh); contain:layout style; }\n"
         .to_string()
