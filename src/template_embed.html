@@ -31,22 +31,26 @@ body[data-offline="operator"] .off-op { display:inline; }
 <div class="sg-offline" aria-hidden="true"><span class="off-hub">offline</span><span class="off-op">operator offline</span></div>
 {{script}}
 <script>
-// Fit the terminal to the frame: CSS `zoom` (layout-affecting, so the flex
-// centering sees the scaled box), growing as well as shrinking — an embed
-// fills the box the host page gave it. The canvas re-rasterizes on "sg-zoom"
-// (see watchZoom in the viewer), so scaled text stays crisp. Re-fits when the
-// grid resizes (a new frame size moves #screen's box) or the frame does.
+// Fit the terminal to the frame with `transform: scale`, growing as well as
+// shrinking — an embed fills the box the host page gave it. Paint-time on
+// purpose: mobile WebKit's text autosizer boosts text CSS `zoom` makes tiny
+// (ignoring text-size-adjust), warping the box — a transform it never sees.
+// Layout keeps the natural box, but flex centering + the default center
+// origin + overflow:hidden mean the scaled picture lands centered anyway.
+// The canvas re-rasterizes on "sg-zoom" (see watchZoom in the viewer), so
+// scaled text stays crisp. Re-fits when the grid resizes (a new frame size
+// moves #screen's box) or the frame does.
 (() => {
   const scr = document.getElementById('screen');
   const fit = () => {
     const box = scr.firstElementChild;
     if (!box) return;
-    scr.style.zoom = 1;
+    scr.style.transform = 'none';
     const b = box.getBoundingClientRect();
     if (!b.width || !b.height) return;
     const z = Math.min(innerWidth / b.width, innerHeight / b.height);
     // a hair under the exact fit so sub-pixel rounding can't overflow the box
-    scr.style.zoom = z * 0.999;
+    scr.style.transform = 'scale(' + z * 0.999 + ')';
     window.dispatchEvent(new Event('sg-zoom'));
   };
   new ResizeObserver(fit).observe(scr);
