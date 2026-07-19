@@ -14,6 +14,15 @@ html, body { height:100%; }
 body { display:flex; align-items:center; justify-content:center;
        overflow:hidden; background:#000; }
 #screen { width:fit-content; }
+/* The fit scales #screen with `transform: scale` (paint-time — see the fit script).
+   The canvas mounts in #sg-canvas-host, OUTSIDE that transform, so WebKit
+   composites it at device resolution instead of resampling a transformed layer
+   (soft glyphs in Safari). The host mirrors the SCALED dimensions (layout can't
+   see the transform) so flex centering has a box to center; #screen keeps only
+   the transparent, selectable ghost rows. Origin 0 0 so the scaled ghost rows
+   land at the host's top-left, exactly under the canvas. */
+#sg-canvas-host { position:relative; }
+#screen { transform-origin:0 0; }
 /* Offline takeover: viewer.ts publishes body[data-offline="hub"|"operator"]
    (absent = live) — a frozen embed should say so, not just stand still. */
 .sg-offline { position:fixed; inset:0; display:none; align-items:center;
@@ -27,7 +36,7 @@ body[data-offline="operator"] .off-op { display:inline; }
 </style>
 </head>
 <body>
-{{screen}}
+<div id="sg-canvas-host">{{screen}}</div>
 <div class="sg-offline" aria-hidden="true"><span class="off-hub">offline</span><span class="off-op">operator offline</span></div>
 {{script}}
 <script>
@@ -41,16 +50,21 @@ body[data-offline="operator"] .off-op { display:inline; }
 // scaled text stays crisp. Re-fits when the grid resizes (a new frame size
 // moves #screen's box) or the frame does.
 (() => {
+  const host = document.getElementById('sg-canvas-host');
   const scr = document.getElementById('screen');
   const fit = () => {
     const box = scr.firstElementChild;
     if (!box) return;
-    scr.style.transform = 'none';
+    scr.style.transform = 'none'; // measure the natural (unscaled) grid box
     const b = box.getBoundingClientRect();
     if (!b.width || !b.height) return;
-    const z = Math.min(innerWidth / b.width, innerHeight / b.height);
     // a hair under the exact fit so sub-pixel rounding can't overflow the box
-    scr.style.transform = 'scale(' + z * 0.999 + ')';
+    const z = Math.min(innerWidth / b.width, innerHeight / b.height) * 0.999;
+    scr.style.transform = 'scale(' + z + ')';
+    // transform is invisible to layout, so mirror the scaled size onto the
+    // non-transformed host — the flex-centered box AND the canvas's 100% frame.
+    host.style.width = b.width * z + 'px';
+    host.style.height = b.height * z + 'px';
     window.dispatchEvent(new Event('sg-zoom'));
   };
   new ResizeObserver(fit).observe(scr);
