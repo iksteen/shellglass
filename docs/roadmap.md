@@ -663,6 +663,17 @@ the DOM mode was removed entirely.**
    rebuilds teleport). Verified: `verify.py` `?mode=cursor` self-check
    (suppression + mid-travel position + landing, driven synchronously via
    `benchCursorStep`).
+4. **embed.js: fit with transform + canvasHost, not CSS zoom** (suggested in
+   PR #1): `mountLight`/the shadow path in `src/embed.js` still scales `wrap`
+   with CSS `zoom`, which WebKit composites crisp but the mobile-WebKit text
+   autosizer counts toward its minimum effective font size (warps wide
+   terminals on phones — the same bug 708be36 fixed for the templates).
+   Switch the fit to `transform: scale` on `wrap`, mirror the scaled size
+   onto the host box (snapped to whole device pixels like the templates),
+   and pass that box as `MountOpts.canvasHost` so WebKit doesn't resample
+   the transformed canvas. Verify: embed a wide session on iOS Safari (no
+   warp) and macOS Safari (no soft glyphs); desktop Chrome/Firefox
+   unchanged.
 ### D. Text fidelity (canvas mode)
 
 Context, from the 2026-07-11 WebGL research: canvas `fillText` already uses
