@@ -130,6 +130,16 @@ icy_sixel = { version = "0.5", optional = true }
 [target.'cfg(target_env = "musl")'.dependencies]
 mimalloc = "0.1"
 
+# Native Windows terminal support: console modes/geometry around portable-pty's
+# ConPTY backend, plus atomic sessions-file replacement.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 # Router-level tests drive the hub's management API via ServiceExt::oneshot.
 tower = { version = "0.5", features = ["util"] }

@@ -3624,6 +3624,7 @@ dependencies = [
  "ttf-parser",
  "tungstenite 0.29.0",
  "vt100",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

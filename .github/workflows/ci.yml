@@ -41,6 +41,32 @@ jobs:
             cargo check --locked --no-default-features ${f:+--features $f}
           done
 
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --workspace --locked --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+      - name: Check feature matrix
+        env:
+          RUSTFLAGS: -D warnings
+        run: |
+          cargo check --locked --no-default-features --features hub
+          cargo check --locked --no-default-features --features serve
+          cargo check --locked --no-default-features --features push
+          cargo check --locked --no-default-features
+
   # The browser renderer is TypeScript, compiled to the committed viewer/dist/viewer.js
   # that build.rs bakes in. Type-check it, run its unit tests, and confirm the committed
   # build is regenerated from source (so it can never drift).

@@ -1,8 +1,8 @@
 //! PTY backend: run an interactive command in a pseudo-terminal that you drive
 //! from your own terminal, while mirroring its screen to the browser — the
 //! `script(1)` model. One PTY feeds a single [`vt100::Parser`], snapshotted as
-//! [`Frame`]s at a 30fps cap for the diff/stream pipeline. Unix only (raw mode +
-//! `TIOCGWINSZ`).
+//! [`Frame`]s at a 30fps cap for the diff/stream pipeline. Unix uses termios +
+//! `TIOCGWINSZ`; Windows uses console VT modes + ConPTY.
 //!
 //! One `screen` thread owns everything that touches the real terminal — the raw
 //! mode, stdout, and the vt100 parser — so hub-connection notices can be shown
@@ -145,10 +145,11 @@ pub fn start(
 
     // Raw mode now, before the child draws anything.
     let raw = RawMode::acquire();
-    // Ask the terminal which image protocols it renders (before the input bridge
-    // starts, so its replies don't leak to the child). We only intercept protocols
-    // the terminal supports, so the web mirror matches what's on the local screen
-    // rather than eating a sequence into a web image the terminal never showed.
+    // Ask the terminal which image protocols it renders and which default colors
+    // its active scheme uses (before the input bridge starts, so the replies don't
+    // leak to the child). Protocol gating preserves mirror fidelity; carrying the
+    // real defaults matters for unstyled/faint-looking text such as Claude Code's
+    // tab-completion suggestion.
     let caps = probe_caps();
     let iterm = iterm_supported();
     // EXPERIMENTAL (opt-in via --sixel-compat): terminal renders kitty/iTerm2
@@ -177,11 +178,13 @@ pub fn start(
         let _ = out.flush();
     }
     let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
-    let (frame_tx, frame_rx) = watch::channel(frame_from(
-        &new_parser(rows, cols),
+    let initial_parser = new_parser(rows, cols);
+    let (frame_tx, frame_rx) = watch::channel(frame_from_with_defaults(
+        &initial_parser,
         &mut Vec::new(),
         &mut Vec::new(),
         &mut CursorBridge::default(),
+        caps,
     ));
 
     // PTY reader → screen thread.
@@ -231,10 +234,12 @@ pub fn start(
         });
     }
 
-    // Size watcher: reflect terminal resizes into the PTY + parser on SIGWINCH.
-    // `master` isn't `Sync`, so it stays in this one thread rather than being shared
-    // with a separate signal thread. If signal registration fails (rare), resize
-    // tracking is skipped — the initial size still applies.
+    // Size watcher: reflect the outer terminal into the child PTY + parser.
+    // `master` isn't `Sync`, so one platform-specific thread owns it. Unix wakes on
+    // SIGWINCH; Windows' byte-oriented VT input doesn't expose resize records, so it
+    // polls the cheap console geometry query. If setup/querying fails, the initial
+    // size still applies.
+    #[cfg(unix)]
     {
         let msg_tx = msg_tx.clone();
         std::thread::spawn(move || {
@@ -245,6 +250,31 @@ pub fn start(
             };
             let mut last = (cols, rows);
             for _ in &mut signals {
+                match term_geom() {
+                    Some(g) if (g.cols, g.rows) != last => {
+                        last = (g.cols, g.rows);
+                        let _ = master.resize(PtySize {
+                            rows: g.rows,
+                            cols: g.cols,
+                            pixel_width: g.px_w,
+                            pixel_height: g.px_h,
+                        });
+                        if msg_tx.send(Msg::Resize(g.rows, g.cols)).is_err() {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+    #[cfg(windows)]
+    {
+        let msg_tx = msg_tx.clone();
+        std::thread::spawn(move || {
+            let mut last = (cols, rows);
+            loop {
+                std::thread::sleep(Duration::from_millis(100));
                 match term_geom() {
                     Some(g) if (g.cols, g.rows) != last => {
                         last = (g.cols, g.rows);
@@ -282,7 +312,8 @@ pub fn start(
         let (seqlog, seq_seen) = SeqLog::new();
         let parser = vt100::Parser::new_with_callbacks(rows, cols, 0, seqlog);
         screen_thread(
-            msg_rx, ready_tx, frame_tx, raw, parser, seq_seen, cell, intercept, transcode, inject,
+            msg_rx, ready_tx, frame_tx, raw, parser, seq_seen, cell, intercept, transcode, caps,
+            inject,
         );
     });
 
@@ -309,6 +340,7 @@ fn screen_thread(
     cell: (u16, u16),
     intercept: (bool, bool, bool),
     transcode: Option<crate::images::GfxProto>,
+    caps: Caps,
     inject: Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
 ) {
     let mut out = std::io::stdout();
@@ -497,7 +529,7 @@ fn screen_thread(
                 dirty = true;
             }
             Some(Msg::Shutdown) => {
-                raw.leave();
+                raw.restore();
                 let _ = out.flush();
                 // The terminal is cooked again — the one moment printing is safe.
                 report_unmirrored(&seq_seen);
@@ -513,7 +545,13 @@ fn screen_thread(
                 .hidden_since
                 .is_some_and(|t| t.elapsed() >= CURSOR_HIDE_GRACE);
         if (dirty || hide_due) && last_frame.elapsed() >= MIN_FRAME && !sync.hold(parser.screen()) {
-            let _ = frame_tx.send(frame_from(&parser, &mut images, &mut zombies, &mut bridge));
+            let _ = frame_tx.send(frame_from_with_defaults(
+                &parser,
+                &mut images,
+                &mut zombies,
+                &mut bridge,
+                caps,
+            ));
             dirty = false;
             last_frame = Instant::now();
         }
@@ -849,13 +887,37 @@ impl CursorBridge {
     }
 }
 
+#[cfg(test)]
 fn frame_from(
     parser: &SgParser,
     images: &mut Vec<Placed>,
     zombies: &mut Vec<Placed>,
     bridge: &mut CursorBridge,
 ) -> Arc<Frame> {
+    frame_from_with_defaults(parser, images, zombies, bridge, Caps::default())
+}
+
+fn frame_from_with_defaults(
+    parser: &SgParser,
+    images: &mut Vec<Placed>,
+    zombies: &mut Vec<Placed>,
+    bridge: &mut CursorBridge,
+    caps: Caps,
+) -> Arc<Frame> {
     let mut grid = crate::parse::grid_from_screen(parser.screen());
+    // An OSC 10/11 app override wins. `Default` means either no override or an
+    // OSC 110/111 reset, both of which resolve to the probed outer-terminal
+    // scheme—not the viewer's hard-coded fallback.
+    if grid.default_colors.0 == crate::model::Color::Default
+        && let Some((r, g, b)) = caps.default_fg
+    {
+        grid.default_colors.0 = crate::model::Color::Rgb(r, g, b);
+    }
+    if grid.default_colors.1 == crate::model::Color::Default
+        && let Some((r, g, b)) = caps.default_bg
+    {
+        grid.default_colors.1 = crate::model::Color::Rgb(r, g, b);
+    }
     bridge.apply(&mut grid, Instant::now());
     grid.images = resolve_images(parser.screen(), images, zombies);
     grid.image_data = images
@@ -1001,6 +1063,7 @@ struct TermGeom {
 const FALLBACK_CELL: (u16, u16) = (8, 16);
 
 /// Our controlling terminal's geometry, if stdin is a tty.
+#[cfg(unix)]
 fn term_geom() -> Option<TermGeom> {
     let ws = rustix::termios::tcgetwinsize(std::io::stdin()).ok()?;
     if ws.ws_col == 0 {
@@ -1021,6 +1084,50 @@ fn term_geom() -> Option<TermGeom> {
     })
 }
 
+/// Visible console geometry for the Windows Terminal/conhost hosting us. ConPTY
+/// exposes rows/columns but no reliable outer-terminal pixel dimensions, so use
+/// the same synthesized cell size as Unix terminals whose winsize reports zero
+/// pixels. This only chooses an image source resolution; the browser still fits
+/// the bitmap to the exact cell rectangle.
+#[cfg(windows)]
+fn term_geom() -> Option<TermGeom> {
+    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Console::{
+        CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetStdHandle, STD_ERROR_HANDLE,
+        STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    for which in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE, STD_INPUT_HANDLE] {
+        // SAFETY: GetStdHandle returns a borrowed process-wide standard handle.
+        let handle: HANDLE = unsafe { GetStdHandle(which) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        // SAFETY: the zeroed representation is valid for this plain C data
+        // structure, and the API initializes it before we inspect any field.
+        let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
+        // SAFETY: `handle` is borrowed and `info` is valid writable storage.
+        if unsafe { GetConsoleScreenBufferInfo(handle, &mut info) } == 0 {
+            continue;
+        }
+        let cols = i32::from(info.srWindow.Right) - i32::from(info.srWindow.Left) + 1;
+        let rows = i32::from(info.srWindow.Bottom) - i32::from(info.srWindow.Top) + 1;
+        let (Ok(cols), Ok(rows)) = (u16::try_from(cols), u16::try_from(rows)) else {
+            continue;
+        };
+        if cols == 0 || rows == 0 {
+            continue;
+        }
+        return Some(TermGeom {
+            cols,
+            rows,
+            px_w: cols.saturating_mul(FALLBACK_CELL.0),
+            px_h: rows.saturating_mul(FALLBACK_CELL.1),
+        });
+    }
+    None
+}
+
 /// Graphics-protocol support the controlling terminal advertises, learned from a
 /// capability handshake rather than a `TERM` signature.
 #[derive(Clone, Copy, Default)]
@@ -1029,13 +1136,22 @@ struct Caps {
     kitty: bool,
     /// Sixel — Primary DA listed feature `4`.
     sixel: bool,
+    /// The outer terminal's active default foreground/background (OSC 10/11).
+    default_fg: Option<(u8, u8, u8)>,
+    default_bg: Option<(u8, u8, u8)>,
 }
 
-/// Ask the terminal which image protocols it renders. Emits a kitty graphics
-/// support query then Primary DA; DA is the fence (every terminal answers it, so
-/// its reply ends the wait — no fixed timeout to guess). Returns nothing if stdin
-/// isn't a tty or the terminal stays silent. Must run before the stdin→PTY bridge
-/// starts, so the replies are consumed here and not forwarded to the child.
+/// Capability/default-color query. DA comes last as the ordering fence: once its
+/// reply arrives, the preceding kitty and OSC 10/11 replies have arrived too.
+const CAP_QUERY: &[u8] =
+    b"\x1b_Gi=1,a=q,s=1,v=1,t=d,f=24;AAAA\x1b\\\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b[c";
+
+/// Ask the terminal which image protocols it renders and which default colors its
+/// active scheme uses. DA is the fence (every terminal answers it, so its reply
+/// ends the wait — no fixed timeout to guess). Returns defaults if stdin isn't a
+/// tty or the terminal stays silent. Must run before the stdin→PTY bridge starts,
+/// so the replies are consumed here and not forwarded to the child.
+#[cfg(unix)]
 fn probe_caps() -> Caps {
     use rustix::termios::{OptionalActions, SpecialCodeIndex, tcgetattr, tcsetattr};
     use std::os::fd::AsFd;
@@ -1052,10 +1168,7 @@ fn probe_caps() -> Caps {
     if tcsetattr(fd, OptionalActions::Now, &probe).is_err() {
         return Caps::default();
     }
-    let _ = rustix::io::write(
-        std::io::stdout().as_fd(),
-        b"\x1b_Gi=1,a=q,s=1,v=1,t=d,f=24;AAAA\x1b\\\x1b[c",
-    );
+    let _ = rustix::io::write(std::io::stdout().as_fd(), CAP_QUERY);
     let mut buf = Vec::new();
     let mut chunk = [0u8; 256];
     // A real terminal answers DA in milliseconds and we break the instant it does
@@ -1080,6 +1193,74 @@ fn probe_caps() -> Caps {
     parse_caps(&buf)
 }
 
+/// Windows equivalent of the termios timed read above. `RawMode::acquire` has
+/// already enabled `ENABLE_VIRTUAL_TERMINAL_INPUT`, so terminal replies arrive as
+/// the same byte stream that will later feed the ConPTY. Waiting on the console
+/// handle gives us a bounded read without a second thread that could steal future
+/// keystrokes from the real stdin bridge.
+#[cfg(windows)]
+fn probe_caps() -> Caps {
+    use std::io::Write;
+    use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::Storage::FileSystem::ReadFile;
+    use windows_sys::Win32::System::Console::{GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE};
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    // SAFETY: GetStdHandle returns a borrowed process-wide standard handle.
+    let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if input.is_null() || input == INVALID_HANDLE_VALUE {
+        return Caps::default();
+    }
+    let mut mode = 0;
+    // A redirected file/pipe is not an outer Windows console to probe.
+    // SAFETY: `mode` is writable and `input` remains owned by the process.
+    if unsafe { GetConsoleMode(input, &mut mode) } == 0 {
+        return Caps::default();
+    }
+
+    let mut out = std::io::stdout();
+    if out.write_all(CAP_QUERY).and_then(|()| out.flush()).is_err() {
+        return Caps::default();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 256];
+    while Instant::now() < deadline {
+        let millis = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(100))
+            .as_millis() as u32;
+        // SAFETY: waiting does not take ownership of the valid console handle.
+        match unsafe { WaitForSingleObject(input, millis) } {
+            WAIT_OBJECT_0 => {
+                let mut read = 0;
+                // SAFETY: `chunk` is valid writable storage and this synchronous
+                // call completes before either pointer leaves scope.
+                if unsafe {
+                    ReadFile(
+                        input,
+                        chunk.as_mut_ptr(),
+                        chunk.len() as u32,
+                        &mut read,
+                        std::ptr::null_mut(),
+                    )
+                } == 0
+                {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..read as usize]);
+                if da_seen(&buf) {
+                    break;
+                }
+            }
+            WAIT_TIMEOUT => {}
+            _ => break,
+        }
+    }
+    parse_caps(&buf)
+}
+
 /// Terminals that render the iTerm2 inline-image protocol. Its OSC 1337 has no
 /// capability query (unlike kitty graphics / sixel), so this is the one protocol we
 /// can only detect by a `TERM_PROGRAM` signature — a deliberate, documented
@@ -1099,9 +1280,17 @@ fn da_seen(buf: &[u8]) -> bool {
 
 /// Interpret the collected handshake replies.
 fn parse_caps(buf: &[u8]) -> Caps {
+    // Reuse the terminal parser's OSC-color grammar rather than maintaining a
+    // second parser here. Everything else in the reply stream is non-visual;
+    // incidental keystrokes may draw in this throwaway parser but cannot affect
+    // the two defaults we read.
+    let mut colors = vt100::Parser::new(1, 1, 0);
+    colors.process(buf);
     Caps {
         kitty: kitty_ok(buf),
         sixel: da_sixel(buf),
+        default_fg: colors.screen().default_fg(),
+        default_bg: colors.screen().default_bg(),
     }
 }
 
@@ -1214,11 +1403,14 @@ impl DaRewriter {
 }
 
 /// Owns the terminal's raw-mode state: `acquire` enters raw and remembers the
-/// original settings; `leave`/`enter` toggle between them for the hub-outage pause.
+/// original settings; `leave`/`enter` toggle between them for the hub-outage pause,
+/// and `restore` puts every changed setting back before process exit.
+#[cfg(unix)]
 struct RawMode {
     orig: Option<rustix::termios::Termios>,
 }
 
+#[cfg(unix)]
 impl RawMode {
     fn acquire() -> RawMode {
         // tcgetattr fails on a non-tty (e.g. piped) — leave the fd as-is.
@@ -1256,6 +1448,118 @@ impl RawMode {
                 rustix::termios::OptionalActions::Now,
                 &rawt,
             );
+        }
+    }
+
+    fn restore(&self) {
+        self.leave();
+    }
+}
+
+/// Windows console-mode counterpart to termios. ConPTY itself is supplied by
+/// `portable-pty`; these modes make our *outer* console a byte-oriented VT terminal
+/// so key/mouse sequences can be copied verbatim into that ConPTY.
+#[cfg(windows)]
+struct RawMode {
+    input_orig: Option<u32>,
+    output_orig: Option<u32>,
+    input_raw: Option<u32>,
+    output_raw: Option<u32>,
+}
+
+#[cfg(windows)]
+impl RawMode {
+    fn acquire() -> RawMode {
+        use windows_sys::Win32::System::Console::{
+            DISABLE_NEWLINE_AUTO_RETURN, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS,
+            ENABLE_INSERT_MODE, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT,
+            ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
+            ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT, GetConsoleMode, GetStdHandle,
+            STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
+        };
+
+        // SAFETY: standard handles are process-owned and remain valid here.
+        let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        // SAFETY: standard handles are process-owned and remain valid here.
+        let output = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        let mut input_mode = 0;
+        let mut output_mode = 0;
+        // SAFETY: each mode pointer is valid writable storage; failure simply means
+        // that stream is redirected and needs no console-mode management.
+        let input_orig =
+            (unsafe { GetConsoleMode(input, &mut input_mode) } != 0).then_some(input_mode);
+        // SAFETY: as above, for the output handle.
+        let output_orig =
+            (unsafe { GetConsoleMode(output, &mut output_mode) } != 0).then_some(output_mode);
+
+        let input_raw = input_orig.map(|mode| {
+            (mode
+                & !(ENABLE_ECHO_INPUT
+                    | ENABLE_LINE_INPUT
+                    | ENABLE_PROCESSED_INPUT
+                    | ENABLE_QUICK_EDIT_MODE
+                    | ENABLE_INSERT_MODE
+                    | ENABLE_WINDOW_INPUT))
+                | ENABLE_EXTENDED_FLAGS
+                | ENABLE_VIRTUAL_TERMINAL_INPUT
+        });
+        let output_raw = output_orig.map(|mode| {
+            mode | ENABLE_PROCESSED_OUTPUT
+                | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                | DISABLE_NEWLINE_AUTO_RETURN
+        });
+        if let Some(mode) = input_raw {
+            // SAFETY: setting a mode doesn't consume the process-owned handle.
+            let _ = unsafe { SetConsoleMode(input, mode) };
+        }
+        if let Some(mode) = output_raw {
+            // SAFETY: as above, for stdout.
+            let _ = unsafe { SetConsoleMode(output, mode) };
+        }
+        RawMode {
+            input_orig,
+            output_orig,
+            input_raw,
+            output_raw,
+        }
+    }
+
+    /// Return input to cooked mode for an outage notice. Keep VT output enabled so
+    /// that the reset/clear/color sequences used by the notice still render even if
+    /// the caller's original conhost mode did not enable them.
+    fn leave(&self) {
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode};
+        if let Some(mode) = self.input_orig {
+            // SAFETY: the process-owned standard handle remains valid.
+            let _ = unsafe { SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), mode) };
+        }
+    }
+
+    fn enter(&self) {
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
+        };
+        if let Some(mode) = self.input_raw {
+            // SAFETY: the process-owned standard handle remains valid.
+            let _ = unsafe { SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), mode) };
+        }
+        if let Some(mode) = self.output_raw {
+            // SAFETY: as above, for stdout.
+            let _ = unsafe { SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), mode) };
+        }
+    }
+
+    fn restore(&self) {
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
+        };
+        if let Some(mode) = self.input_orig {
+            // SAFETY: the process-owned standard handle remains valid.
+            let _ = unsafe { SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), mode) };
+        }
+        if let Some(mode) = self.output_orig {
+            // SAFETY: as above, for stdout.
+            let _ = unsafe { SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), mode) };
         }
     }
 }
@@ -1358,16 +1662,60 @@ mod tests {
 
     #[test]
     fn handshake_replies_parse_to_caps() {
-        // kitty OK + a DA that lists sixel (4).
-        let both = b"\x1b_Gi=1;OK\x1b\\\x1b[?62;4;22c";
+        // Kitty OK + default colors + a DA that lists sixel (4).
+        let both = b"\x1b_Gi=1;OK\x1b\\\x1b]10;rgb:cccc/aaaa/8888\x1b\\\
+                     \x1b]11;rgb:1111/2222/3333\x1b\\\x1b[?62;4;22c";
         let caps = parse_caps(both);
         assert!(caps.kitty && caps.sixel);
+        assert_eq!(caps.default_fg, Some((0xcc, 0xaa, 0x88)));
+        assert_eq!(caps.default_bg, Some((0x11, 0x22, 0x33)));
+        let parser = new_parser(24, 80);
+        let Frame::Screen(grid) = &*frame_from_with_defaults(
+            &parser,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut CursorBridge::default(),
+            caps,
+        );
+        assert_eq!(
+            grid.default_colors.0,
+            crate::model::Color::Rgb(0xcc, 0xaa, 0x88)
+        );
+        assert_eq!(
+            grid.default_colors.1,
+            crate::model::Color::Rgb(0x11, 0x22, 0x33)
+        );
+        // An app override wins; its reset resolves back to the probed scheme.
+        let mut parser = parser;
+        parser.process(b"\x1b]10;#010203\x1b\\");
+        let Frame::Screen(grid) = &*frame_from_with_defaults(
+            &parser,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut CursorBridge::default(),
+            caps,
+        );
+        assert_eq!(grid.default_colors.0, crate::model::Color::Rgb(1, 2, 3));
+        parser.process(b"\x1b]110\x1b\\");
+        let Frame::Screen(grid) = &*frame_from_with_defaults(
+            &parser,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut CursorBridge::default(),
+            caps,
+        );
+        assert_eq!(
+            grid.default_colors.0,
+            crate::model::Color::Rgb(0xcc, 0xaa, 0x88)
+        );
         assert!(da_seen(both));
 
-        // DA without 4, and a kitty *error* reply → neither.
+        // DA without 4, and a kitty *error* reply → neither; absent OSC replies
+        // leave the configured viewer defaults in force.
         let neither = b"\x1b_Gi=1;ENOTSUPPORTED:nope\x1b\\\x1b[?62;22c";
         let caps = parse_caps(neither);
         assert!(!caps.kitty && !caps.sixel);
+        assert_eq!((caps.default_fg, caps.default_bg), (None, None));
 
         // No DA yet → fence hasn't arrived.
         assert!(!da_seen(b"\x1b_Gi=1;OK\x1b\\"));
