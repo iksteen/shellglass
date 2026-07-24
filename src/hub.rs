@@ -375,6 +375,38 @@ pub struct HubState {
     record_dir: Option<Arc<std::path::PathBuf>>,
 }
 
+/// Atomically replace the registry snapshot. Unix `rename` replaces an existing
+/// destination; Windows' Rust `rename` does not, so request the equivalent native
+/// replace operation there. Source and destination are siblings, hence same-volume.
+#[cfg(unix)]
+fn replace_file(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn replace_file(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: both slices are NUL-terminated and remain alive for the call.
+    if unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 impl HubState {
     pub fn new(allow: AllowConfig, base: String) -> Self {
         let (shutdown, _) = broadcast::channel(1);
@@ -499,8 +531,7 @@ impl HubState {
         }
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, text).with_context(|| format!("writing {tmp:?}"))?;
-        std::fs::rename(&tmp, path.as_ref())
-            .with_context(|| format!("moving {tmp:?} into place"))?;
+        replace_file(&tmp, path.as_ref()).with_context(|| format!("moving {tmp:?} into place"))?;
         Ok(())
     }
 

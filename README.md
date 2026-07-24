@@ -20,8 +20,10 @@ shellglass push https://hub --key … -- bash       # or stream it to a hub
 ```
 
 The command to mirror goes **last**, after any flags (use `--` to separate it); omit it
-to mirror your `$SHELL`. The terminal is switched to raw mode for the session and
-restored when the command exits (which also quits shellglass). Unix only.
+to mirror your `$SHELL` on Unix or `%COMSPEC%` on Windows. The terminal is switched
+to raw mode for the session and restored when the command exits (which also quits
+shellglass). On Windows, shellglass uses ConPTY and requires Windows 10 version 1809
+or newer; Windows Terminal is the recommended host.
 
 ## Build & quickstart
 
@@ -29,6 +31,14 @@ restored when the command exits (which also quits shellglass). Unix only.
 cargo build --release
 ./target/release/shellglass serve --bind 127.0.0.1:8080
 # open http://127.0.0.1:8080/ — the browser mirrors this terminal live
+```
+
+From PowerShell on Windows:
+
+```powershell
+cargo build --release
+.\target\release\shellglass.exe serve --bind 127.0.0.1:8080
+# Omit the command for cmd.exe, or append: -- pwsh.exe -NoLogo
 ```
 
 ## Hub + client

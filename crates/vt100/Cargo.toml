@@ -73,14 +73,17 @@
 #     Attrs carries the id (Cell<()> is 44 bytes with it). Tests in
 #     tests/osc.rs (hyperlinks_…).
 #   - perform.rs: deliberate no-ops for non-visual queries/syntax — Primary and
-#     Secondary DA (`CSI c`/`CSI > c`), bare ST (`ESC \`), XTWINOPS reports
+#     Secondary DA (`CSI c`/`CSI > c`), standard DSR (`CSI 5/6 n`), bare ST
+#     (`ESC \`), XTWINOPS reports
 #     (`CSI 11/13/14/16/18/19/21 t`; 22/23 became the title stack above),
 #     OSC 10/11 color *queries* (`;?` only; the set form is mirrored), cursor
 #     blink (`CSI ? 12 h/l` — the mirror renders a steady cursor by design),
 #     and SCS US-ASCII (`ESC ( B`/`ESC ) B` — the only charset modeled;
 #     `ESC ( 0` DEC graphics keeps reporting). Round 4 added XTVERSION
-#     (`CSI > q`), XTMODKEYS (`CSI > … m`), private DSR (`CSI ? … n`), and
-#     modes 1004 (focus reporting), 2031 (color-scheme notifications) and
+#     (`CSI > q`), XTMODKEYS (`CSI > … m`), private DSR (`CSI ? … n`), kitty
+#     keyboard query/push/pop (`CSI ?/>/< … u`), Claude's undefined bare
+#     teardown mode (`CSI 25 l`), OSC 133 shell-integration markers, and modes
+#     1004 (focus reporting), 2031 (color-scheme notifications) and
 #     7727 (urxvt application-ESC) — all keyboard/query protocol, zero render
 #     effect. Round 5 added sixel display/scroll modes 80 (DECSDM) and 8452
 #     (cursor right of graphic) to the ignored set — sixel is mirrored by

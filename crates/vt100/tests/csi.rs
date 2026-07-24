@@ -381,9 +381,12 @@ fn noop_arms_round4() {
     vt.process(b"a");
     vt.process(b"\x1b[>4;2m\x1b[>4m\x1b[>m"); // XTMODKEYS (modifyOtherKeys)
     vt.process(b"\x1b[>q"); // XTVERSION
+    vt.process(b"\x1b[?u\x1b[>1u\x1b[<u"); // kitty keyboard query/push/pop
+    vt.process(b"\x1b[25l"); // undefined bare mode Claude emits on teardown
     vt.process(b"\x1b[?1004h\x1b[?1004l"); // focus-event reporting
     vt.process(b"\x1b[?2031h\x1b[?2031l"); // color-scheme notifications
     vt.process(b"\x1b[?7727h\x1b[?7727l"); // urxvt application-ESC mode
+    vt.process(b"\x1b[5n\x1b[6n"); // standard DSR (status, cursor position; ConPTY uses 6)
     vt.process(b"\x1b[?6n\x1b[?15n\x1b[?25n"); // private DSR (DECXCPR, printer, UDK)
                                                // sixel display/scroll modes — 80 (DECSDM), 8452 (cursor right of graphic).
                                                // shellglass mirrors sixel via its own interceptor with a fixed default-

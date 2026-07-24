@@ -435,7 +435,7 @@ struct SourceArgs {
 
     /// Interactive command to mirror in a PTY (the `script(1)` model): it runs in
     /// your terminal, the browser watches. Put it last, after any flags — e.g.
-    /// `serve -- bash -l`. Defaults to your `$SHELL` when omitted.
+    /// `serve -- bash -l`. Defaults to `$SHELL` on Unix or `%COMSPEC%` on Windows.
     #[arg(
         trailing_var_arg = true,
         allow_hyphen_values = true,
@@ -446,14 +446,27 @@ struct SourceArgs {
 
 #[cfg(feature = "mirror")]
 impl SourceArgs {
-    /// The command to run, defaulting to the user's `$SHELL` (then `/bin/sh`).
+    /// The command to run, defaulting to the platform's user shell.
     fn command(&self) -> Vec<String> {
         if self.command.is_empty() {
-            vec![std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())]
+            vec![default_shell()]
         } else {
             self.command.clone()
         }
     }
+}
+
+#[cfg(all(feature = "mirror", unix))]
+fn default_shell() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+}
+
+#[cfg(all(feature = "mirror", windows))]
+fn default_shell() -> String {
+    // COMSPEC is a native executable path. MSYS/Git Bash often exports a Unix-style
+    // SHELL (`/usr/bin/bash`) that CreateProcess/ConPTY cannot resolve reliably;
+    // those shells remain available when passed explicitly after `--`.
+    std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into())
 }
 
 /// Secret key whose `argon2id` hash is the shareable session id, shared by
@@ -1135,7 +1148,8 @@ async fn serve_hub(
 }
 
 /// Resolve when the process is asked to stop: SIGTERM (`docker stop`/`restart`,
-/// systemd, k8s) or SIGINT (Ctrl-C).
+/// systemd, k8s) or SIGINT (Ctrl-C) on Unix; console close/shutdown controls too on
+/// Windows.
 ///
 /// Installing these matters most in a container: shellglass runs as PID 1, and the
 /// kernel *ignores* any signal with no installed handler for PID 1 — so an unhandled
@@ -1143,7 +1157,7 @@ async fn serve_hub(
 /// connections as the network namespace is torn down (no FIN reaches clients — they
 /// black-hole until a TCP timeout). Handling it lets us close cleanly while the
 /// network is still up.
-#[cfg(feature = "hub")]
+#[cfg(all(feature = "hub", unix))]
 async fn shutdown_signal() {
     use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
@@ -1151,6 +1165,21 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = term.recv() => {}
         _ = int.recv() => {}
+    }
+}
+
+#[cfg(all(feature = "hub", windows))]
+async fn shutdown_signal() {
+    use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
+    let mut c = ctrl_c().expect("install Ctrl-C handler");
+    let mut brk = ctrl_break().expect("install Ctrl-Break handler");
+    let mut close = ctrl_close().expect("install console-close handler");
+    let mut shutdown = ctrl_shutdown().expect("install system-shutdown handler");
+    tokio::select! {
+        _ = c.recv() => {}
+        _ = brk.recv() => {}
+        _ = close.recv() => {}
+        _ = shutdown.recv() => {}
     }
 }
 
