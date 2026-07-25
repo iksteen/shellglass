@@ -55,25 +55,25 @@
 use arc_swap::ArcSwap;
 // The SSE endpoint is the one axum-touching corner of this module — HTTP-serving
 // builds only (serve/hub); the push client uses just the encode side.
-#[cfg(any(feature = "serve", feature = "hub"))]
+#[cfg(any(feature = "serve-api", feature = "hub"))]
 use axum::response::sse::{Event, KeepAlive, Sse};
-#[cfg(any(feature = "serve", feature = "hub"))]
+#[cfg(any(feature = "serve-api", feature = "hub"))]
 use axum::response::{IntoResponse, Response};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-#[cfg(any(feature = "serve", feature = "hub"))]
+#[cfg(any(feature = "serve-api", feature = "hub"))]
 use std::convert::Infallible;
-#[cfg(any(feature = "serve", feature = "hub"))]
+#[cfg(any(feature = "serve-api", feature = "hub"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{broadcast, watch};
-#[cfg(any(feature = "serve", feature = "hub"))]
+#[cfg(any(feature = "serve-api", feature = "hub"))]
 use tokio_stream::StreamExt;
-#[cfg(any(feature = "serve", feature = "hub"))]
+#[cfg(any(feature = "serve-api", feature = "hub"))]
 use tokio_stream::wrappers::BroadcastStream;
-#[cfg(any(feature = "serve", feature = "hub"))]
+#[cfg(any(feature = "serve-api", feature = "hub"))]
 use tokio_stream::wrappers::WatchStream;
-#[cfg(any(feature = "serve", feature = "hub"))]
+#[cfg(any(feature = "serve-api", feature = "hub"))]
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use crate::model::{Color, Frame, Grid, ImagePlacement, StyledCell};
@@ -90,7 +90,7 @@ pub const PROTO: u32 = 4;
 /// The version-hello event data, sent at the head of every SSE stream: the wire
 /// proto plus the baked viewer.js content tag — the two things that decide
 /// whether a loaded page can keep consuming this stream.
-#[cfg(any(feature = "serve", feature = "hub"))]
+#[cfg(any(feature = "serve-api", feature = "hub"))]
 fn hello_message() -> String {
     format!(
         "{{\"v\":{PROTO},\"js\":\"{}\"}}",
@@ -111,11 +111,11 @@ struct State {
     frame: Arc<Frame>,
     // Only the SSE connect path reads it; non-serving builds still populate
     // the lock (it's just never asked for).
-    #[cfg_attr(not(any(feature = "serve", feature = "hub")), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "serve-api", feature = "hub")), allow(dead_code))]
     full: OnceLock<Arc<str>>,
 }
 
-#[cfg(any(feature = "serve", feature = "hub"))]
+#[cfg(any(feature = "serve-api", feature = "hub"))]
 impl State {
     fn full_msg(&self) -> Arc<str> {
         self.full
@@ -153,21 +153,21 @@ pub struct Live {
     /// decremented when the connection's [`ViewerGuard`] drops. Surfaced by the
     /// management API's session listing. (HTTP-serving builds only — the push client
     /// compiles `Live` but never serves viewers.)
-    #[cfg(any(feature = "serve", feature = "hub"))]
+    #[cfg(any(feature = "serve-api", feature = "hub"))]
     viewers: [AtomicUsize; Transport::ALL.len()],
 }
 
 /// A viewer transport, for the per-channel live counts. To count a new kind of
 /// viewer, add a variant (and to `ALL`): the counter array, the guard, and the API
 /// listing all extend from this one enum — no new field or accessor per channel.
-#[cfg(any(feature = "serve", feature = "hub"))]
+#[cfg(any(feature = "serve-api", feature = "hub"))]
 #[derive(Clone, Copy)]
 pub enum Transport {
     Web,
     Ssh,
 }
 
-#[cfg(any(feature = "serve", feature = "hub"))]
+#[cfg(any(feature = "serve-api", feature = "hub"))]
 impl Transport {
     /// Every variant, in `as usize` index order (the counter-array layout). Keep in
     /// sync with the enum.
@@ -185,13 +185,13 @@ impl Transport {
 /// Counts a viewer on one [`Transport`] while held, decrementing on drop — so the
 /// count reflects live connections, falling as viewers disconnect. The web SSE
 /// response owns one inside its stream; the SSH view loop holds one for its duration.
-#[cfg(any(feature = "serve", feature = "hub"))]
+#[cfg(any(feature = "serve-api", feature = "hub"))]
 pub struct ViewerGuard {
     live: Arc<Live>,
     transport: Transport,
 }
 
-#[cfg(any(feature = "serve", feature = "hub"))]
+#[cfg(any(feature = "serve-api", feature = "hub"))]
 impl Drop for ViewerGuard {
     fn drop(&mut self) {
         self.live.viewers[self.transport as usize].fetch_sub(1, Ordering::Relaxed);
@@ -215,7 +215,7 @@ impl Live {
             diffs,
             online,
             reload,
-            #[cfg(any(feature = "serve", feature = "hub"))]
+            #[cfg(any(feature = "serve-api", feature = "hub"))]
             viewers: std::array::from_fn(|_| AtomicUsize::new(0)),
         })
     }
@@ -324,7 +324,7 @@ impl Live {
 
     /// Count a viewer on `transport` for as long as the returned guard lives. Held by
     /// the SSE stream ([`Live::connect`]) / the SSH view loop ([`crate::ssh`]).
-    #[cfg(any(feature = "serve", feature = "hub"))]
+    #[cfg(any(feature = "serve-api", feature = "hub"))]
     pub fn viewer(self: &Arc<Self>, transport: Transport) -> ViewerGuard {
         self.viewers[transport as usize].fetch_add(1, Ordering::Relaxed);
         ViewerGuard {
@@ -334,7 +334,7 @@ impl Live {
     }
 
     /// Current live viewer count on `transport`.
-    #[cfg(any(feature = "serve", feature = "hub"))]
+    #[cfg(any(feature = "serve-api", feature = "hub"))]
     pub fn viewer_count(&self, transport: Transport) -> usize {
         self.viewers[transport as usize].load(Ordering::Relaxed)
     }
@@ -342,7 +342,7 @@ impl Live {
     /// The current state as a one-shot full-frame wire message — byte-identical to
     /// the first frame [`Live::connect`] sends a new SSE viewer (memoized on the
     /// snapshot, so repeated calls share one encode). Backs the `/snapshot` endpoint.
-    #[cfg(any(feature = "serve", feature = "hub"))]
+    #[cfg(any(feature = "serve-api", feature = "hub"))]
     pub fn snapshot(&self) -> Arc<str> {
         self.state.load().full_msg()
     }
@@ -352,7 +352,7 @@ impl Live {
     /// and skip deltas the snapshot already covers (seq ≤ snapshot's). On `Lagged`
     /// (viewer overflowed the backlog) it resyncs with a fresh snapshot, raising the
     /// skip threshold — stale retained deltas are discarded exactly, not replayed.
-    #[cfg(any(feature = "serve", feature = "hub"))]
+    #[cfg(any(feature = "serve-api", feature = "hub"))]
     pub fn connect(self: &Arc<Self>) -> Response {
         let rx = self.diffs.subscribe();
         let snap = self.state.load_full();
@@ -530,7 +530,11 @@ pub fn encode_delta(cur: &Frame, next: &Frame) -> Option<Arc<str>> {
     // the image set forces a full (cheap: images are rare and the set is
     // usually empty ⇒ this compares two empty vecs). Same for the OSC 10/11
     // default-color overrides (`e`, likewise full-frame-only and rare).
-    let msg = if same_layout(a, b) && a.images == b.images && a.default_colors == b.default_colors {
+    let msg = if same_layout(a, b)
+        && a.source_epoch == b.source_epoch
+        && a.images == b.images
+        && a.default_colors == b.default_colors
+    {
         diff_message(a, b)?
     } else {
         full_message_grid(b)
@@ -1659,6 +1663,7 @@ fn apply_wire(prev: &Frame, msg: WireMsgIn) -> Option<Frame> {
             images,
         } => {
             return Some(Frame::Screen(Grid {
+                source_epoch: 0,
                 cols: w,
                 rows: rows.into_iter().map(decode_block).collect(),
                 cursor: cur,
@@ -1816,6 +1821,7 @@ mod tests {
     /// A grid from rows of text (each char → a plain cell).
     fn grid(rows: &[&str]) -> Grid {
         Grid {
+            source_epoch: 0,
             cols: rows.iter().map(|r| r.chars().count()).max().unwrap_or(0) as u16,
             rows: rows.iter().map(|r| r.chars().map(cell).collect()).collect(),
             cursor: None,
@@ -2204,6 +2210,20 @@ mod tests {
         assert!(!same_layout(&a, &b));
         let c = grid(&["abcd"]); // different width
         assert!(!same_layout(&a, &c), "width change forces a full frame");
+    }
+
+    #[test]
+    fn source_epoch_switch_forces_full_even_at_same_layout() {
+        let mut a = grid(&["same"]);
+        let mut b = a.clone();
+        a.source_epoch = 1;
+        b.source_epoch = 2;
+        let msg = encode_delta(&Frame::Screen(a), &Frame::Screen(b))
+            .expect("source switch is publishable");
+        assert!(
+            msg.starts_with("{\"d\":"),
+            "source switch must be full: {msg}"
+        );
     }
 
     #[test]
@@ -2651,7 +2671,7 @@ mod tests {
     }
 
     // tokio runtime: connect()'s SSE keep-alive builds a timer that needs a reactor.
-    #[cfg(any(feature = "serve", feature = "hub"))]
+    #[cfg(any(feature = "serve-api", feature = "hub"))]
     #[tokio::test]
     async fn viewer_counts_track_web_and_ssh_connections() {
         use Transport::{Ssh, Web};

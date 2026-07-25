@@ -124,6 +124,7 @@ fn waiting_frame(msg: &str) -> Frame {
     let mut rows = vec![line];
     rows.resize_with(24, Vec::new);
     Frame::Screen(crate::model::Grid {
+        source_epoch: 0,
         cols: 80,
         rows,
         cursor: None,

@@ -3,22 +3,14 @@
 //! wrappers over the types here, so flags and behavior can't drift. Modes are
 //! cargo features; a subset build simply lacks the other subcommands.
 
-#[cfg(feature = "push")]
-use crate::client;
-#[cfg(feature = "serve")]
-use crate::diff;
 #[cfg(feature = "hub")]
 use crate::hub;
 use crate::proto;
-#[cfg(feature = "serve")]
-use crate::render;
-#[cfg(feature = "serve")]
-use crate::server::{self, AppState};
-#[cfg(feature = "ssh-view")]
-use crate::ssh;
 #[cfg(feature = "mirror")]
-use crate::{config::Config, fonts, fonts::FontFile, fonts::Resolver, pty};
-#[cfg(any(feature = "serve", feature = "push", feature = "hub"))]
+use crate::pty;
+#[cfg(feature = "hub")]
+use crate::ssh;
+#[cfg(feature = "hub")]
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
@@ -29,8 +21,6 @@ use clap::Parser;
     feature = "sessions"
 ))]
 use std::path::PathBuf;
-#[cfg(feature = "mirror")]
-use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -446,13 +436,16 @@ struct SourceArgs {
 
 #[cfg(feature = "mirror")]
 impl SourceArgs {
-    /// The command to run, defaulting to the platform's user shell.
     fn command(&self) -> Vec<String> {
         if self.command.is_empty() {
             vec![default_shell()]
         } else {
             self.command.clone()
         }
+    }
+
+    fn start(&self) -> Result<crate::source::SourceSession> {
+        pty::start(&self.command(), self.sixel_compat)
     }
 }
 
@@ -657,17 +650,16 @@ impl ServeArgs {
     /// # Errors
     /// Config/font/bind failures before the PTY starts; server errors after.
     pub async fn run(self) -> Result<()> {
-        run_serve(
-            self.source,
-            &self.bind,
-            self.cors_origin,
-            self.ssh_bind,
-            self.ssh_host_key,
-            self.ssh_motd_file,
-            self.ssh_motd_delay,
-            self.record_dir,
-        )
-        .await
+        let presentation = crate::api::Presentation::load(self.source.config.as_deref())?;
+        let mut options = crate::api::ServeOptions::new(self.bind);
+        options.cors_origins = self.cors_origin;
+        options.ssh_bind = self.ssh_bind;
+        options.ssh_host_key = self.ssh_host_key;
+        options.ssh_motd_file = self.ssh_motd_file;
+        options.ssh_motd_delay = self.ssh_motd_delay;
+        options.record_dir = self.record_dir;
+        options.source_label = describe_source(&self.source);
+        crate::api::serve(move || self.source.start(), presentation, options).await
     }
 }
 
@@ -678,7 +670,12 @@ impl PushArgs {
     /// # Errors
     /// Config/font failures before registration; the client loop's after.
     pub async fn run(self) -> Result<()> {
-        run_push(self.url, self.key.key, self.source, self.no_record).await
+        let base = self.url.trim_end_matches('/');
+        println!("shellglass: pushing live to {base}");
+        let presentation = crate::api::Presentation::load(self.source.config.as_deref())?;
+        let mut options = crate::api::PushOptions::new(self.url, self.key.key);
+        options.no_record = self.no_record;
+        crate::api::push(move || self.source.start(), presentation, options).await
     }
 }
 
@@ -762,227 +759,6 @@ pub fn gen_key(api: bool, id_salt: &IdSaltArg) -> Result<()> {
         println!("id:  {}", proto::session_id_ext(&key, &id_salt.id_salt));
     }
     Ok(())
-}
-
-/// Config-derived state shared by `serve` and `push`: fonts resolved and read,
-/// template loaded. Deliberately does NOT start the PTY — `push` must register
-/// with the hub first, so a bad hub address or a down hub is reported (and
-/// retried) before the terminal is switched to raw mode and the command runs.
-#[cfg(feature = "mirror")]
-struct Setup {
-    config: Arc<Config>,
-    resolver: Arc<Resolver>,
-    fonts: Arc<Vec<FontFile>>,
-    template: Arc<String>,
-}
-
-#[cfg(feature = "mirror")]
-fn setup(source: &SourceArgs) -> Result<Setup> {
-    let mut config = match &source.config {
-        Some(path) => Config::load(path)?,
-        None => Config::default(),
-    };
-    let resolver = Arc::new(Resolver::build(&config).context("building font resolver")?);
-    // Pin any generic (monospace/…) in default_font to the host's concrete font so
-    // viewers see the same face, then locate + read every referenced font on this
-    // host (which has them installed) so we can serve them to viewers that don't.
-    fonts::resolve_generics(&mut config);
-    let fonts = Arc::new(fonts::collect_fonts(&config));
-    // kitty's box model: the cell derives from the font. An explicit
-    // `line_height` in the config still wins; otherwise the served font's own
-    // metrics set it, so descenders and accents fit the row by construction
-    // (line_height_px falls back to 1.2 only when no font file resolved).
-    if config.line_height.is_none() {
-        config.line_height = fonts::metric_line_height(&fonts);
-    }
-    let template = Arc::new(config.template_html().context("loading viewer template")?);
-    Ok(Setup {
-        config: Arc::new(config),
-        resolver,
-        fonts,
-        template,
-    })
-}
-
-/// Standalone live viewer: render locally and serve the page + SSE over HTTP (and,
-/// with `--ssh-bind`, a read-only ANSI view over SSH). When the mirrored command
-/// exits, `pty.rs` exits the whole process, so the SSH connection drops and the
-/// client's own tty is restored by its ssh.
-#[cfg(feature = "serve")]
-#[allow(clippy::too_many_arguments)] // one call site, mirrors ServeArgs field-for-field
-async fn run_serve(
-    source: SourceArgs,
-    bind_addr: &str,
-    cors_origins: Vec<String>,
-    ssh_bind: Option<String>,
-    ssh_host_key: Option<PathBuf>,
-    ssh_motd_file: Option<PathBuf>,
-    ssh_motd_delay: u64,
-    record_dir: Option<PathBuf>,
-) -> Result<()> {
-    let listener = bind(bind_addr)?;
-    let s = setup(&source)?;
-    // Fail loud on an unusable recording directory NOW, before raw mode: once
-    // the PTY owns the terminal nothing may print, so the recorder itself
-    // stays silent and only this up-front check can reach the operator.
-    if let Some(dir) = &record_dir {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("creating --record-dir {}", dir.display()))?;
-    }
-    // Bind + resolve the SSH host key before the PTY takes the terminal, so the hint
-    // and fingerprint print cleanly (raw mode hasn't started yet). A failure here must
-    // NOT abort the HTTP mirror — log and continue without the SSH view.
-    let ssh_ready = match &ssh_bind {
-        Some(addr) => match prepare_ssh(addr, ssh_host_key.as_deref(), "x") {
-            Ok(ready) => Some(ready),
-            Err(e) => {
-                eprintln!("shellglass: SSH view disabled — {e:#}");
-                None
-            }
-        },
-        None => None,
-    };
-    // Print the URL before the PTY switches the terminal to raw mode.
-    println!(
-        "shellglass: mirroring {} at http://{}/",
-        describe_source(&source),
-        listener.local_addr()?
-    );
-    let (rx, _notifier) = pty::start(&source.command(), source.sixel_compat)?;
-    // Feed the image store from a sibling subscription: every frame's payloads
-    // are inserted (no-ops when already present), with the frame's own
-    // placements protected from the byte-cap eviction.
-    let images = Arc::new(std::sync::Mutex::new(diff::ImageStore::new(
-        64 * 1024 * 1024,
-    )));
-    {
-        let images = Arc::clone(&images);
-        let mut rx = rx.clone();
-        tokio::spawn(async move {
-            loop {
-                if let crate::model::Frame::Screen(g) = &**rx.borrow_and_update()
-                    && !g.image_data.is_empty()
-                {
-                    let protected: std::collections::HashSet<String> =
-                        g.images.iter().map(|p| p.hash.clone()).collect();
-                    let mut store = images.lock().unwrap();
-                    for (hash, blob) in &g.image_data {
-                        store.insert(
-                            hash.clone(),
-                            blob.mime.clone(),
-                            blob.bytes.clone(),
-                            &protected,
-                        );
-                    }
-                }
-                if rx.changed().await.is_err() {
-                    return; // PTY gone; the server is shutting down with it
-                }
-            }
-        });
-    }
-    let live = diff::Live::spawn(rx);
-    if let Some((l, key)) = ssh_ready {
-        let target = ssh::Target::Single(Arc::clone(&live));
-        let motd = load_ssh_motd(ssh_motd_file.as_deref(), ssh_motd_delay);
-        // ponytail: unsupervised — an SSH failure logs and dies; HTTP is unaffected.
-        tokio::spawn(async move {
-            if let Err(e) = ssh::serve(l, key, target, motd).await {
-                eprintln!("shellglass: ssh server error: {e}");
-            }
-        });
-    }
-    // Relative: the page lives at `/`, and relative URLs survive a
-    // subpath-mounting reverse proxy that absolute ones can't know about.
-    let font_css = render::font_face_css(&s.fonts, "fonts/");
-    // Tag the rendering config, so a viewer stays reloadable when serve is
-    // restarted with a DIFFERENT config: the process death drops the SSE, the
-    // browser reconnects on the same (now stale) page, and the new tag differing
-    // from the one it first saw triggers a re-fetch. Same config across a restart
-    // hashes identical, so an ordinary restart reloads no one.
-    let cfg_json = render::render_config_json(&s.config, &s.resolver);
-    live.set_reload_tag(&crate::proto::config_tag(&[
-        &font_css,
-        &cfg_json,
-        &s.template,
-    ]));
-    // Session recording (`--record-dir`): one native-stream transcript for the
-    // process lifetime, shaped exactly like a push connection's — a register
-    // built the way the push client builds one, then snapshot + deltas
-    // (record_live). The feeder's stop sender lives to the end of this
-    // function, so the recording ends with the server. Silent by design past
-    // the startup check above (raw mode owns the terminal); a write error
-    // just ends the recording.
-    let _record_stop = record_dir.map(|dir| {
-        let (rec, _done) = crate::record::start(dir);
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let live = Arc::clone(&live);
-        let (config, template, fonts) = (
-            Arc::clone(&s.config),
-            Arc::clone(&s.template),
-            Arc::clone(&s.fonts),
-        );
-        let (font_css, cfg_json) = (font_css.clone(), cfg_json.clone());
-        tokio::spawn(async move {
-            // The register carries the font bundle (MBs base64) — build it on
-            // the blocking pool so neither the async workers nor this
-            // function's caller stall on it; the stream's snapshot-first shape
-            // means a late register start loses nothing.
-            let register = tokio::task::spawn_blocking(move || {
-                let css = render::head_css(&font_css, &config);
-                serde_json::to_string(&crate::proto::RegisterBody {
-                    css,
-                    render_cfg: cfg_json,
-                    template: (*template).clone(),
-                    fonts: crate::fonts::font_assets(&fonts),
-                    font_css,
-                    no_record: false,
-                })
-                .expect("register body serializes")
-            })
-            .await
-            .expect("register build task");
-            crate::record::record_live(live, register, rec, rx).await;
-        });
-        tx
-    });
-    let state = AppState {
-        font_css: Arc::new(font_css),
-        config: s.config,
-        resolver: s.resolver,
-        fonts: s.fonts,
-        template: s.template,
-        live,
-        images,
-    };
-    axum::serve(listener, server::app_with_cors(state, &cors_origins)).await?;
-    Ok(())
-}
-
-/// Client mode: render locally and push frames to a remote hub. The PTY (and the
-/// command) start only once the hub has accepted a registration — `client::run`
-/// invokes the closure after the first successful register.
-#[cfg(feature = "push")]
-async fn run_push(url: String, key: String, source: SourceArgs, no_record: bool) -> Result<()> {
-    // The client derives NO ids: authorization sends the key itself, font URLs
-    // in the pushed CSS are page-relative, and the authoritative view URL is
-    // announced in the HUB's log on connect — the client could only guess it
-    // (it knows neither the slug nor the hub's --id-salt).
-    let base = url.trim_end_matches('/');
-    println!("shellglass: pushing live to {base}");
-    let s = setup(&source)?;
-    let sixel_compat = source.sixel_compat;
-    client::run(
-        url,
-        key,
-        s.config,
-        s.resolver,
-        s.fonts,
-        s.template,
-        no_record,
-        || pty::start(&source.command(), sixel_compat),
-    )
-    .await
 }
 
 /// One-line description of what a source mirrors, for the startup log.
@@ -1207,7 +983,7 @@ fn spawn_tls_shutdown(handle: axum_server::Handle<std::net::SocketAddr>, hub: hu
 /// fingerprint). Returned as a pair the caller spawns `ssh::serve` on. Fallible so a
 /// privileged/in-use port or an unwritable host key disables only the SSH view, never
 /// the HTTP service.
-#[cfg(feature = "ssh-view")]
+#[cfg(feature = "hub")]
 fn prepare_ssh(
     addr: &str,
     key_path: Option<&std::path::Path>,
@@ -1221,7 +997,7 @@ fn prepare_ssh(
 /// Build the SSH MOTD from `--ssh-motd-file`, or `None` if unset. A read failure
 /// logs and disables only the banner — the SSH view still runs — consistent with how
 /// a bad host key disables just the SSH view, not the whole mirror.
-#[cfg(feature = "ssh-view")]
+#[cfg(feature = "hub")]
 fn load_ssh_motd(path: Option<&std::path::Path>, delay_secs: u64) -> Option<ssh::Motd> {
     match ssh::Motd::load(path?, delay_secs) {
         Ok(m) => Some(m),
@@ -1235,7 +1011,7 @@ fn load_ssh_motd(path: Option<&std::path::Path>, delay_secs: u64) -> Option<ssh:
 /// Bind with `SO_REUSEADDR` so a hub restart can rebind immediately — otherwise the
 /// previous run's client/browser connections linger in `TIME_WAIT` and the fresh
 /// bind fails with "address in use" for up to a minute.
-#[cfg(any(feature = "serve", feature = "hub", feature = "ssh-view"))]
+#[cfg(feature = "hub")]
 fn bind(addr: &str) -> Result<tokio::net::TcpListener> {
     use tokio::net::TcpSocket;
     let sockaddr: std::net::SocketAddr = addr

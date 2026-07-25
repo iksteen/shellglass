@@ -20,13 +20,13 @@ fn main() {
     println!("cargo:rerun-if-changed=viewer/tsconfig.json");
     println!("cargo:rerun-if-changed=viewer/dist/viewer.js");
 
-    // tsc is a shell wrapper on Windows; extension-less path works on Unix, which is
-    // all we build from here. No `current_dir`: a relative program path resolves in
-    // the *child's* cwd on Unix, so pairing it with current_dir("viewer") would look
-    // for viewer/viewer/… and never find tsc. `-p viewer` points at the tsconfig.
-    let tsc = Path::new("viewer/node_modules/.bin/tsc");
+    // Invoke TypeScript's JavaScript entry point directly instead of npm's
+    // platform-specific shell/`.cmd` shims. No `current_dir`: `-p viewer` and the
+    // entry-point path are relative to the repository root.
+    let tsc = Path::new("viewer/node_modules/typescript/bin/tsc");
     if tsc.exists() {
-        let ok = Command::new(tsc)
+        let ok = Command::new("node")
+            .arg(tsc)
             .args(["-p", "viewer", "--outDir"])
             .arg(&out_dir)
             .status()

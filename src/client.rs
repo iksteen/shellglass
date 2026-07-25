@@ -25,6 +25,7 @@ use crate::proto::{
     PROTOCOL_MIN_HEADER, PROTOCOL_VERSION, RegisterBody,
 };
 use crate::render;
+use crate::source::{SinkStatus, SourceSession};
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -66,7 +67,7 @@ pub async fn run(
     // Starts the PTY backend (raw mode, the command itself). Invoked only after the
     // hub has accepted the WebSocket upgrade, so a down or misconfigured hub is
     // reported — and retried — before the command runs and the terminal is taken over.
-    start: impl FnOnce() -> Result<(watch::Receiver<Arc<Frame>>, crate::pty::Notifier)>,
+    start: impl FnOnce() -> Result<SourceSession>,
 ) -> Result<()> {
     let base = base_url.trim_end_matches('/').to_string();
     // WebSocket upgrades require HTTP/1.1 (never h2). This client's only HTTP use is
@@ -107,12 +108,12 @@ pub async fn run(
     // The PTY backend, started after the first successful upgrade. Until then outage
     // reports go to stderr (the terminal is still ours); after, the notifier
     // pauses/restores the raw session cleanly.
-    let mut backend: Option<(watch::Receiver<Arc<Frame>>, crate::pty::Notifier)> = None;
+    let mut backend: Option<SourceSession> = None;
     // Whether we've reported the hub as down (so we report down/up once per outage,
     // not every retry).
     let mut down = false;
     loop {
-        let notifier = backend.as_ref().map(|(_, n)| n);
+        let sink_status = backend.as_ref().map(|source| source.sink_status.as_ref());
         // Connect (and re-register) before streaming. The upgrade fails fast when the
         // hub is down, so the reconnect loop spins here — cheaply — until it's back.
         // Startup and mid-session failures take the same path; only a rejected key is
@@ -120,7 +121,7 @@ pub async fn run(
         let ws = match connect(&http, &base, &key).await {
             Ok(ws) => {
                 if down {
-                    report_up(notifier);
+                    report_up(sink_status);
                     down = false;
                 }
                 ws
@@ -136,7 +137,7 @@ pub async fn run(
             Err(ConnErr::Incompatible(msg)) => bail!("{msg}"),
             Err(ConnErr::Retry(cause)) => {
                 if !down {
-                    report_down(notifier, cause);
+                    report_down(sink_status, cause);
                     down = true;
                 }
                 tokio::time::sleep(RECONNECT_BACKOFF).await;
@@ -148,8 +149,8 @@ pub async fn run(
             // Hub reachable and key accepted — now take the terminal and launch the command.
             backend = Some(start.take().expect("started once")()?);
         }
-        let (rx, _) = backend.as_mut().expect("backend started on first Ok");
-        match run_session(ws, &reg_json, rx).await {
+        let source = backend.as_mut().expect("backend started on first Ok");
+        match run_session(ws, &reg_json, &mut source.frames).await {
             End::LiveDone => break, // PTY backend ended — nothing left to push
             End::Disconnected => {
                 // Transient — let the next connect decide if it's a real outage, so a
@@ -165,10 +166,10 @@ pub async fn run(
 /// stderr (still ours before the first successful upgrade). The message is built
 /// entirely from our own literals plus a `u16` — see [`Cause`]; no peer-supplied
 /// text ever reaches the terminal.
-fn report_down(notifier: Option<&crate::pty::Notifier>, cause: Cause) {
+fn report_down(sink_status: Option<&dyn SinkStatus>, cause: Cause) {
     let msg = notice(cause);
-    match notifier {
-        Some(n) => n.hub_down(&msg),
+    match sink_status {
+        Some(status) => status.hub_down(&msg),
         None => eprintln!("shellglass: {msg}"),
     }
 }
@@ -186,9 +187,9 @@ fn notice(cause: Cause) -> String {
 }
 
 /// Report the hub as reachable again: restore the terminal, or stay quiet pre-PTY.
-fn report_up(notifier: Option<&crate::pty::Notifier>) {
-    if let Some(n) = notifier {
-        n.hub_up();
+fn report_up(sink_status: Option<&dyn SinkStatus>) {
+    if let Some(status) = sink_status {
+        status.hub_up();
     }
 }
 

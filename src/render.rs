@@ -6,12 +6,12 @@
 // The Config/Resolver-consuming assembly is mirror-side (serve/push build the
 // page + render config from local state); the hub only uses the baked assets,
 // `page` and `sse_script` on client-pushed strings.
-#[cfg(feature = "mirror")]
+#[cfg(feature = "presentation")]
 use crate::config::Config;
 use crate::fonts::FontFile;
-#[cfg(feature = "mirror")]
+#[cfg(feature = "presentation")]
 use crate::fonts::Resolver;
-#[cfg(feature = "mirror")]
+#[cfg(feature = "presentation")]
 use serde::Serialize;
 use std::fmt::Write as _;
 
@@ -61,9 +61,9 @@ pub fn font_face_css(fonts: &[FontFile], url_prefix: &str) -> String {
     css
 }
 
-#[cfg(feature = "mirror")]
+#[cfg(feature = "presentation")]
 const DEFAULT_FG: (u8, u8, u8) = (0xd0, 0xd0, 0xd0);
-#[cfg(feature = "mirror")]
+#[cfg(feature = "presentation")]
 const DEFAULT_BG: (u8, u8, u8) = (0x00, 0x00, 0x00);
 
 /// Built-in viewer template (n3o-style dark chrome).
@@ -91,7 +91,7 @@ pub const EMBED_JS: &str = include_str!("embed.js");
 /// the config-derived base CSS. Computed by whoever owns the config (the standalone
 /// server or a push client); the hub just stores and re-emits it, so it renders
 /// nothing.
-#[cfg(feature = "mirror")]
+#[cfg(feature = "presentation")]
 pub fn head_css(font_css: &str, config: &Config) -> String {
     // The terminal backdrop lives on #screen (not body) so a template controls the
     // surrounding page background; #screen stays black wherever it's placed.
@@ -203,7 +203,7 @@ pub fn config_json(events_path: &str, cfg_json: &str) -> String {
 /// them on its own container — the baked page gets them from the head CSS), and the
 /// `symbol_map` overrides as `[lo, hi, familyStack]` (each stack pre-joined,
 /// override family first). Injected once per page.
-#[cfg(feature = "mirror")]
+#[cfg(feature = "presentation")]
 pub fn render_config_json(config: &Config, resolver: &Resolver) -> String {
     #[derive(Serialize)]
     struct RenderConfig {
@@ -257,7 +257,7 @@ pub fn render_config_json(config: &Config, resolver: &Resolver) -> String {
 
 /// Standalone page (local command → local viewer): streams live from `events`
 /// (relative — the page lives at `/`).
-#[cfg(feature = "mirror")]
+#[cfg(feature = "presentation")]
 pub fn render_page(template: &str, font_css: &str, config: &Config, cfg_json: &str) -> String {
     page(
         template,
@@ -269,7 +269,7 @@ pub fn render_page(template: &str, font_css: &str, config: &Config, cfg_json: &s
 /// The base font stack: the configured families in order, with a `monospace`
 /// last resort appended unless already present. The browser resolves each glyph
 /// against this stack, giving Kitty-style per-character fallback for free.
-#[cfg(feature = "mirror")]
+#[cfg(feature = "presentation")]
 fn font_stack(config: &Config) -> String {
     let mut fams: Vec<String> = config
         .default_font
@@ -282,13 +282,13 @@ fn font_stack(config: &Config) -> String {
     fams.join(",")
 }
 
-#[cfg(feature = "mirror")]
+#[cfg(feature = "presentation")]
 fn hex((r, g, b): (u8, u8, u8)) -> String {
     format!("#{r:02x}{g:02x}{b:02x}")
 }
 
 /// Quote a font family unless it's a CSS generic keyword.
-#[cfg(feature = "mirror")]
+#[cfg(feature = "presentation")]
 fn quote_family(name: &str) -> String {
     const GENERICS: [&str; 5] = ["monospace", "serif", "sans-serif", "cursive", "fantasy"];
     if GENERICS.contains(&name) {
@@ -298,7 +298,7 @@ fn quote_family(name: &str) -> String {
     }
 }
 
-#[cfg(all(test, feature = "mirror"))]
+#[cfg(all(test, feature = "presentation"))]
 // Tests build a Config then tweak a field or two — the mutate-after-default form
 // reads better here than struct-update with ..Default::default().
 #[allow(clippy::field_reassign_with_default)]

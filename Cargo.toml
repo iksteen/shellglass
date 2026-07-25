@@ -19,15 +19,20 @@ license = "MIT"
 # actions in src/cli.rs, so flags and behavior can't drift from the full CLI.
 [features]
 default = ["serve", "push", "hub", "sessions", "recordings"]
-serve = ["mirror", "ssh-view", "dep:axum", "dep:tower-http"]
+serve = ["mirror", "serve-api"]
+# Library-only standalone publisher. Unlike `serve`, this does not compile the
+# built-in PTY/parser producer.
+serve-api = ["presentation", "ssh-view", "dep:axum", "dep:tower-http"]
 # `sessions` — the hub-control CLI (list/add/remove over the management API).
 # Only needs an HTTP client; independent of the mirror stack.
 sessions = ["dep:reqwest"]
 # `recordings` — the session-owner recordings CLI (list/get/delete your own
 # recordings on a hub, authorized by the session key). HTTP client only.
 recordings = ["dep:reqwest"]
-push = [
-    "mirror",
+push = ["mirror", "push-api"]
+# Library-only hub publisher, usable by an external frame producer.
+push-api = [
+    "presentation",
     "dep:reqwest",
     "dep:reqwest-websocket",
     "dep:futures-util",
@@ -41,15 +46,19 @@ hub = [
     "dep:rustls-acme",
     "dep:tungstenite",
 ]
-# Internal: the local-mirror stack shared by serve and push (PTY, image
-# interceptor, font discovery, TOML config).
-mirror = [
-    "dep:portable-pty",
-    "dep:signal-hook",
-    "dep:rustix",
+# Browser presentation preparation shared by PTY and external producers.
+presentation = [
     "dep:fontdb",
     "dep:ttf-parser",
     "dep:toml",
+]
+# Internal built-in PTY/parser producer retained by the stock CLI.
+mirror = [
+    "presentation",
+    "dep:portable-pty",
+    "dep:vt100",
+    "dep:signal-hook",
+    "dep:rustix",
     "dep:png",
     "dep:icy_sixel",
     "dep:imagesize",
@@ -88,6 +97,11 @@ required-features = ["recordings"]
 name = "shellglass-keytool"
 path = "src/bin/keytool.rs"
 
+[[example]]
+name = "external-source"
+path = "examples/external-source.rs"
+required-features = ["serve-api"]
+
 [dependencies]
 anyhow = "1.0.103"
 arc-swap = "1"
@@ -117,7 +131,7 @@ tokio-stream = { version = "0.1.17", features = ["sync"] }
 tower-http = { version = "0.7", features = ["compression-br", "compression-gzip", "cors"], optional = true }
 toml = { version = "1.1.2", optional = true }
 # Vendored (upstream unmaintained) — see crates/vt100/Cargo.toml for provenance.
-vt100 = { path = "crates/vt100" }
+vt100 = { path = "crates/vt100", optional = true }
 reqwest-websocket = { version = "0.6.0", optional = true }
 futures-util = { version = "0.3.32", default-features = false, features = ["sink", "std"], optional = true }
 tungstenite = { version = "0.29", default-features = false, optional = true }
