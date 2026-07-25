@@ -480,7 +480,7 @@ async fn view_loop(
 
 /// Resolve the SSH host key: an explicit `--ssh-host-key` path (loaded, or generated
 /// then persisted 0600 on first run), else a generated ed25519 key persisted under
-/// `$XDG_STATE_HOME/shellglass/` so the fingerprint survives restarts.
+/// the platform's user state directory so the fingerprint survives restarts.
 ///
 /// This never borrows the machine's real `/etc/ssh` host key: that key is the host's
 /// genuine SSH identity, and binding it to a separate accept-any read-only viewer
@@ -536,16 +536,27 @@ fn persist(key: &PrivateKey, p: &Path) -> Result<()> {
         f.write_all(pem.as_bytes())
             .with_context(|| format!("writing host key {p:?}"))?;
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     std::fs::write(p, pem.as_bytes()).with_context(|| format!("writing host key {p:?}"))?;
     Ok(())
 }
 
 fn state_key_path() -> Result<PathBuf> {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-        .context("no XDG_STATE_HOME or HOME to store the SSH host key")?;
+    let mut base = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
+    #[cfg(windows)]
+    if base.is_none() {
+        base = std::env::var_os("LOCALAPPDATA")
+            .or_else(|| std::env::var_os("APPDATA"))
+            .map(PathBuf::from);
+    }
+    if base.is_none() {
+        base = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state"));
+    }
+    #[cfg(windows)]
+    if base.is_none() {
+        base = std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join("AppData/Local"));
+    }
+    let base = base.context("no user state directory available to store the SSH host key")?;
     Ok(base.join("shellglass").join("ssh_host_ed25519_key"))
 }
 

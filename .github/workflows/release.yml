@@ -122,6 +122,43 @@ jobs:
           path: target/${{ matrix.target }}/dist/shellglass-hub
           if-no-files-found: error
 
+  build-windows:
+    name: x86_64-pc-windows-msvc
+    needs: create-release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-edit
+
+      - name: Stamp version
+        run: cargo set-version -p shellglass "$($env:GITHUB_REF_NAME.Substring(1))"
+
+      - name: Build
+        run: cargo build --profile dist --locked --target x86_64-pc-windows-msvc
+
+      - name: Package
+        run: |
+          New-Item -ItemType Directory package
+          $names = @(
+            "shellglass", "shellglass-serve", "shellglass-push", "shellglass-hub",
+            "shellglass-sessions", "shellglass-recordings", "shellglass-keytool"
+          )
+          foreach ($name in $names) {
+            Copy-Item "target/x86_64-pc-windows-msvc/dist/$name.exe" package/
+          }
+          Compress-Archive -Path package/*.exe -DestinationPath shellglass-x86_64-pc-windows-msvc.zip
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: shellglass-x86_64-pc-windows-msvc.zip
+
   # Assemble the multi-arch image from the already-built Linux binaries — no second
   # Rust compile, so no slow aws-lc-rs build under arm64 QEMU. Only the tiny runtime
   # stage (apt + useradd) runs emulated.

@@ -1513,6 +1513,11 @@ impl<T> Screen<T> {
         for param in params {
             match param {
                 [4] => self.clear_mode(MODE_INSERT),
+                // Claude Code emits bare `CSI 25 l` during teardown alongside
+                // the real `CSI ? 25 h`. Mode 25 is only defined in DEC-private
+                // form; terminals ignore the bare form, so do not report it as
+                // a possible rendering gap.
+                [25] => {}
                 _ => unhandled(self),
             }
         }

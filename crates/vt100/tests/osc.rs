@@ -109,8 +109,11 @@ fn default_colors_track_set_and_reset() {
     vt.process(b"\x1b]10;#fa0\x07");
     assert_eq!(vt.screen().default_fg(), Some((0xff, 0xaa, 0x00)));
 
-    // Queries stay silent no-ops; a named color is unparseable → reports.
-    vt.process(b"\x1b]10;?\x1b\\\x1b]11;?\x07");
+    // Queries and OSC 133 shell-integration markers stay silent no-ops; a named
+    // color is unparseable → reports.
+    vt.process(
+        b"\x1b]10;?\x1b\\\x1b]11;?\x07\x1b]133;A\x07\x1b]133;D;0\x1b\\",
+    );
     assert_eq!(vt.callbacks().0, 0);
     vt.process(b"\x1b]11;papayawhip\x07");
     assert_eq!(vt.callbacks().0, 1);

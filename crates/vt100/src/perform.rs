@@ -156,10 +156,11 @@ impl<CB: crate::callbacks::Callbacks<T>, T> vte::Perform
                 // shellglass: REP
                 'b' => self.screen.rep(canonicalize_params_1(params, 1)),
                 'd' => self.screen.vpa(canonicalize_params_1(params, 1)),
-                // shellglass: Primary DA — an identity query with zero render
-                // effect; answering is the embedding terminal's job.
+                // shellglass: Primary DA and standard DSR — identity/status
+                // queries with zero render effect; answering is the embedding
+                // terminal's job. (ConPTY emits `CSI 6 n` at startup.)
                 // Deliberately ignored, not unhandled.
-                'c' => {}
+                'c' | 'n' => {}
                 // shellglass: TBC
                 'g' => self.screen.tbc(canonicalize_params_1(params, 0)),
                 // shellglass: SM/RM (IRM is the one modeled mode)
@@ -251,10 +252,11 @@ impl<CB: crate::callbacks::Callbacks<T>, T> vte::Perform
                 'h' => self.screen.decset(params, unhandled),
                 'l' => self.screen.decrst(params, unhandled),
                 // shellglass: private DSR (`CSI ? … n` — DECXCPR cursor
-                // position, printer/UDK/locator status): queries the
-                // embedding terminal answers via the tee; zero render
-                // effect. Deliberately ignored, not unhandled.
-                'n' => {}
+                // position, printer/UDK/locator status) and kitty keyboard
+                // protocol query (`CSI ? u`): the embedding terminal answers
+                // via the tee; zero render effect. Deliberately ignored, not
+                // unhandled.
+                'n' | 'u' => {}
                 _ => {
                     self.callbacks.unhandled_csi(
                         &mut self.screen,
@@ -268,10 +270,10 @@ impl<CB: crate::callbacks::Callbacks<T>, T> vte::Perform
             // shellglass: Secondary DA (`CSI > c`) — same identity-query
             // family as Primary DA above; deliberately ignored. XTVERSION
             // (`CSI > q`) likewise — the tee delivers the local terminal's
-            // answer. XTMODKEYS (`CSI > 4 m` and friends) is keyboard
-            // protocol config with zero render effect.
+            // answer. XTMODKEYS (`CSI > 4 m` and friends) and kitty keyboard
+            // push (`CSI > … u`) are input protocol with zero render effect.
             Some(b'>') => match c {
-                'c' | 'q' | 'm' => {}
+                'c' | 'q' | 'm' | 'u' => {}
                 _ => {
                     self.callbacks.unhandled_csi(
                         &mut self.screen,
@@ -282,6 +284,9 @@ impl<CB: crate::callbacks::Callbacks<T>, T> vte::Perform
                     );
                 }
             },
+            // shellglass: kitty keyboard protocol pop (`CSI < … u`) — input
+            // state serviced by the embedding terminal, zero render effect.
+            Some(b'<') if c == 'u' => {}
             // shellglass: DECSCUSR (`CSI n SP q`, set cursor style) — 0-6
             // (default / blinking+steady block / underline / bar); anything
             // else keeps reporting.
@@ -343,8 +348,11 @@ impl<CB: crate::callbacks::Callbacks<T>, T> vte::Perform
                 self.callbacks.set_window_title(&mut self.screen, s);
             }
             // shellglass: default fg/bg *queries* (vim/neovim background
-            // detection) — the embedding terminal answers; nothing to render.
-            [b"10" | b"11", b"?"] => {}
+            // detection) are answered by the embedding terminal; OSC 133
+            // shell-integration prompt/command markers are semantic metadata.
+            // Neither has pixels of its own; the local terminal sees both via
+            // the tee.
+            [b"10" | b"11", b"?"] | [b"133", ..] => {}
             // shellglass: OSC 10/11 set form — override the default fg/bg
             // (theme switchers, OSC 11-emitting TUIs); OSC 110/111 reset.
             // A value we can't parse (named colors, rgbi:) stays unhandled

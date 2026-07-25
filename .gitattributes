@@ -1,0 +1,4 @@
+# The vendored vt100 fixtures are raw terminal byte streams, not source text.
+# Checkout must not rewrite LF to CRLF on Windows.
+crates/vt100/tests/data/fixtures/**/*.typescript -text
+crates/vt100/tests/data/fixtures/*.in -text
