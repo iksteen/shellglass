@@ -13,6 +13,7 @@
 
 use crate::images::{Interceptor, Step};
 use crate::model::{Frame, ImagePlacement};
+use crate::source::{SinkStatus, SourceSession};
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{Read, Write};
@@ -79,27 +80,26 @@ enum Msg {
 /// Lets the push client report hub connection changes to the terminal owner so it
 /// can pause/announce/restore cleanly instead of printing into the raw session.
 #[derive(Clone)]
-pub struct Notifier(mpsc::Sender<Msg>);
+struct Notifier(mpsc::Sender<Msg>);
 
-impl Notifier {
+impl SinkStatus for Notifier {
     /// Hub became unreachable — pause the mirror, drop to cooked mode, show `msg`.
-    pub fn hub_down(&self, msg: &str) {
+    fn hub_down(&self, msg: &str) {
         let _ = self.0.send(Msg::HubDown(msg.to_string()));
     }
+
     /// Hub is back — restore raw mode and repaint the screen.
-    pub fn hub_up(&self) {
+    fn hub_up(&self) {
         let _ = self.0.send(Msg::HubUp);
     }
 }
 
-/// Start an interactive PTY session running `command`. Returns a receiver of the
-/// latest screen [`Frame`] plus a [`Notifier`] for hub status. Puts the terminal in
-/// raw mode, bridges stdin/stdout, and exits the process when the command exits.
+/// Start an interactive PTY session running `command`. Returns a generic source
+/// session whose latest screen frames come from the PTY parser and whose sink-status
+/// implementation owns the terminal pause/repaint behavior. Puts the terminal in
+/// raw mode, bridges stdin/stdout, and exits the frame stream when the command exits.
 /// `sixel_compat` opts into the EXPERIMENTAL sixel→kitty/iTerm2 transcode.
-pub fn start(
-    command: &[String],
-    sixel_compat: bool,
-) -> Result<(watch::Receiver<Arc<Frame>>, Notifier)> {
+pub fn start(command: &[String], sixel_compat: bool) -> Result<SourceSession> {
     let geom = term_geom().unwrap_or(TermGeom {
         cols: 80,
         rows: 24,
@@ -326,7 +326,10 @@ pub fn start(
         });
     }
 
-    Ok((frame_rx, Notifier(msg_tx)))
+    Ok(SourceSession {
+        frames: frame_rx,
+        sink_status: Arc::new(Notifier(msg_tx)),
+    })
 }
 
 #[allow(clippy::too_many_arguments)] // ponytail: one call site, private
@@ -1570,6 +1573,7 @@ mod tests {
 
     fn grid_with_cursor(cursor: Option<(u16, u16)>) -> crate::model::Grid {
         crate::model::Grid {
+            source_epoch: 0,
             cols: 80,
             rows: Vec::new(),
             cursor,

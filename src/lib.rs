@@ -21,7 +21,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// credentials are ever used, so `*` is safe); otherwise only the exact listed
 /// origins are echoed. Shared by the standalone server and the hub (both bring
 /// in `tower-http`).
-#[cfg(any(feature = "serve", feature = "hub"))]
+#[cfg(any(feature = "serve-api", feature = "hub"))]
 pub(crate) fn server_cors(origins: &[String]) -> Option<tower_http::cors::CorsLayer> {
     use tower_http::cors::{AllowOrigin, CorsLayer};
     if origins.is_empty() {
@@ -41,14 +41,16 @@ pub(crate) fn server_cors(origins: &[String]) -> Option<tower_http::cors::CorsLa
 
 #[cfg(feature = "ssh-view")]
 pub mod ansi;
+#[cfg(feature = "presentation")]
+pub mod api;
 #[cfg(feature = "sessions")]
 pub mod apictl;
 pub mod cli;
-#[cfg(feature = "push")]
+#[cfg(feature = "push-api")]
 pub mod client;
 #[cfg(any(feature = "sessions", feature = "recordings"))]
 pub(crate) mod cliutil;
-#[cfg(feature = "mirror")]
+#[cfg(feature = "presentation")]
 pub mod config;
 pub mod diff;
 pub mod fonts;
@@ -57,16 +59,18 @@ pub mod hub;
 #[cfg(feature = "mirror")]
 pub mod images;
 pub mod model;
+#[cfg(feature = "mirror")]
 pub mod parse;
 pub mod proto;
 #[cfg(feature = "mirror")]
 pub mod pty;
 #[cfg(feature = "recordings")]
 pub mod recctl;
-#[cfg(any(feature = "serve", feature = "hub"))]
+#[cfg(any(feature = "serve-api", feature = "hub"))]
 pub mod record;
 pub mod render;
-#[cfg(feature = "serve")]
+#[cfg(feature = "serve-api")]
 pub mod server;
+pub mod source;
 #[cfg(feature = "ssh-view")]
 pub mod ssh;

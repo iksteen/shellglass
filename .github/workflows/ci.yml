@@ -36,7 +36,7 @@ jobs:
         env:
           RUSTFLAGS: -D warnings
         run: |
-          for f in hub serve push ""; do
+          for f in hub serve push serve-api push-api ""; do
             echo "== features: ${f:-none}"
             cargo check --locked --no-default-features ${f:+--features $f}
           done
@@ -65,6 +65,8 @@ jobs:
           cargo check --locked --no-default-features --features hub
           cargo check --locked --no-default-features --features serve
           cargo check --locked --no-default-features --features push
+          cargo check --locked --no-default-features --features serve-api
+          cargo check --locked --no-default-features --features push-api
           cargo check --locked --no-default-features
 
   # The browser renderer is TypeScript, compiled to the committed viewer/dist/viewer.js

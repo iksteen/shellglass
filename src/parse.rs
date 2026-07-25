@@ -86,6 +86,7 @@ pub fn grid_from_screen<T>(screen: &vt100::Screen<T>) -> Grid {
     };
 
     Grid {
+        source_epoch: 0,
         cols: scols,
         rows: grid_rows,
         cursor,

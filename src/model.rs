@@ -158,6 +158,11 @@ pub struct ImageBlob {
 /// wide continuation columns already removed (so a row may be shorter than `cols`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Grid {
+    /// Producer-controlled presentation epoch. It never rides the viewer wire,
+    /// but changing it forces a full frame so a multiplexing external source can
+    /// reset cells, links, cursor, and images even when dimensions are unchanged.
+    /// PTY and wire-decoded grids use epoch zero.
+    pub source_epoch: u64,
     /// Nominal column count (the screen width in cells).
     pub cols: u16,
     pub rows: Vec<Vec<StyledCell>>,

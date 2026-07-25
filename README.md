@@ -41,6 +41,12 @@ cargo build --release
 # Omit the command for cmd.exe, or append: -- pwsh.exe -NoLogo
 ```
 
+## External frame producers
+
+The library API accepts parser-independent frame sources while preserving the
+stock viewer, diff protocol, local HTTP/SSH serving, recording, and hub push.
+See [`docs/library-api.md`](docs/library-api.md).
+
 ## Hub + client
 
 The **secret key** is the write capability. Its hash — `hex(argon2id(secret))`, a
