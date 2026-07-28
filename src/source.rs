@@ -30,6 +30,10 @@ pub struct NoopSinkStatus;
 impl SinkStatus for NoopSinkStatus {}
 
 /// One active source, ready for the existing frame-oriented publishing pipeline.
+///
+/// `non_exhaustive`: build one with [`SourceSession::external`] or
+/// [`SourceSession::new`] so a future field doesn't break every producer.
+#[non_exhaustive]
 pub struct SourceSession {
     /// Latest complete screen. `watch` gives every backend newest-frame
     /// backpressure: an unread intermediate frame is replaced, never queued.
@@ -39,12 +43,18 @@ pub struct SourceSession {
 }
 
 impl SourceSession {
-    /// Construct an externally-owned source with outage notifications disabled.
-    pub fn external(frames: watch::Receiver<Arc<Frame>>) -> Self {
+    /// Construct a source that reports hub status to `sink_status` — for a
+    /// producer that owns the terminal it captures and can pause/repaint it.
+    pub fn new(frames: watch::Receiver<Arc<Frame>>, sink_status: Arc<dyn SinkStatus>) -> Self {
         Self {
             frames,
-            sink_status: Arc::new(NoopSinkStatus),
+            sink_status,
         }
+    }
+
+    /// Construct an externally-owned source with outage notifications disabled.
+    pub fn external(frames: watch::Receiver<Arc<Frame>>) -> Self {
+        Self::new(frames, Arc::new(NoopSinkStatus))
     }
 }
 
@@ -53,7 +63,14 @@ impl SourceSession {
 /// Clones share one channel and presentation epoch. Publishing replaces any
 /// unread frame instead of queueing it. [`switch_source`](Self::switch_source)
 /// increments producer-only metadata so the next browser message is a full
-/// snapshot even when the old and new sources have identical dimensions.
+/// snapshot even when the old and new sources have identical dimensions — which
+/// is also how a producer resets the OSC 8 link table (see
+/// [`crate::model::Grid::links`]).
+///
+/// Publish from ONE task at a time: clones exist so a producer can hand the
+/// handle around, not so several can race. A `publish` concurrent with another
+/// clone's `switch_source` can stamp the pre-switch epoch onto the post-switch
+/// frame, and the viewer would then get a diff across the discontinuity.
 #[derive(Clone)]
 pub struct FramePublisher {
     frames: watch::Sender<Arc<Frame>>,

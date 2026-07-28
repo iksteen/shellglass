@@ -52,7 +52,12 @@ impl Presentation {
 }
 
 /// Standalone HTTP/SSE publishing options.
+///
+/// `non_exhaustive`: these mirror the CLI's flags and gain a field whenever one
+/// is added, so build them with [`ServeOptions::new`] and assign what you need —
+/// a struct literal here would break on every new option.
 #[cfg(feature = "serve-api")]
+#[non_exhaustive]
 pub struct ServeOptions {
     pub bind: String,
     pub cors_origins: Vec<String>,
@@ -230,7 +235,11 @@ where
 }
 
 /// Remote hub publishing options.
+///
+/// `non_exhaustive` for the same reason as [`ServeOptions`] — construct with
+/// [`PushOptions::new`].
 #[cfg(feature = "push-api")]
+#[non_exhaustive]
 pub struct PushOptions {
     pub url: String,
     pub key: String,
