@@ -16,10 +16,10 @@
 //!
 //! Unix only (unix-domain sockets + termios). Frame fidelity matches the local
 //! mirror for text/colors/cursor; inline-image decoding is not wired into the
-//! headless owner (see [`crate::pty::HeadlessScreen`]).
+//! headless owner (see [`crate::pty::ScreenState`]).
 
 use crate::model::Frame;
-use crate::pty::{self, HeadlessScreen, RawMode};
+use crate::pty::{RawMode, ScreenState};
 use crate::source::{SinkStatus, SourceSession};
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::watch;
 
 /// The detach hotkey: `Ctrl-\` (FS, 0x1c) — dtach/abduco's default, chosen so it
@@ -98,7 +98,7 @@ impl ClientSink {
     }
 }
 
-/// Messages into the single core thread (owns the [`HeadlessScreen`]).
+/// Messages into the single core thread (owns the [`ScreenState`]).
 enum Core {
     Data(Vec<u8>),
     Resize(u16, u16), // rows, cols (parser side)
@@ -247,7 +247,7 @@ pub fn start_detached(
 
     let (core_tx, core_rx) = mpsc::channel::<Core>();
     let (pty_tx, pty_rx) = mpsc::channel::<PtyCmd>();
-    let (frame_tx, frame_rx) = watch::channel(HeadlessScreen::blank_frame(rows, cols));
+    let (frame_tx, frame_rx) = watch::channel(ScreenState::blank_frame(rows, cols));
 
     // PTY reader -> core.
     {
@@ -350,7 +350,7 @@ pub fn start_detached(
                 core_rx,
                 pty_tx,
                 frame_tx,
-                HeadlessScreen::new(rows, cols),
+                ScreenState::new(rows, cols),
                 socket,
             );
         });
@@ -449,32 +449,20 @@ fn handle_client(
     let _ = core_tx.send(Core::Detach { cid });
 }
 
-/// The single owner of the [`HeadlessScreen`] AND the one-client-at-a-time policy.
-/// Tees PTY output to the attached client (if any) and renders frames for the hub
-/// at ≤30fps.
+/// The single owner of the [`ScreenState`] AND the one-client-at-a-time policy.
+/// Tees PTY output to the attached client (if any); the screen state itself owns
+/// the frame clock, so pacing and fidelity match the local mirror by construction.
 fn core_thread(
     rx: mpsc::Receiver<Core>,
     pty_tx: mpsc::Sender<PtyCmd>,
     frame_tx: watch::Sender<Arc<Frame>>,
-    mut screen: HeadlessScreen,
+    mut screen: ScreenState,
     socket: PathBuf,
 ) {
     let mut client: Option<(u64, ClientSink)> = None;
-    let mut last_frame = Instant::now();
-    let mut dirty = false;
 
     loop {
-        // Wake at the soonest of: the frame interval (when dirty) and the
-        // cursor-hide grace expiry (when bridging a hidden cursor, so the real
-        // hide still ships even if the app then goes quiet). Neither ⇒ block.
-        let wait = {
-            let mut d = dirty.then(|| pty::MIN_FRAME.saturating_sub(last_frame.elapsed()));
-            if let Some(rem) = screen.hide_grace_remaining() {
-                d = Some(d.map_or(rem, |x| x.min(rem)));
-            }
-            d
-        };
-        let msg = match wait {
+        let msg = match screen.wait() {
             Some(d) => match rx.recv_timeout(d) {
                 Ok(m) => Some(m),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
@@ -494,12 +482,8 @@ fn core_thread(
                 {
                     client = None;
                 }
-                dirty = true;
             }
-            Some(Core::Resize(rows, cols)) => {
-                screen.set_size(rows, cols);
-                dirty = true;
-            }
+            Some(Core::Resize(rows, cols)) => screen.set_size(rows, cols),
             Some(Core::AttachRequest {
                 cid,
                 force,
@@ -525,7 +509,7 @@ fn core_thread(
                     let _ = sink.send_data(&screen.repaint());
                     client = Some((cid, sink));
                     let _ = reply.send(true);
-                    dirty = true;
+                    screen.touch();
                 }
             }
             Some(Core::Detach { cid }) => {
@@ -549,15 +533,8 @@ fn core_thread(
             None => {}
         }
 
-        // A bridged hidden cursor whose grace has now expired must publish the
-        // real hide even with no new data (dirty=false).
-        if (dirty || screen.hide_due())
-            && last_frame.elapsed() >= pty::MIN_FRAME
-            && !screen.hold_frame()
-        {
-            let _ = frame_tx.send(screen.frame());
-            dirty = false;
-            last_frame = Instant::now();
+        if let Some(frame) = screen.due_frame() {
+            let _ = frame_tx.send(frame);
         }
     }
     let _ = std::fs::remove_file(&socket);
@@ -738,11 +715,11 @@ mod tests {
     fn one_client_at_a_time_policy() {
         let (core_tx, core_rx) = mpsc::channel();
         let (pty_tx, pty_rx) = mpsc::channel();
-        let (frame_tx, _frame_rx) = watch::channel(HeadlessScreen::blank_frame(24, 80));
+        let (frame_tx, _frame_rx) = watch::channel(ScreenState::blank_frame(24, 80));
         let sock =
             std::env::temp_dir().join(format!("shellglass-test-{}.sock", std::process::id()));
         thread::spawn(move || {
-            core_thread(core_rx, pty_tx, frame_tx, HeadlessScreen::new(24, 80), sock);
+            core_thread(core_rx, pty_tx, frame_tx, ScreenState::new(24, 80), sock);
         });
 
         // First client: accepted, and only now does the PTY track its terminal.
