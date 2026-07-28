@@ -444,17 +444,26 @@ fn core_thread(
     let mut dirty = false;
 
     loop {
-        let msg = if dirty {
-            match rx.recv_timeout(pty::MIN_FRAME) {
+        // Wake at the soonest of: the frame interval (when dirty) and the
+        // cursor-hide grace expiry (when bridging a hidden cursor, so the real
+        // hide still ships even if the app then goes quiet). Neither ⇒ block.
+        let wait = {
+            let mut d = dirty.then(|| pty::MIN_FRAME.saturating_sub(last_frame.elapsed()));
+            if let Some(rem) = screen.hide_grace_remaining() {
+                d = Some(d.map_or(rem, |x| x.min(rem)));
+            }
+            d
+        };
+        let msg = match wait {
+            Some(d) => match rx.recv_timeout(d) {
                 Ok(m) => Some(m),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        } else {
-            match rx.recv() {
+            },
+            None => match rx.recv() {
                 Ok(m) => Some(m),
                 Err(_) => break,
-            }
+            },
         };
 
         match msg {
@@ -505,11 +514,9 @@ fn core_thread(
                 }
             }
             Some(Core::HubUp) => {
-                if let Some((_, sink)) = client.as_mut()
-                    && sink.send_data(&screen.repaint()).is_err()
-                {
-                    client = None;
-                }
+                // The attached client's screen never showed the outage (HubDown
+                // only logs) — nothing to restore; just log the recovery.
+                eprintln!("shellglass: hub connection restored");
             }
             Some(Core::HubDown(msg)) => {
                 // No local terminal to paint onto; log for the backgrounded owner.
@@ -522,7 +529,12 @@ fn core_thread(
             None => {}
         }
 
-        if dirty && last_frame.elapsed() >= pty::MIN_FRAME {
+        // A bridged hidden cursor whose grace has now expired must publish the
+        // real hide even with no new data (dirty=false).
+        if (dirty || screen.hide_due())
+            && last_frame.elapsed() >= pty::MIN_FRAME
+            && !screen.hold_frame()
+        {
             let _ = frame_tx.send(screen.frame());
             dirty = false;
             last_frame = Instant::now();

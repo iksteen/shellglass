@@ -970,6 +970,7 @@ pub(crate) struct HeadlessScreen {
     images: Vec<Placed>,
     zombies: Vec<Placed>,
     bridge: CursorBridge,
+    sync: SyncGate,
 }
 
 #[cfg(all(feature = "push", unix))]
@@ -980,6 +981,7 @@ impl HeadlessScreen {
             images: Vec::new(),
             zombies: Vec::new(),
             bridge: CursorBridge::default(),
+            sync: SyncGate::new(),
         }
     }
 
@@ -1000,6 +1002,27 @@ impl HeadlessScreen {
 
     pub(crate) fn set_size(&mut self, rows: u16, cols: u16) {
         self.parser.screen_mut().set_size(rows, cols);
+    }
+
+    /// Should a due publish be held for an in-progress synchronized update
+    /// (DEC 2026)? Same gating as the local mirror: an attached terminal
+    /// answers the inner app's mode queries, so tmux/neovim will wrap redraws
+    /// in BSU/ESU and a gate-less snapshot would ship torn mid-redraw frames.
+    pub(crate) fn hold_frame(&mut self) -> bool {
+        self.sync.hold(self.parser.screen())
+    }
+
+    /// Remaining cursor-hide grace while bridging a hidden cursor: the owner's
+    /// loop must wake when it expires so the genuine hide still publishes even
+    /// if the app then goes quiet.
+    pub(crate) fn hide_grace_remaining(&self) -> Option<Duration> {
+        let since = self.bridge.hidden_since.filter(|_| self.bridge.shown.is_some())?;
+        Some(CURSOR_HIDE_GRACE.saturating_sub(since.elapsed()))
+    }
+
+    /// A bridged hidden cursor whose grace has expired: publish even if clean.
+    pub(crate) fn hide_due(&self) -> bool {
+        self.hide_grace_remaining() == Some(Duration::ZERO)
     }
 
     /// Snapshot the current screen as a [`Frame`] for the hub pipeline.
