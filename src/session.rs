@@ -23,13 +23,14 @@ use crate::pty::{self, HeadlessScreen, Notifier, RawMode};
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 /// The detach hotkey: `Ctrl-\` (FS, 0x1c) — dtach/abduco's default, chosen so it
@@ -56,10 +57,21 @@ fn write_frame<W: Write>(w: &mut W, tag: u8, payload: &[u8]) -> std::io::Result<
     w.flush()
 }
 
+/// Cap on one wire frame's payload. The largest legitimate frame is a
+/// full-screen repaint, well under this; anything bigger is a broken or hostile
+/// peer and must not translate into an attacker-sized allocation.
+const MAX_FRAME_LEN: usize = 1 << 20;
+
 fn read_frame<R: Read>(r: &mut R) -> std::io::Result<(u8, Vec<u8>)> {
     let mut hdr = [0u8; 5];
     r.read_exact(&mut hdr)?;
     let len = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
+    if len > MAX_FRAME_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "wire frame exceeds MAX_FRAME_LEN",
+        ));
+    }
     let mut payload = vec![0u8; len];
     r.read_exact(&mut payload)?;
     Ok((hdr[0], payload))
@@ -289,20 +301,34 @@ pub fn start_detached(
     if let Some(dir) = socket.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::remove_file(socket); // clear a stale socket
+    // A connectable socket means a live owner — refuse to silently steal its
+    // attach path; only a dead leftover is stale and safe to clear.
+    if socket.exists() {
+        if UnixStream::connect(socket).is_ok() {
+            anyhow::bail!(
+                "a session is already listening on {} (use --socket for a second session)",
+                socket.display()
+            );
+        }
+        let _ = std::fs::remove_file(socket);
+    }
     let listener = UnixListener::bind(socket)
         .with_context(|| format!("binding socket {}", socket.display()))?;
+    // The socket is the write capability to the session (keystroke injection):
+    // owner-only, regardless of umask or a custom --socket location.
+    let _ = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600));
     {
         let core_tx = core_tx.clone();
         let pty_tx = pty_tx.clone();
         thread::spawn(move || {
-            let next_cid = AtomicU64::new(0);
+            let mut next_cid: u64 = 0;
             for conn in listener.incoming() {
                 let stream = match conn {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
-                let cid = next_cid.fetch_add(1, Ordering::SeqCst) + 1;
+                next_cid += 1;
+                let cid = next_cid;
                 let core_tx = core_tx.clone();
                 let pty_tx = pty_tx.clone();
                 thread::spawn(move || handle_client(stream, cid, core_tx, pty_tx));
@@ -313,7 +339,10 @@ pub fn start_detached(
     // Core thread.
     {
         let socket = socket.to_path_buf();
-        thread::spawn(move || core_thread(core_rx, frame_tx, HeadlessScreen::new(rows, cols), socket));
+        let pty_tx = pty_tx.clone();
+        thread::spawn(move || {
+            core_thread(core_rx, pty_tx, frame_tx, HeadlessScreen::new(rows, cols), socket);
+        });
     }
 
     let notifier = {
@@ -340,6 +369,10 @@ fn handle_client(stream: UnixStream, cid: u64, core_tx: mpsc::Sender<Core>, pty_
         Ok(s) => s,
         Err(_) => return,
     };
+    // Bound sink writes: the core thread is the hub's frame producer, and a
+    // stuck client (SIGSTOP, wedged terminal) filling the socket buffer must
+    // cost it at most this before the client is dropped — never a frozen mirror.
+    let _ = sink_stream.set_write_timeout(Some(Duration::from_secs(1)));
     let mut read_half = stream;
 
     // First frame: hello (carries the --force flag). Tolerate its absence.
@@ -358,7 +391,6 @@ fn handle_client(stream: UnixStream, cid: u64, core_tx: mpsc::Sender<Core>, pty_
         Ok(_) => {}
         Err(_) => return,
     }
-    let _ = pty_tx.send(PtyCmd::Resize(rows, cols));
 
     let (reply_tx, reply_rx) = mpsc::channel::<bool>();
     if core_tx
@@ -402,6 +434,7 @@ fn handle_client(stream: UnixStream, cid: u64, core_tx: mpsc::Sender<Core>, pty_
 /// at ≤30fps.
 fn core_thread(
     rx: mpsc::Receiver<Core>,
+    pty_tx: mpsc::Sender<PtyCmd>,
     frame_tx: watch::Sender<Arc<Frame>>,
     mut screen: HeadlessScreen,
     socket: PathBuf,
@@ -455,6 +488,9 @@ fn core_thread(
                     if let Some((_, mut old)) = client.take() {
                         let _ = old.send_kicked(); // force takeover: notify the incumbent
                     }
+                    // The PTY tracks the client's terminal only once the attach is
+                    // GRANTED — a rejected attach must never resize the session.
+                    let _ = pty_tx.send(PtyCmd::Resize(rows, cols));
                     screen.set_size(rows, cols);
                     let _ = sink.send_accepted();
                     let _ = sink.send_data(&screen.repaint());
