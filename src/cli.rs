@@ -44,6 +44,20 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// If the chosen mode is `push --daemon`, fork into the background before the
+    /// caller builds the tokio runtime. A no-op for every other mode. Must be
+    /// called while still single-threaded.
+    ///
+    /// # Errors
+    /// Propagates [`PushArgs::daemonize_if_requested`].
+    pub fn daemonize_if_requested(&self) -> Result<()> {
+        match &self.action {
+            #[cfg(feature = "push")]
+            Action::Push(args) => args.daemonize_if_requested(),
+            _ => Ok(()),
+        }
+    }
+
     /// Dispatch the chosen mode — the single entry point every binary uses.
     ///
     /// # Errors
@@ -56,6 +70,8 @@ impl Cli {
             Action::Serve(args) => args.run().await,
             #[cfg(feature = "push")]
             Action::Push(args) => args.run().await,
+            #[cfg(all(feature = "push", unix))]
+            Action::Attach(args) => args.run(),
             #[cfg(feature = "hub")]
             Action::Hub(args) => args.run().await,
             #[cfg(feature = "sessions")]
@@ -332,6 +348,11 @@ enum Action {
     #[cfg(feature = "push")]
     Push(PushArgs),
 
+    /// Attach a terminal to a detached `push --detachable` session. Detach with
+    /// `Ctrl-\`; the session keeps running at the last attached size.
+    #[cfg(all(feature = "push", unix))]
+    Attach(AttachArgs),
+
     /// Run as a hub: receive pushes from clients and re-serve their sessions.
     #[cfg(feature = "hub")]
     Hub(HubArgs),
@@ -415,6 +436,103 @@ pub struct PushArgs {
         value_parser = clap::builder::FalseyValueParser::new()
     )]
     no_record: bool,
+
+    /// Run detached (dtach-style): the command runs in a terminal-less PTY, keeps
+    /// streaming to the hub with no local terminal, and is reachable via
+    /// `shellglass attach`. Detach a client with `Ctrl-\`; the session then holds
+    /// the last attached size. Unix only.
+    #[arg(long)]
+    detachable: bool,
+
+    /// Unix socket for `attach` to connect to (detachable mode). Defaults to
+    /// `$XDG_RUNTIME_DIR/shellglass-<id>.sock` (else `$TMPDIR`).
+    #[arg(long, value_name = "PATH")]
+    socket: Option<PathBuf>,
+
+    /// Initial / no-client PTY size for detachable mode, `WIDTHxHEIGHT`.
+    #[arg(long, value_name = "WxH", default_value = "80x24")]
+    size: String,
+
+    /// Daemonize: fork into the background, fully detached from the terminal and
+    /// the (SSH) session, so it survives logout. Requires --detachable; stdio is
+    /// redirected to --log-file. The launching shell returns immediately. Unix
+    /// only.
+    #[arg(long, short = 'd')]
+    daemon: bool,
+
+    /// Where a --daemon's stdout/stderr go. Defaults to
+    /// `$XDG_RUNTIME_DIR/shellglass-<id>.log` (else `$TMPDIR`).
+    #[arg(long, value_name = "PATH")]
+    log_file: Option<PathBuf>,
+}
+
+#[cfg(feature = "push")]
+impl PushArgs {
+    /// If `--daemon` was given, fork into the background BEFORE the tokio runtime
+    /// starts (fork is only safe while single-threaded). Returns immediately when
+    /// not daemonizing, and only in the detached daemon when it is.
+    ///
+    /// # Errors
+    /// `--daemon` without `--detachable`, on non-Unix, or if the fork/redirect fails.
+    pub fn daemonize_if_requested(&self) -> Result<()> {
+        if !self.daemon {
+            return Ok(());
+        }
+        if !self.detachable {
+            anyhow::bail!("--daemon requires --detachable");
+        }
+        #[cfg(unix)]
+        {
+            let id = proto::session_id(&self.key.key);
+            let sock = self
+                .socket
+                .clone()
+                .unwrap_or_else(|| crate::session::default_socket_path(&id));
+            let log = self
+                .log_file
+                .clone()
+                .unwrap_or_else(|| crate::session::default_log_path(&id));
+            let info = format!(
+                "shellglass: daemonized detached session on {}\n\
+                 shellglass: attach with `shellglass attach {}`\n\
+                 shellglass: logging to {}\n",
+                sock.display(),
+                sock.display(),
+                log.display(),
+            );
+            crate::session::daemonize(&info, &log)
+        }
+        #[cfg(not(unix))]
+        {
+            anyhow::bail!("--daemon is only supported on Unix");
+        }
+    }
+}
+
+/// Args for `attach` (detachable sessions; Unix only).
+#[cfg(all(feature = "push", unix))]
+#[derive(clap::Args, Debug)]
+pub struct AttachArgs {
+    /// Path to the session's unix socket (the `push --socket` value).
+    #[arg(value_name = "SOCKET")]
+    socket: PathBuf,
+
+    /// Take over even if a client is already attached: force the incumbent to
+    /// detach, then attach. Without this, attaching to a session that already
+    /// has a client is refused.
+    #[arg(long, short = 'f')]
+    force: bool,
+}
+
+#[cfg(all(feature = "push", unix))]
+impl AttachArgs {
+    /// Attach the current terminal to a detached session.
+    ///
+    /// # Errors
+    /// If the socket can't be reached or the tty can't be set up.
+    pub fn run(self) -> Result<()> {
+        crate::session::attach(&self.socket, self.force)
+    }
 }
 
 /// The terminal source, shared by `serve` and `push` (both render locally).
@@ -678,7 +796,16 @@ impl PushArgs {
     /// # Errors
     /// Config/font failures before registration; the client loop's after.
     pub async fn run(self) -> Result<()> {
-        run_push(self.url, self.key.key, self.source, self.no_record).await
+        run_push(
+            self.url,
+            self.key.key,
+            self.source,
+            self.no_record,
+            self.detachable,
+            self.socket,
+            self.size,
+        )
+        .await
     }
 }
 
@@ -963,7 +1090,24 @@ async fn run_serve(
 /// command) start only once the hub has accepted a registration — `client::run`
 /// invokes the closure after the first successful register.
 #[cfg(feature = "push")]
-async fn run_push(url: String, key: String, source: SourceArgs, no_record: bool) -> Result<()> {
+async fn run_push(
+    url: String,
+    key: String,
+    source: SourceArgs,
+    no_record: bool,
+    detachable: bool,
+    socket: Option<PathBuf>,
+    size: String,
+) -> Result<()> {
+    if detachable {
+        #[cfg(unix)]
+        return run_push_detached(url, key, source, no_record, socket, size).await;
+        #[cfg(not(unix))]
+        {
+            let _ = (socket, size);
+            anyhow::bail!("--detachable is only supported on Unix");
+        }
+    }
     // The client derives NO ids: authorization sends the key itself, font URLs
     // in the pushed CSS are page-relative, and the authoritative view URL is
     // announced in the HUB's log on connect — the client could only guess it
@@ -983,6 +1127,54 @@ async fn run_push(url: String, key: String, source: SourceArgs, no_record: bool)
         || pty::start(&source.command(), sixel_compat),
     )
     .await
+}
+
+/// Detachable variant of `run_push`: the command runs in a terminal-less PTY
+/// exposed on a unix socket (`shellglass attach`), holding the last attached
+/// size on detach. Unix only.
+#[cfg(all(feature = "push", unix))]
+async fn run_push_detached(
+    url: String,
+    key: String,
+    source: SourceArgs,
+    no_record: bool,
+    socket: Option<PathBuf>,
+    size: String,
+) -> Result<()> {
+    let id = proto::session_id(&key);
+    let sock = socket.unwrap_or_else(|| crate::session::default_socket_path(&id));
+    let size = parse_size(&size)?;
+    let base = url.trim_end_matches('/');
+    println!("shellglass: pushing live to {base}");
+    println!("shellglass: detached session on {}", sock.display());
+    println!(
+        "shellglass: attach with `shellglass attach {}`",
+        sock.display()
+    );
+    let s = setup(&source)?;
+    let cmd = source.command();
+    client::run(
+        url,
+        key,
+        s.config,
+        s.resolver,
+        s.fonts,
+        s.template,
+        no_record,
+        move || crate::session::start_detached(&cmd, &sock, size),
+    )
+    .await
+}
+
+/// Parse a `WIDTHxHEIGHT` size string into (cols, rows).
+#[cfg(all(feature = "push", unix))]
+fn parse_size(s: &str) -> Result<(u16, u16)> {
+    let (w, h) = s
+        .split_once(['x', 'X'])
+        .with_context(|| format!("size must look like 160x50, got {s:?}"))?;
+    let cols = w.trim().parse().with_context(|| format!("bad width in {s:?}"))?;
+    let rows = h.trim().parse().with_context(|| format!("bad height in {s:?}"))?;
+    Ok((cols, rows))
 }
 
 /// One-line description of what a source mirrors, for the startup log.

@@ -68,5 +68,7 @@ pub mod record;
 pub mod render;
 #[cfg(feature = "serve")]
 pub mod server;
+#[cfg(all(feature = "push", unix))]
+pub mod session;
 #[cfg(feature = "ssh-view")]
 pub mod ssh;
