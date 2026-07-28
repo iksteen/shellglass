@@ -24,13 +24,14 @@ use crate::source::{SinkStatus, SourceSession};
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 /// The detach hotkey: `Ctrl-\` (FS, 0x1c) — dtach/abduco's default, chosen so it
@@ -57,10 +58,21 @@ fn write_frame<W: Write>(w: &mut W, tag: u8, payload: &[u8]) -> std::io::Result<
     w.flush()
 }
 
+/// Cap on one wire frame's payload. The largest legitimate frame is a
+/// full-screen repaint, well under this; anything bigger is a broken or hostile
+/// peer and must not translate into an attacker-sized allocation.
+const MAX_FRAME_LEN: usize = 1 << 20;
+
 fn read_frame<R: Read>(r: &mut R) -> std::io::Result<(u8, Vec<u8>)> {
     let mut hdr = [0u8; 5];
     r.read_exact(&mut hdr)?;
     let len = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
+    if len > MAX_FRAME_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "wire frame exceeds MAX_FRAME_LEN",
+        ));
+    }
     let mut payload = vec![0u8; len];
     r.read_exact(&mut payload)?;
     Ok((hdr[0], payload))
@@ -223,7 +235,10 @@ pub fn start_detached(
     if std::env::var_os("TERM").is_none() {
         builder.env("TERM", "xterm-256color");
     }
-    let mut child = pair.slave.spawn_command(builder).context("spawning command")?;
+    let mut child = pair
+        .slave
+        .spawn_command(builder)
+        .context("spawning command")?;
     drop(pair.slave);
 
     let master = pair.master;
@@ -291,20 +306,34 @@ pub fn start_detached(
     if let Some(dir) = socket.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::remove_file(socket); // clear a stale socket
+    // A connectable socket means a live owner — refuse to silently steal its
+    // attach path; only a dead leftover is stale and safe to clear.
+    if socket.exists() {
+        if UnixStream::connect(socket).is_ok() {
+            anyhow::bail!(
+                "a session is already listening on {} (use --socket for a second session)",
+                socket.display()
+            );
+        }
+        let _ = std::fs::remove_file(socket);
+    }
     let listener = UnixListener::bind(socket)
         .with_context(|| format!("binding socket {}", socket.display()))?;
+    // The socket is the write capability to the session (keystroke injection):
+    // owner-only, regardless of umask or a custom --socket location.
+    let _ = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600));
     {
         let core_tx = core_tx.clone();
         let pty_tx = pty_tx.clone();
         thread::spawn(move || {
-            let next_cid = AtomicU64::new(0);
+            let mut next_cid: u64 = 0;
             for conn in listener.incoming() {
                 let stream = match conn {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
-                let cid = next_cid.fetch_add(1, Ordering::SeqCst) + 1;
+                next_cid += 1;
+                let cid = next_cid;
                 let core_tx = core_tx.clone();
                 let pty_tx = pty_tx.clone();
                 thread::spawn(move || handle_client(stream, cid, core_tx, pty_tx));
@@ -315,7 +344,16 @@ pub fn start_detached(
     // Core thread.
     {
         let socket = socket.to_path_buf();
-        thread::spawn(move || core_thread(core_rx, frame_tx, HeadlessScreen::new(rows, cols), socket));
+        let pty_tx = pty_tx.clone();
+        thread::spawn(move || {
+            core_thread(
+                core_rx,
+                pty_tx,
+                frame_tx,
+                HeadlessScreen::new(rows, cols),
+                socket,
+            );
+        });
     }
 
     Ok(SourceSession::new(frame_rx, Arc::new(CoreStatus(core_tx))))
@@ -339,11 +377,20 @@ impl SinkStatus for CoreStatus {
 /// Owner-side per-connection handler: read the client's hello + initial size, ask
 /// the core to attach it, and (if accepted) pump its input/resize/detach frames
 /// until it disconnects.
-fn handle_client(stream: UnixStream, cid: u64, core_tx: mpsc::Sender<Core>, pty_tx: mpsc::Sender<PtyCmd>) {
+fn handle_client(
+    stream: UnixStream,
+    cid: u64,
+    core_tx: mpsc::Sender<Core>,
+    pty_tx: mpsc::Sender<PtyCmd>,
+) {
     let sink_stream = match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
     };
+    // Bound sink writes: the core thread is the hub's frame producer, and a
+    // stuck client (SIGSTOP, wedged terminal) filling the socket buffer must
+    // cost it at most this before the client is dropped — never a frozen mirror.
+    let _ = sink_stream.set_write_timeout(Some(Duration::from_secs(1)));
     let mut read_half = stream;
 
     // First frame: hello (carries the --force flag). Tolerate its absence.
@@ -362,7 +409,6 @@ fn handle_client(stream: UnixStream, cid: u64, core_tx: mpsc::Sender<Core>, pty_
         Ok(_) => {}
         Err(_) => return,
     }
-    let _ = pty_tx.send(PtyCmd::Resize(rows, cols));
 
     let (reply_tx, reply_rx) = mpsc::channel::<bool>();
     if core_tx
@@ -371,7 +417,9 @@ fn handle_client(stream: UnixStream, cid: u64, core_tx: mpsc::Sender<Core>, pty_
             force,
             cols,
             rows,
-            sink: ClientSink { stream: sink_stream },
+            sink: ClientSink {
+                stream: sink_stream,
+            },
             reply: reply_tx,
         })
         .is_err()
@@ -406,6 +454,7 @@ fn handle_client(stream: UnixStream, cid: u64, core_tx: mpsc::Sender<Core>, pty_
 /// at ≤30fps.
 fn core_thread(
     rx: mpsc::Receiver<Core>,
+    pty_tx: mpsc::Sender<PtyCmd>,
     frame_tx: watch::Sender<Arc<Frame>>,
     mut screen: HeadlessScreen,
     socket: PathBuf,
@@ -415,17 +464,26 @@ fn core_thread(
     let mut dirty = false;
 
     loop {
-        let msg = if dirty {
-            match rx.recv_timeout(pty::MIN_FRAME) {
+        // Wake at the soonest of: the frame interval (when dirty) and the
+        // cursor-hide grace expiry (when bridging a hidden cursor, so the real
+        // hide still ships even if the app then goes quiet). Neither ⇒ block.
+        let wait = {
+            let mut d = dirty.then(|| pty::MIN_FRAME.saturating_sub(last_frame.elapsed()));
+            if let Some(rem) = screen.hide_grace_remaining() {
+                d = Some(d.map_or(rem, |x| x.min(rem)));
+            }
+            d
+        };
+        let msg = match wait {
+            Some(d) => match rx.recv_timeout(d) {
                 Ok(m) => Some(m),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        } else {
-            match rx.recv() {
+            },
+            None => match rx.recv() {
                 Ok(m) => Some(m),
                 Err(_) => break,
-            }
+            },
         };
 
         match msg {
@@ -459,6 +517,9 @@ fn core_thread(
                     if let Some((_, mut old)) = client.take() {
                         let _ = old.send_kicked(); // force takeover: notify the incumbent
                     }
+                    // The PTY tracks the client's terminal only once the attach is
+                    // GRANTED — a rejected attach must never resize the session.
+                    let _ = pty_tx.send(PtyCmd::Resize(rows, cols));
                     screen.set_size(rows, cols);
                     let _ = sink.send_accepted();
                     let _ = sink.send_data(&screen.repaint());
@@ -473,11 +534,9 @@ fn core_thread(
                 }
             }
             Some(Core::HubUp) => {
-                if let Some((_, sink)) = client.as_mut()
-                    && sink.send_data(&screen.repaint()).is_err()
-                {
-                    client = None;
-                }
+                // The attached client's screen never showed the outage (HubDown
+                // only logs) — nothing to restore; just log the recovery.
+                eprintln!("shellglass: hub connection restored");
             }
             Some(Core::HubDown(msg)) => {
                 // No local terminal to paint onto; log for the backgrounded owner.
@@ -490,7 +549,12 @@ fn core_thread(
             None => {}
         }
 
-        if dirty && last_frame.elapsed() >= pty::MIN_FRAME {
+        // A bridged hidden cursor whose grace has now expired must publish the
+        // real hide even with no new data (dirty=false).
+        if (dirty || screen.hide_due())
+            && last_frame.elapsed() >= pty::MIN_FRAME
+            && !screen.hold_frame()
+        {
             let _ = frame_tx.send(screen.frame());
             dirty = false;
             last_frame = Instant::now();
@@ -630,4 +694,85 @@ pub fn attach(socket: &Path, force: bool) -> Result<()> {
     raw.leave(); // restore the tty (RawMode has no Drop)
     println!("\r\n[shellglass: detached]\r");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_frame_round_trip() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, C_INPUT, b"hello").unwrap();
+        let (tag, payload) = read_frame(&mut std::io::Cursor::new(buf)).unwrap();
+        assert_eq!(tag, C_INPUT);
+        assert_eq!(payload, b"hello");
+    }
+
+    #[test]
+    fn wire_frame_rejects_oversized_length() {
+        let hdr = [S_DATA, 0xff, 0xff, 0xff, 0xff];
+        let err = read_frame(&mut std::io::Cursor::new(hdr.to_vec())).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// Send one AttachRequest to a running core, returning our end of the
+    /// client socket and the core's accept/reject verdict.
+    fn attach_request(core_tx: &mpsc::Sender<Core>, cid: u64, force: bool) -> (UnixStream, bool) {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        core_tx
+            .send(Core::AttachRequest {
+                cid,
+                force,
+                cols: 100,
+                rows: 30,
+                sink: ClientSink { stream: theirs },
+                reply: reply_tx,
+            })
+            .unwrap();
+        (ours, reply_rx.recv().unwrap())
+    }
+
+    #[test]
+    fn one_client_at_a_time_policy() {
+        let (core_tx, core_rx) = mpsc::channel();
+        let (pty_tx, pty_rx) = mpsc::channel();
+        let (frame_tx, _frame_rx) = watch::channel(HeadlessScreen::blank_frame(24, 80));
+        let sock =
+            std::env::temp_dir().join(format!("shellglass-test-{}.sock", std::process::id()));
+        thread::spawn(move || {
+            core_thread(core_rx, pty_tx, frame_tx, HeadlessScreen::new(24, 80), sock);
+        });
+
+        // First client: accepted, and only now does the PTY track its terminal.
+        let (mut first, ok) = attach_request(&core_tx, 1, false);
+        assert!(ok);
+        assert!(matches!(pty_rx.recv().unwrap(), PtyCmd::Resize(30, 100)));
+        let (tag, _) = read_frame(&mut first).unwrap();
+        assert_eq!(tag, S_ACCEPTED);
+
+        // Second client without force: rejected with a reason, and the live
+        // session was NOT resized.
+        let (mut second, ok) = attach_request(&core_tx, 2, false);
+        assert!(!ok);
+        let (tag, reason) = read_frame(&mut second).unwrap();
+        assert_eq!(tag, S_REJECTED);
+        assert!(!reason.is_empty());
+        assert!(
+            pty_rx.try_recv().is_err(),
+            "rejected attach must not resize"
+        );
+
+        // Third client with force: the incumbent is kicked, the newcomer wins.
+        let (mut third, ok) = attach_request(&core_tx, 3, true);
+        assert!(ok);
+        assert!(matches!(pty_rx.recv().unwrap(), PtyCmd::Resize(30, 100)));
+        let (tag, _) = read_frame(&mut third).unwrap();
+        assert_eq!(tag, S_ACCEPTED);
+        let (tag, _) = read_frame(&mut first).unwrap(); // the accept-time repaint
+        assert_eq!(tag, S_DATA);
+        let (tag, _) = read_frame(&mut first).unwrap();
+        assert_eq!(tag, S_KICKED);
+    }
 }

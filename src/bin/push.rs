@@ -15,7 +15,7 @@ struct Cli {
 }
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     // Daemonize (if `--daemon`) before the tokio runtime spins up its threads.
     cli.args.daemonize_if_requested()?;
     tokio::runtime::Builder::new_multi_thread()
