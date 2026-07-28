@@ -14,7 +14,12 @@ struct Cli {
     args: shellglass::cli::PushArgs,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    Cli::parse().args.run().await
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    // Daemonize (if `--daemon`) before the tokio runtime spins up its threads.
+    cli.args.daemonize_if_requested()?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(cli.args.run())
 }
