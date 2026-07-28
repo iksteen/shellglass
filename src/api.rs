@@ -82,6 +82,9 @@ impl ServeOptions {
 }
 
 /// Serve any parser-independent source through shellglass's stock viewer.
+///
+/// Runs until the process ends; use [`serve_with_shutdown`] to stop it on a
+/// signal of your own.
 #[cfg(feature = "serve-api")]
 pub async fn serve<F>(start: F, presentation: Presentation, options: ServeOptions) -> Result<()>
 where
@@ -90,8 +93,12 @@ where
     serve_with_shutdown(start, presentation, options, std::future::pending()).await
 }
 
+/// [`serve`], stopping gracefully when `shutdown` resolves: in-flight responses
+/// finish, then the listener closes and this returns. An embedder that owns the
+/// process lifetime (a GUI, a test, a supervisor) needs this rather than the
+/// run-forever default.
 #[cfg(feature = "serve-api")]
-async fn serve_with_shutdown<F, S>(
+pub async fn serve_with_shutdown<F, S>(
     start: F,
     presentation: Presentation,
     options: ServeOptions,
@@ -105,13 +112,13 @@ where
     use crate::render;
     use crate::server::{self, AppState};
 
-    let listener = bind(&options.bind)?;
+    let listener = crate::bind(&options.bind)?;
     if let Some(dir) = &options.record_dir {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("creating record directory {}", dir.display()))?;
     }
     let ssh_ready = match &options.ssh_bind {
-        Some(addr) => match prepare_ssh(addr, options.ssh_host_key.as_deref(), "x") {
+        Some(addr) => match crate::ssh::prepare(addr, options.ssh_host_key.as_deref(), "x") {
             Ok(ready) => Some(ready),
             Err(error) => {
                 eprintln!("shellglass: SSH view disabled — {error:#}");
@@ -162,7 +169,7 @@ where
     let live = diff::Live::spawn(rx);
     if let Some((listener, key)) = ssh_ready {
         let target = crate::ssh::Target::Single(Arc::clone(&live));
-        let motd = load_ssh_motd(options.ssh_motd_file.as_deref(), options.ssh_motd_delay);
+        let motd = crate::ssh::load_motd(options.ssh_motd_file.as_deref(), options.ssh_motd_delay);
         tokio::spawn(async move {
             if let Err(error) = crate::ssh::serve(listener, key, target, motd).await {
                 eprintln!("shellglass: ssh server error: {error}");
@@ -261,49 +268,6 @@ where
         start,
     )
     .await
-}
-
-#[cfg(feature = "serve-api")]
-fn prepare_ssh(
-    addr: &str,
-    key_path: Option<&Path>,
-    hint_user: &str,
-) -> Result<(tokio::net::TcpListener, russh::keys::PrivateKey)> {
-    let listener = bind(addr)?;
-    let key = crate::ssh::setup(listener.local_addr()?, key_path, hint_user)?;
-    Ok((listener, key))
-}
-
-#[cfg(feature = "serve-api")]
-fn load_ssh_motd(path: Option<&Path>, delay_secs: u64) -> Option<crate::ssh::Motd> {
-    match crate::ssh::Motd::load(path?, delay_secs) {
-        Ok(motd) => Some(motd),
-        Err(error) => {
-            eprintln!("shellglass: SSH MOTD disabled — {error:#}");
-            None
-        }
-    }
-}
-
-#[cfg(feature = "serve-api")]
-fn bind(addr: &str) -> Result<tokio::net::TcpListener> {
-    use tokio::net::TcpSocket;
-    let sockaddr: std::net::SocketAddr = addr
-        .parse()
-        .with_context(|| format!("bind address must be IP:port, got {addr:?}"))?;
-    let socket = if sockaddr.is_ipv6() {
-        TcpSocket::new_v6()
-    } else {
-        TcpSocket::new_v4()
-    }
-    .context("creating socket")?;
-    socket.set_reuseaddr(true)?;
-    socket
-        .bind(sockaddr)
-        .with_context(|| format!("binding {addr}"))?;
-    socket
-        .listen(1024)
-        .with_context(|| format!("listening on {addr}"))
 }
 
 #[cfg(all(test, feature = "serve-api", feature = "push-api"))]
