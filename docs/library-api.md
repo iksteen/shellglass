@@ -46,7 +46,9 @@ shellglass::api::serve(|| Ok(source), presentation, options).await?;
 `ServeOptions` and `PushOptions` are `#[non_exhaustive]` — build them with
 `::new()` and assign the fields you need, so a new option is not a breaking
 change. To stop the server on your own signal, use `serve_with_shutdown`, which
-takes a future and shuts down gracefully when it resolves.
+takes a future and shuts down gracefully when it resolves. It closes long-lived
+SSE and SSH viewers, stops source-forwarding tasks, and flushes an active
+recording before returning, so the same runtime can start another server.
 
 For a hub, `api::push` takes the same source factory and a `PushOptions`. The
 factory is invoked only after the authenticated WebSocket upgrade succeeds.

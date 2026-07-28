@@ -22,7 +22,13 @@ default = ["serve", "push", "hub", "sessions", "recordings"]
 serve = ["mirror", "serve-api"]
 # Library-only standalone publisher. Unlike `serve`, this does not compile the
 # built-in PTY/parser producer.
-serve-api = ["presentation", "ssh-view", "dep:axum", "dep:tower-http"]
+serve-api = [
+    "presentation",
+    "ssh-view",
+    "dep:axum",
+    "dep:futures-util",
+    "dep:tower-http",
+]
 # `sessions` — the hub-control CLI (list/add/remove over the management API).
 # Only needs an HTTP client; independent of the mirror stack.
 sessions = ["dep:reqwest"]
@@ -42,6 +48,7 @@ hub = [
     "ssh-view",
     "dep:axum",
     "dep:axum-server",
+    "dep:futures-util",
     "dep:tower-http",
     "dep:rustls-acme",
     "dep:tungstenite",
