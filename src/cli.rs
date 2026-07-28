@@ -1452,3 +1452,21 @@ fn bind(addr: &str) -> Result<tokio::net::TcpListener> {
         .listen(1024)
         .with_context(|| format!("listening on {addr}"))
 }
+
+#[cfg(all(test, feature = "push", unix))]
+mod tests {
+    use super::parse_size;
+
+    #[test]
+    fn parse_size_accepts_wxh() {
+        assert_eq!(parse_size("160x50").unwrap(), (160, 50));
+        assert_eq!(parse_size(" 80X24 ").unwrap(), (80, 24));
+    }
+
+    #[test]
+    fn parse_size_rejects_bad_input() {
+        assert!(parse_size("160").is_err());
+        assert!(parse_size("axb").is_err());
+        assert!(parse_size("0x0").is_err());
+    }
+}

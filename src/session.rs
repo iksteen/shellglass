@@ -675,3 +675,80 @@ pub fn attach(socket: &Path, force: bool) -> Result<()> {
     println!("\r\n[shellglass: detached]\r");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_frame_round_trip() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, C_INPUT, b"hello").unwrap();
+        let (tag, payload) = read_frame(&mut std::io::Cursor::new(buf)).unwrap();
+        assert_eq!(tag, C_INPUT);
+        assert_eq!(payload, b"hello");
+    }
+
+    #[test]
+    fn wire_frame_rejects_oversized_length() {
+        let hdr = [S_DATA, 0xff, 0xff, 0xff, 0xff];
+        let err = read_frame(&mut std::io::Cursor::new(hdr.to_vec())).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// Send one AttachRequest to a running core, returning our end of the
+    /// client socket and the core's accept/reject verdict.
+    fn attach_request(core_tx: &mpsc::Sender<Core>, cid: u64, force: bool) -> (UnixStream, bool) {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        core_tx
+            .send(Core::AttachRequest {
+                cid,
+                force,
+                cols: 100,
+                rows: 30,
+                sink: ClientSink { stream: theirs },
+                reply: reply_tx,
+            })
+            .unwrap();
+        (ours, reply_rx.recv().unwrap())
+    }
+
+    #[test]
+    fn one_client_at_a_time_policy() {
+        let (core_tx, core_rx) = mpsc::channel();
+        let (pty_tx, pty_rx) = mpsc::channel();
+        let (frame_tx, _frame_rx) = watch::channel(HeadlessScreen::blank_frame(24, 80));
+        let sock = std::env::temp_dir().join(format!("shellglass-test-{}.sock", std::process::id()));
+        thread::spawn(move || {
+            core_thread(core_rx, pty_tx, frame_tx, HeadlessScreen::new(24, 80), sock);
+        });
+
+        // First client: accepted, and only now does the PTY track its terminal.
+        let (mut first, ok) = attach_request(&core_tx, 1, false);
+        assert!(ok);
+        assert!(matches!(pty_rx.recv().unwrap(), PtyCmd::Resize(30, 100)));
+        let (tag, _) = read_frame(&mut first).unwrap();
+        assert_eq!(tag, S_ACCEPTED);
+
+        // Second client without force: rejected with a reason, and the live
+        // session was NOT resized.
+        let (mut second, ok) = attach_request(&core_tx, 2, false);
+        assert!(!ok);
+        let (tag, reason) = read_frame(&mut second).unwrap();
+        assert_eq!(tag, S_REJECTED);
+        assert!(!reason.is_empty());
+        assert!(pty_rx.try_recv().is_err(), "rejected attach must not resize");
+
+        // Third client with force: the incumbent is kicked, the newcomer wins.
+        let (mut third, ok) = attach_request(&core_tx, 3, true);
+        assert!(ok);
+        assert!(matches!(pty_rx.recv().unwrap(), PtyCmd::Resize(30, 100)));
+        let (tag, _) = read_frame(&mut third).unwrap();
+        assert_eq!(tag, S_ACCEPTED);
+        let (tag, _) = read_frame(&mut first).unwrap(); // the accept-time repaint
+        assert_eq!(tag, S_DATA);
+        let (tag, _) = read_frame(&mut first).unwrap();
+        assert_eq!(tag, S_KICKED);
+    }
+}
