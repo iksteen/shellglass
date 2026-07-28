@@ -86,6 +86,11 @@ path = "src/bin/push.rs"
 required-features = ["push"]
 
 [[bin]]
+name = "shellglass-attach"
+path = "src/bin/attach.rs"
+required-features = ["push"]
+
+[[bin]]
 name = "shellglass-hub"
 path = "src/bin/hub.rs"
 required-features = ["hub"]

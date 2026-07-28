@@ -87,6 +87,37 @@ the session at `/s/demo` instead of `/s/<64-hex-id>` — the slug becomes the *o
 view route. Pushing is unchanged. Ids and slugs must be unique across `--allow`; a
 collision or a non-URL-safe slug is a startup error.
 
+## Detachable sessions
+
+`push --detachable` runs the mirrored command in a terminal-less PTY (the
+`dtach(1)` model): the stream to the hub stays live with **no** local terminal,
+and the session is exposed on a unix socket for `shellglass attach`, which
+connects a real terminal — driving input and size — until `` Ctrl-\ `` detaches
+it again. The session then holds the last attached dimensions (`--size` sets
+the initial/no-client size). One client at a time: a second `attach` is refused
+unless it takes over with `--force`, which kicks the incumbent. Unix only;
+inline images aren't mirrored in this mode (there is no local terminal to probe
+for image capabilities).
+
+```sh
+# start a persistent stream at 160x50 (the socket path is printed)
+shellglass push https://hub.example.com --key "$KEY" \
+    --detachable --size 160x50 -- tmux attach -t work
+
+# from any other terminal: hop in, work, Ctrl-\ to leave it running
+shellglass attach "$XDG_RUNTIME_DIR/shellglass-<id>.sock"
+```
+
+`--daemon` additionally forks the push into the background — detached from the
+terminal and the SSH session, stdio redirected to `--log-file` — so it survives
+logout: start it over SSH, disconnect, attach from anywhere later.
+
+> **systemd note:** the default socket/log paths live in `$XDG_RUNTIME_DIR`,
+> which systemd-logind **deletes when your last session ends** unless lingering
+> is enabled. For a `--daemon` that must outlive the logout, run
+> `loginctl enable-linger` once — or pass `--socket`/`--log-file` paths outside
+> the runtime dir.
+
 ## Commands
 
 `shellglass <command>` — run `shellglass <command> --help` for its full flags.
@@ -95,6 +126,7 @@ collision or a non-URL-safe slug is a startup error.
 |---------|--------------|
 | `serve` | self-contained: render locally and serve the viewer over HTTP |
 | `push <url>` | client: render locally, stream frames to the hub at `<url>` |
+| `attach <socket>` | attach this terminal to a `push --detachable` session; `` Ctrl-\ `` detaches (Unix only) |
 | `hub` | run as a hub: relay clients' pushes (no config needed) |
 | `sessions <url>` | manage a hub's sessions over its management API: list, add, remove — plus any session's recordings |
 | `recordings <url>` | manage **your own** session recordings on a hub: list, get, delete (authorized by the session key) |
@@ -119,6 +151,12 @@ Flags by command:
 | `--sessions-file <path>` | hub | persist the session registry across restarts (see [Managing hub sessions](#managing-hub-sessions-over-http)) |
 | `--record-dir <dir>` | serve, hub | record sessions as timestamped native streams (see [Session recording](#session-recording)) |
 | `--no-record` | push | decline recording on a hub that records (or `SHELLGLASS_NO_RECORD=true`) |
+| `--detachable` | push | run the command in a terminal-less PTY reachable via `attach` — see [Detachable sessions](#detachable-sessions) (Unix only) |
+| `--socket <path>` | push | the detachable session's unix socket (default `$XDG_RUNTIME_DIR/shellglass-<id>.sock`) |
+| `--size <WxH>` | push | initial / no-client PTY size in detachable mode (default `80x24`) |
+| `--daemon` | push | fork the detachable push into the background so it survives logout; stdio goes to `--log-file` |
+| `--log-file <path>` | push | where a `--daemon`'s stdout/stderr go (default `$XDG_RUNTIME_DIR/shellglass-<id>.log`) |
+| `--force` | attach | take over even if another client is attached (it is kicked with a notice) |
 | `--api` | gen-key, print-id | mint/print in the API salt domain (for `--api-allow`) instead of the session domain |
 | `--id-salt <ext>` | hub, gen-key, print-id | optional per-system salt extension (or `SHELLGLASS_ID_SALT`); one value per hub, used by every command deriving ids for it — see [security notes](#security-notes) |
 | `--tls-cert <path>` / `--tls-key <path>` | hub | serve HTTPS with your own PEM cert chain + key |

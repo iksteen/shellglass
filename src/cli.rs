@@ -10,7 +10,7 @@ use crate::proto;
 use crate::pty;
 #[cfg(feature = "hub")]
 use crate::ssh;
-#[cfg(feature = "hub")]
+#[cfg(any(feature = "hub", all(feature = "push", unix)))]
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
@@ -40,8 +40,8 @@ impl Cli {
     ///
     /// # Errors
     /// Propagates [`PushArgs::daemonize_if_requested`].
-    pub fn daemonize_if_requested(&self) -> Result<()> {
-        match &self.action {
+    pub fn daemonize_if_requested(&mut self) -> Result<()> {
+        match &mut self.action {
             #[cfg(feature = "push")]
             Action::Push(args) => args.daemonize_if_requested(),
             _ => Ok(()),
@@ -436,23 +436,28 @@ pub struct PushArgs {
 
     /// Unix socket for `attach` to connect to (detachable mode). Defaults to
     /// `$XDG_RUNTIME_DIR/shellglass-<id>.sock` (else `$TMPDIR`).
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", requires = "detachable")]
     socket: Option<PathBuf>,
 
     /// Initial / no-client PTY size for detachable mode, `WIDTHxHEIGHT`.
-    #[arg(long, value_name = "WxH", default_value = "80x24")]
+    #[arg(
+        long,
+        value_name = "WxH",
+        default_value = "80x24",
+        requires = "detachable"
+    )]
     size: String,
 
     /// Daemonize: fork into the background, fully detached from the terminal and
     /// the (SSH) session, so it survives logout. Requires --detachable; stdio is
     /// redirected to --log-file. The launching shell returns immediately. Unix
     /// only.
-    #[arg(long, short = 'd')]
+    #[arg(long, short = 'd', requires = "detachable")]
     daemon: bool,
 
     /// Where a --daemon's stdout/stderr go. Defaults to
     /// `$XDG_RUNTIME_DIR/shellglass-<id>.log` (else `$TMPDIR`).
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", requires = "daemon")]
     log_file: Option<PathBuf>,
 }
 
@@ -463,21 +468,23 @@ impl PushArgs {
     /// not daemonizing, and only in the detached daemon when it is.
     ///
     /// # Errors
-    /// `--daemon` without `--detachable`, on non-Unix, or if the fork/redirect fails.
-    pub fn daemonize_if_requested(&self) -> Result<()> {
+    /// A bad `--size`, on non-Unix, or if the fork/redirect fails.
+    pub fn daemonize_if_requested(&mut self) -> Result<()> {
         if !self.daemon {
             return Ok(());
         }
-        if !self.detachable {
-            anyhow::bail!("--daemon requires --detachable");
-        }
         #[cfg(unix)]
         {
+            // Validate what we can BEFORE forking: past this point an error
+            // lands in the log file after the launcher already reported success.
+            parse_size(&self.size)?;
+            // Materialize the socket path so the post-fork push never re-derives
+            // the id (session_id is deliberately memory-hard: derive it once).
             let id = proto::session_id(&self.key.key);
             let sock = self
                 .socket
-                .clone()
-                .unwrap_or_else(|| crate::session::default_socket_path(&id));
+                .get_or_insert_with(|| crate::session::default_socket_path(&id))
+                .clone();
             let log = self
                 .log_file
                 .clone()
@@ -797,11 +804,12 @@ impl PushArgs {
         // the key is still here — before the key moves into the options.
         #[cfg(unix)]
         let detached = if self.detachable {
-            let id = proto::session_id(&self.key.key);
-            let sock = self
-                .socket
-                .clone()
-                .unwrap_or_else(|| crate::session::default_socket_path(&id));
+            // `--daemon` already materialized this; deriving the id is
+            // deliberately memory-hard, so only do it when it's still unset.
+            let sock = match self.socket.clone() {
+                Some(sock) => sock,
+                None => crate::session::default_socket_path(&proto::session_id(&self.key.key)),
+            };
             println!("shellglass: detached session on {}", sock.display());
             println!(
                 "shellglass: attach with `shellglass attach {}`",
@@ -933,6 +941,9 @@ fn parse_size(s: &str) -> Result<(u16, u16)> {
         .trim()
         .parse()
         .with_context(|| format!("bad height in {s:?}"))?;
+    if cols == 0 || rows == 0 {
+        anyhow::bail!("size must be at least 1x1, got {s:?}");
+    }
     Ok((cols, rows))
 }
 
@@ -1152,4 +1163,22 @@ fn spawn_tls_shutdown(handle: axum_server::Handle<std::net::SocketAddr>, hub: hu
         hub.trigger_shutdown();
         handle.graceful_shutdown(Some(std::time::Duration::from_millis(500)));
     });
+}
+
+#[cfg(all(test, feature = "push", unix))]
+mod tests {
+    use super::parse_size;
+
+    #[test]
+    fn parse_size_accepts_wxh() {
+        assert_eq!(parse_size("160x50").unwrap(), (160, 50));
+        assert_eq!(parse_size(" 80X24 ").unwrap(), (80, 24));
+    }
+
+    #[test]
+    fn parse_size_rejects_bad_input() {
+        assert!(parse_size("160").is_err());
+        assert!(parse_size("axb").is_err());
+        assert!(parse_size("0x0").is_err());
+    }
 }
