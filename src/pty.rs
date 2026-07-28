@@ -326,10 +326,7 @@ pub fn start(command: &[String], sixel_compat: bool) -> Result<SourceSession> {
         });
     }
 
-    Ok(SourceSession {
-        frames: frame_rx,
-        sink_status: Arc::new(Notifier(msg_tx)),
-    })
+    Ok(SourceSession::new(frame_rx, Arc::new(Notifier(msg_tx))))
 }
 
 #[allow(clippy::too_many_arguments)] // ponytail: one call site, private

@@ -184,6 +184,13 @@ pub struct Grid {
     /// id → URI. Rides the wire as the optional `y` key: the whole table on
     /// full frames, new entries only on the Diff shape (a diff introducing a
     /// new id forces that shape).
+    ///
+    /// Because a diff carries only ids the viewer hasn't seen, an id is
+    /// **append-only within one `source_epoch`**: re-using an id for a
+    /// different URI would leave viewers resolving it to the old target. An
+    /// external producer that wants to reset the table bumps the epoch
+    /// ([`crate::source::FramePublisher::switch_source`]), which forces a full
+    /// frame; the PTY producer gets this for free from vt100's monotonic ids.
     pub links: std::collections::BTreeMap<u32, String>,
     /// Inline images currently placed on the screen (empty for the common case).
     pub images: Vec<ImagePlacement>,

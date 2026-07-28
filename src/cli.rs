@@ -436,6 +436,7 @@ struct SourceArgs {
 
 #[cfg(feature = "mirror")]
 impl SourceArgs {
+    /// The command to run, defaulting to the platform's user shell.
     fn command(&self) -> Vec<String> {
         if self.command.is_empty() {
             vec![default_shell()]
@@ -978,4 +979,3 @@ fn spawn_tls_shutdown(handle: axum_server::Handle<std::net::SocketAddr>, hub: hu
         handle.graceful_shutdown(Some(std::time::Duration::from_millis(500)));
     });
 }
-

@@ -23,6 +23,18 @@ publisher.switch_source(first_frame); // increments source_epoch; forces full
 same-sized source transitions with a full frame, including links, cursor, images,
 and defaults.
 
+Publish from one task at a time — clones share the channel so the handle can be
+passed around, not so several tasks can race a `publish` against a
+`switch_source`.
+
+### The link table is append-only within an epoch
+
+Deltas carry only OSC 8 link ids the viewer hasn't seen yet, so re-using an id
+for a different URI inside one epoch leaves viewers resolving it to the old
+target. Either keep ids unique for the life of the epoch, or call
+`switch_source` — the resulting full frame republishes the whole table. (The
+built-in PTY producer gets this free from vt100's monotonic ids.)
+
 ## Presentation and transport
 
 ```rust
@@ -30,6 +42,11 @@ let presentation = shellglass::api::Presentation::load(config_path)?;
 let options = shellglass::api::ServeOptions::new("127.0.0.1:8080");
 shellglass::api::serve(|| Ok(source), presentation, options).await?;
 ```
+
+`ServeOptions` and `PushOptions` are `#[non_exhaustive]` — build them with
+`::new()` and assign the fields you need, so a new option is not a breaking
+change. To stop the server on your own signal, use `serve_with_shutdown`, which
+takes a future and shuts down gracefully when it resolves.
 
 For a hub, `api::push` takes the same source factory and a `PushOptions`. The
 factory is invoked only after the authenticated WebSocket upgrade succeeds.
