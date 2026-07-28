@@ -34,6 +34,20 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// If the chosen mode is `push --daemon`, fork into the background before the
+    /// caller builds the tokio runtime. A no-op for every other mode. Must be
+    /// called while still single-threaded.
+    ///
+    /// # Errors
+    /// Propagates [`PushArgs::daemonize_if_requested`].
+    pub fn daemonize_if_requested(&self) -> Result<()> {
+        match &self.action {
+            #[cfg(feature = "push")]
+            Action::Push(args) => args.daemonize_if_requested(),
+            _ => Ok(()),
+        }
+    }
+
     /// Dispatch the chosen mode — the single entry point every binary uses.
     ///
     /// # Errors
@@ -46,6 +60,8 @@ impl Cli {
             Action::Serve(args) => args.run().await,
             #[cfg(feature = "push")]
             Action::Push(args) => args.run().await,
+            #[cfg(all(feature = "push", unix))]
+            Action::Attach(args) => args.run(),
             #[cfg(feature = "hub")]
             Action::Hub(args) => args.run().await,
             #[cfg(feature = "sessions")]
@@ -322,6 +338,11 @@ enum Action {
     #[cfg(feature = "push")]
     Push(PushArgs),
 
+    /// Attach a terminal to a detached `push --detachable` session. Detach with
+    /// `Ctrl-\`; the session keeps running at the last attached size.
+    #[cfg(all(feature = "push", unix))]
+    Attach(AttachArgs),
+
     /// Run as a hub: receive pushes from clients and re-serve their sessions.
     #[cfg(feature = "hub")]
     Hub(HubArgs),
@@ -405,6 +426,103 @@ pub struct PushArgs {
         value_parser = clap::builder::FalseyValueParser::new()
     )]
     no_record: bool,
+
+    /// Run detached (dtach-style): the command runs in a terminal-less PTY, keeps
+    /// streaming to the hub with no local terminal, and is reachable via
+    /// `shellglass attach`. Detach a client with `Ctrl-\`; the session then holds
+    /// the last attached size. Unix only.
+    #[arg(long)]
+    detachable: bool,
+
+    /// Unix socket for `attach` to connect to (detachable mode). Defaults to
+    /// `$XDG_RUNTIME_DIR/shellglass-<id>.sock` (else `$TMPDIR`).
+    #[arg(long, value_name = "PATH")]
+    socket: Option<PathBuf>,
+
+    /// Initial / no-client PTY size for detachable mode, `WIDTHxHEIGHT`.
+    #[arg(long, value_name = "WxH", default_value = "80x24")]
+    size: String,
+
+    /// Daemonize: fork into the background, fully detached from the terminal and
+    /// the (SSH) session, so it survives logout. Requires --detachable; stdio is
+    /// redirected to --log-file. The launching shell returns immediately. Unix
+    /// only.
+    #[arg(long, short = 'd')]
+    daemon: bool,
+
+    /// Where a --daemon's stdout/stderr go. Defaults to
+    /// `$XDG_RUNTIME_DIR/shellglass-<id>.log` (else `$TMPDIR`).
+    #[arg(long, value_name = "PATH")]
+    log_file: Option<PathBuf>,
+}
+
+#[cfg(feature = "push")]
+impl PushArgs {
+    /// If `--daemon` was given, fork into the background BEFORE the tokio runtime
+    /// starts (fork is only safe while single-threaded). Returns immediately when
+    /// not daemonizing, and only in the detached daemon when it is.
+    ///
+    /// # Errors
+    /// `--daemon` without `--detachable`, on non-Unix, or if the fork/redirect fails.
+    pub fn daemonize_if_requested(&self) -> Result<()> {
+        if !self.daemon {
+            return Ok(());
+        }
+        if !self.detachable {
+            anyhow::bail!("--daemon requires --detachable");
+        }
+        #[cfg(unix)]
+        {
+            let id = proto::session_id(&self.key.key);
+            let sock = self
+                .socket
+                .clone()
+                .unwrap_or_else(|| crate::session::default_socket_path(&id));
+            let log = self
+                .log_file
+                .clone()
+                .unwrap_or_else(|| crate::session::default_log_path(&id));
+            let info = format!(
+                "shellglass: daemonized detached session on {}\n\
+                 shellglass: attach with `shellglass attach {}`\n\
+                 shellglass: logging to {}\n",
+                sock.display(),
+                sock.display(),
+                log.display(),
+            );
+            crate::session::daemonize(&info, &log)
+        }
+        #[cfg(not(unix))]
+        {
+            anyhow::bail!("--daemon is only supported on Unix");
+        }
+    }
+}
+
+/// Args for `attach` (detachable sessions; Unix only).
+#[cfg(all(feature = "push", unix))]
+#[derive(clap::Args, Debug)]
+pub struct AttachArgs {
+    /// Path to the session's unix socket (the `push --socket` value).
+    #[arg(value_name = "SOCKET")]
+    socket: PathBuf,
+
+    /// Take over even if a client is already attached: force the incumbent to
+    /// detach, then attach. Without this, attaching to a session that already
+    /// has a client is refused.
+    #[arg(long, short = 'f')]
+    force: bool,
+}
+
+#[cfg(all(feature = "push", unix))]
+impl AttachArgs {
+    /// Attach the current terminal to a detached session.
+    ///
+    /// # Errors
+    /// If the socket can't be reached or the tty can't be set up.
+    pub fn run(self) -> Result<()> {
+        crate::session::attach(&self.socket, self.force)
+    }
 }
 
 /// The terminal source, shared by `serve` and `push` (both render locally).
@@ -674,9 +792,42 @@ impl PushArgs {
         let base = self.url.trim_end_matches('/');
         println!("shellglass: pushing live to {base}");
         let presentation = crate::api::Presentation::load(self.source.config.as_deref())?;
+        // Detachable mode differs from an ordinary push in exactly one way: which
+        // source the pipeline pulls frames from. Resolve it — and its socket, while
+        // the key is still here — before the key moves into the options.
+        #[cfg(unix)]
+        let detached = if self.detachable {
+            let id = proto::session_id(&self.key.key);
+            let sock = self
+                .socket
+                .clone()
+                .unwrap_or_else(|| crate::session::default_socket_path(&id));
+            println!("shellglass: detached session on {}", sock.display());
+            println!(
+                "shellglass: attach with `shellglass attach {}`",
+                sock.display()
+            );
+            Some((self.source.command(), sock, parse_size(&self.size)?))
+        } else {
+            None
+        };
+        #[cfg(not(unix))]
+        if self.detachable {
+            anyhow::bail!("--detachable is only supported on Unix");
+        }
         let mut options = crate::api::PushOptions::new(self.url, self.key.key);
         options.no_record = self.no_record;
-        crate::api::push(move || self.source.start(), presentation, options).await
+        let source: SourceFactory = {
+            #[cfg(unix)]
+            if let Some((cmd, sock, size)) = detached {
+                Box::new(move || crate::session::start_detached(&cmd, &sock, size))
+            } else {
+                Box::new(move || self.source.start())
+            }
+            #[cfg(not(unix))]
+            Box::new(move || self.source.start())
+        };
+        crate::api::push(source, presentation, options).await
     }
 }
 
@@ -760,6 +911,29 @@ pub fn gen_key(api: bool, id_salt: &IdSaltArg) -> Result<()> {
         println!("id:  {}", proto::session_id_ext(&key, &id_salt.id_salt));
     }
     Ok(())
+}
+
+/// The boxed frame-source starter handed to [`crate::api::push`]. Boxed because
+/// `push` picks between two different producers (PTY-with-terminal, or the
+/// detachable owner) that share only this signature.
+#[cfg(feature = "push")]
+type SourceFactory = Box<dyn FnOnce() -> Result<crate::source::SourceSession> + Send>;
+
+/// Parse a `WIDTHxHEIGHT` size string into (cols, rows).
+#[cfg(all(feature = "push", unix))]
+fn parse_size(s: &str) -> Result<(u16, u16)> {
+    let (w, h) = s
+        .split_once(['x', 'X'])
+        .with_context(|| format!("size must look like 160x50, got {s:?}"))?;
+    let cols = w
+        .trim()
+        .parse()
+        .with_context(|| format!("bad width in {s:?}"))?;
+    let rows = h
+        .trim()
+        .parse()
+        .with_context(|| format!("bad height in {s:?}"))?;
+    Ok((cols, rows))
 }
 
 /// One-line description of what a source mirrors, for the startup log.

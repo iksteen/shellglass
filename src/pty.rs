@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 /// Frame cap: coalesce bursts of PTY output into at most ~30 renders per second.
-const MIN_FRAME: Duration = Duration::from_millis(33);
+pub(crate) const MIN_FRAME: Duration = Duration::from_millis(33);
 
 /// Debounce a cursor-hidden transient for this long. Apps bracket each redraw in
 /// `?25l … ?25h` (hide, repaint, show); the local terminal applies the burst as
@@ -79,6 +79,8 @@ enum Msg {
 
 /// Lets the push client report hub connection changes to the terminal owner so it
 /// can pause/announce/restore cleanly instead of printing into the raw session.
+/// The detachable owner ([`crate::session`]) has no local terminal and supplies
+/// its own [`SinkStatus`] instead.
 #[derive(Clone)]
 struct Notifier(mpsc::Sender<Msg>);
 
@@ -931,6 +933,71 @@ fn frame_from_with_defaults(
     Arc::new(Frame::Screen(grid))
 }
 
+/// A headless screen for the detachable session owner ([`crate::session`]): it
+/// drives PTY output through the session parser and produces [`Frame`]s for the
+/// stream pipeline WITHOUT owning any local terminal. Inline-image decoding is
+/// deliberately absent — a detached owner has no local terminal to probe for
+/// image capabilities — so images mirror as their covered cells; everything else
+/// (text, colors, cursor bridging) is full fidelity via the same frame builder.
+#[cfg(feature = "push")]
+pub(crate) struct HeadlessScreen {
+    parser: SgParser,
+    images: Vec<Placed>,
+    zombies: Vec<Placed>,
+    bridge: CursorBridge,
+}
+
+#[cfg(feature = "push")]
+impl HeadlessScreen {
+    pub(crate) fn new(rows: u16, cols: u16) -> HeadlessScreen {
+        HeadlessScreen {
+            parser: new_parser(rows, cols),
+            images: Vec::new(),
+            zombies: Vec::new(),
+            bridge: CursorBridge::default(),
+        }
+    }
+
+    /// The blank starting frame, to seed the watch channel before any output.
+    pub(crate) fn blank_frame(rows: u16, cols: u16) -> Arc<Frame> {
+        frame_from_with_defaults(
+            &new_parser(rows, cols),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut CursorBridge::default(),
+            Caps::default(),
+        )
+    }
+
+    pub(crate) fn process(&mut self, bytes: &[u8]) {
+        self.parser.process(bytes);
+    }
+
+    pub(crate) fn set_size(&mut self, rows: u16, cols: u16) {
+        self.parser.screen_mut().set_size(rows, cols);
+    }
+
+    /// Snapshot the current screen as a [`Frame`] for the hub pipeline.
+    pub(crate) fn frame(&mut self) -> Arc<Frame> {
+        frame_from_with_defaults(
+            &self.parser,
+            &mut self.images,
+            &mut self.zombies,
+            &mut self.bridge,
+            Caps::default(),
+        )
+    }
+
+    /// Bytes that repaint the current screen onto a freshly-attached terminal.
+    pub(crate) fn repaint(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"\x1b[2J\x1b[H");
+        buf.extend_from_slice(&self.parser.screen().contents_formatted());
+        buf.extend_from_slice(&self.parser.screen().input_mode_formatted());
+        buf
+    }
+}
+
 /// The stamped cell rectangles of two placements overlap.
 fn rects_overlap(a: &Placed, b: &Placed) -> bool {
     let (ar, ac) = (i32::from(a.row), i32::from(a.col));
@@ -1406,13 +1473,13 @@ impl DaRewriter {
 /// original settings; `leave`/`enter` toggle between them for the hub-outage pause,
 /// and `restore` puts every changed setting back before process exit.
 #[cfg(unix)]
-struct RawMode {
+pub(crate) struct RawMode {
     orig: Option<rustix::termios::Termios>,
 }
 
 #[cfg(unix)]
 impl RawMode {
-    fn acquire() -> RawMode {
+    pub(crate) fn acquire() -> RawMode {
         // tcgetattr fails on a non-tty (e.g. piped) — leave the fd as-is.
         let Ok(orig) = rustix::termios::tcgetattr(std::io::stdin()) else {
             return RawMode { orig: None };
@@ -1428,7 +1495,7 @@ impl RawMode {
     }
 
     /// Restore the terminal's original (cooked) settings.
-    fn leave(&self) {
+    pub(crate) fn leave(&self) {
         if let Some(orig) = &self.orig {
             let _ = rustix::termios::tcsetattr(
                 std::io::stdin(),
