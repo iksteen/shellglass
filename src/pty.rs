@@ -964,7 +964,7 @@ fn frame_from_with_defaults(
 /// deliberately absent — a detached owner has no local terminal to probe for
 /// image capabilities — so images mirror as their covered cells; everything else
 /// (text, colors, cursor bridging) is full fidelity via the same frame builder.
-#[cfg(feature = "push")]
+#[cfg(all(feature = "push", unix))]
 pub(crate) struct HeadlessScreen {
     parser: SgParser,
     images: Vec<Placed>,
@@ -972,7 +972,7 @@ pub(crate) struct HeadlessScreen {
     bridge: CursorBridge,
 }
 
-#[cfg(feature = "push")]
+#[cfg(all(feature = "push", unix))]
 impl HeadlessScreen {
     pub(crate) fn new(rows: u16, cols: u16) -> HeadlessScreen {
         HeadlessScreen {
