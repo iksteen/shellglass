@@ -450,7 +450,12 @@ pub struct PushArgs {
     socket: Option<PathBuf>,
 
     /// Initial / no-client PTY size for detachable mode, `WIDTHxHEIGHT`.
-    #[arg(long, value_name = "WxH", default_value = "80x24", requires = "detachable")]
+    #[arg(
+        long,
+        value_name = "WxH",
+        default_value = "80x24",
+        requires = "detachable"
+    )]
     size: String,
 
     /// Daemonize: fork into the background, fully detached from the terminal and
@@ -1174,8 +1179,14 @@ fn parse_size(s: &str) -> Result<(u16, u16)> {
     let (w, h) = s
         .split_once(['x', 'X'])
         .with_context(|| format!("size must look like 160x50, got {s:?}"))?;
-    let cols = w.trim().parse().with_context(|| format!("bad width in {s:?}"))?;
-    let rows = h.trim().parse().with_context(|| format!("bad height in {s:?}"))?;
+    let cols = w
+        .trim()
+        .parse()
+        .with_context(|| format!("bad width in {s:?}"))?;
+    let rows = h
+        .trim()
+        .parse()
+        .with_context(|| format!("bad height in {s:?}"))?;
     if cols == 0 || rows == 0 {
         anyhow::bail!("size must be at least 1x1, got {s:?}");
     }

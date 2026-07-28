@@ -1016,7 +1016,10 @@ impl HeadlessScreen {
     /// loop must wake when it expires so the genuine hide still publishes even
     /// if the app then goes quiet.
     pub(crate) fn hide_grace_remaining(&self) -> Option<Duration> {
-        let since = self.bridge.hidden_since.filter(|_| self.bridge.shown.is_some())?;
+        let since = self
+            .bridge
+            .hidden_since
+            .filter(|_| self.bridge.shown.is_some())?;
         Some(CURSOR_HIDE_GRACE.saturating_sub(since.elapsed()))
     }
 

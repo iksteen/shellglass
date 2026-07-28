@@ -233,7 +233,10 @@ pub fn start_detached(
     if std::env::var_os("TERM").is_none() {
         builder.env("TERM", "xterm-256color");
     }
-    let mut child = pair.slave.spawn_command(builder).context("spawning command")?;
+    let mut child = pair
+        .slave
+        .spawn_command(builder)
+        .context("spawning command")?;
     drop(pair.slave);
 
     let master = pair.master;
@@ -341,7 +344,13 @@ pub fn start_detached(
         let socket = socket.to_path_buf();
         let pty_tx = pty_tx.clone();
         thread::spawn(move || {
-            core_thread(core_rx, pty_tx, frame_tx, HeadlessScreen::new(rows, cols), socket);
+            core_thread(
+                core_rx,
+                pty_tx,
+                frame_tx,
+                HeadlessScreen::new(rows, cols),
+                socket,
+            );
         });
     }
 
@@ -364,7 +373,12 @@ pub fn start_detached(
 /// Owner-side per-connection handler: read the client's hello + initial size, ask
 /// the core to attach it, and (if accepted) pump its input/resize/detach frames
 /// until it disconnects.
-fn handle_client(stream: UnixStream, cid: u64, core_tx: mpsc::Sender<Core>, pty_tx: mpsc::Sender<PtyCmd>) {
+fn handle_client(
+    stream: UnixStream,
+    cid: u64,
+    core_tx: mpsc::Sender<Core>,
+    pty_tx: mpsc::Sender<PtyCmd>,
+) {
     let sink_stream = match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
@@ -399,7 +413,9 @@ fn handle_client(stream: UnixStream, cid: u64, core_tx: mpsc::Sender<Core>, pty_
             force,
             cols,
             rows,
-            sink: ClientSink { stream: sink_stream },
+            sink: ClientSink {
+                stream: sink_stream,
+            },
             reply: reply_tx,
         })
         .is_err()
@@ -719,7 +735,8 @@ mod tests {
         let (core_tx, core_rx) = mpsc::channel();
         let (pty_tx, pty_rx) = mpsc::channel();
         let (frame_tx, _frame_rx) = watch::channel(HeadlessScreen::blank_frame(24, 80));
-        let sock = std::env::temp_dir().join(format!("shellglass-test-{}.sock", std::process::id()));
+        let sock =
+            std::env::temp_dir().join(format!("shellglass-test-{}.sock", std::process::id()));
         thread::spawn(move || {
             core_thread(core_rx, pty_tx, frame_tx, HeadlessScreen::new(24, 80), sock);
         });
@@ -738,7 +755,10 @@ mod tests {
         let (tag, reason) = read_frame(&mut second).unwrap();
         assert_eq!(tag, S_REJECTED);
         assert!(!reason.is_empty());
-        assert!(pty_rx.try_recv().is_err(), "rejected attach must not resize");
+        assert!(
+            pty_rx.try_recv().is_err(),
+            "rejected attach must not resize"
+        );
 
         // Third client with force: the incumbent is kicked, the newcomer wins.
         let (mut third, ok) = attach_request(&core_tx, 3, true);
