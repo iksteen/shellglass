@@ -39,6 +39,32 @@ pub(crate) fn server_cors(origins: &[String]) -> Option<tower_http::cors::CorsLa
     )
 }
 
+/// Bind with `SO_REUSEADDR` so a restart can rebind immediately — otherwise the
+/// previous run's client/browser connections linger in `TIME_WAIT` and the fresh
+/// bind fails with "address in use" for up to a minute. Shared by every listener
+/// the crate opens: the standalone/library server, the hub, and the SSH view.
+#[cfg(any(feature = "serve-api", feature = "hub", feature = "ssh-view"))]
+pub(crate) fn bind(addr: &str) -> anyhow::Result<tokio::net::TcpListener> {
+    use anyhow::Context as _;
+    use tokio::net::TcpSocket;
+    let sockaddr: std::net::SocketAddr = addr
+        .parse()
+        .with_context(|| format!("bind address must be IP:port, got {addr:?}"))?;
+    let socket = if sockaddr.is_ipv6() {
+        TcpSocket::new_v6()
+    } else {
+        TcpSocket::new_v4()
+    }
+    .context("creating socket")?;
+    socket.set_reuseaddr(true)?;
+    socket
+        .bind(sockaddr)
+        .with_context(|| format!("binding {addr}"))?;
+    socket
+        .listen(1024)
+        .with_context(|| format!("listening on {addr}"))
+}
+
 #[cfg(feature = "ssh-view")]
 pub mod ansi;
 #[cfg(feature = "presentation")]

@@ -793,7 +793,7 @@ async fn serve_hub(
     ssh_motd_file: Option<PathBuf>,
     ssh_motd_delay: u64,
 ) -> Result<()> {
-    let listener = bind(addr)?;
+    let listener = crate::bind(addr)?;
     let local = listener.local_addr()?;
     // Public base for the view URLs the hub logs. For ACME the cert is for the
     // domain, so use that; otherwise the bound address (as in the startup line).
@@ -826,10 +826,10 @@ async fn serve_hub(
     // un-aliased) is the SSH username. A setup failure must not abort the hub's
     // HTTP service — log and continue without the SSH view.
     if let Some(ssh_addr) = &ssh_bind {
-        match prepare_ssh(ssh_addr, ssh_host_key.as_deref(), "<slug>") {
+        match ssh::prepare(ssh_addr, ssh_host_key.as_deref(), "<slug>") {
             Ok((l, key)) => {
                 let target = ssh::Target::Hub(hub_state.clone());
-                let motd = load_ssh_motd(ssh_motd_file.as_deref(), ssh_motd_delay);
+                let motd = ssh::load_motd(ssh_motd_file.as_deref(), ssh_motd_delay);
                 // ponytail: unsupervised — an SSH runtime failure logs and dies; HTTP
                 // is unaffected.
                 tokio::spawn(async move {
@@ -979,55 +979,3 @@ fn spawn_tls_shutdown(handle: axum_server::Handle<std::net::SocketAddr>, hub: hu
     });
 }
 
-/// Bind the SSH listener and resolve its host key (printing the connection hint +
-/// fingerprint). Returned as a pair the caller spawns `ssh::serve` on. Fallible so a
-/// privileged/in-use port or an unwritable host key disables only the SSH view, never
-/// the HTTP service.
-#[cfg(feature = "hub")]
-fn prepare_ssh(
-    addr: &str,
-    key_path: Option<&std::path::Path>,
-    hint_user: &str,
-) -> Result<(tokio::net::TcpListener, russh::keys::PrivateKey)> {
-    let l = bind(addr)?;
-    let key = ssh::setup(l.local_addr()?, key_path, hint_user)?;
-    Ok((l, key))
-}
-
-/// Build the SSH MOTD from `--ssh-motd-file`, or `None` if unset. A read failure
-/// logs and disables only the banner — the SSH view still runs — consistent with how
-/// a bad host key disables just the SSH view, not the whole mirror.
-#[cfg(feature = "hub")]
-fn load_ssh_motd(path: Option<&std::path::Path>, delay_secs: u64) -> Option<ssh::Motd> {
-    match ssh::Motd::load(path?, delay_secs) {
-        Ok(m) => Some(m),
-        Err(e) => {
-            eprintln!("shellglass: SSH MOTD disabled — {e:#}");
-            None
-        }
-    }
-}
-
-/// Bind with `SO_REUSEADDR` so a hub restart can rebind immediately — otherwise the
-/// previous run's client/browser connections linger in `TIME_WAIT` and the fresh
-/// bind fails with "address in use" for up to a minute.
-#[cfg(feature = "hub")]
-fn bind(addr: &str) -> Result<tokio::net::TcpListener> {
-    use tokio::net::TcpSocket;
-    let sockaddr: std::net::SocketAddr = addr
-        .parse()
-        .with_context(|| format!("bind address must be IP:port, got {addr:?}"))?;
-    let socket = if sockaddr.is_ipv6() {
-        TcpSocket::new_v6()
-    } else {
-        TcpSocket::new_v4()
-    }
-    .context("creating socket")?;
-    socket.set_reuseaddr(true)?;
-    socket
-        .bind(sockaddr)
-        .with_context(|| format!("binding {addr}"))?;
-    socket
-        .listen(1024)
-        .with_context(|| format!("listening on {addr}"))
-}

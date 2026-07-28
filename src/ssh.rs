@@ -113,6 +113,33 @@ pub fn setup(addr: SocketAddr, key_path: Option<&Path>, hint_user: &str) -> Resu
     Ok(key)
 }
 
+/// Bind the SSH listener and resolve its host key (printing the connection hint +
+/// fingerprint). Returned as a pair the caller spawns [`serve`] on. Fallible so a
+/// privileged/in-use port or an unwritable host key disables only the SSH view, never
+/// the HTTP service.
+pub(crate) fn prepare(
+    addr: &str,
+    key_path: Option<&Path>,
+    hint_user: &str,
+) -> Result<(tokio::net::TcpListener, PrivateKey)> {
+    let listener = crate::bind(addr)?;
+    let key = setup(listener.local_addr()?, key_path, hint_user)?;
+    Ok((listener, key))
+}
+
+/// Build the SSH MOTD from `--ssh-motd-file`, or `None` if unset. A read failure
+/// logs and disables only the banner — the SSH view still runs — consistent with how
+/// a bad host key disables just the SSH view, not the whole mirror.
+pub(crate) fn load_motd(path: Option<&Path>, delay_secs: u64) -> Option<Motd> {
+    match Motd::load(path?, delay_secs) {
+        Ok(motd) => Some(motd),
+        Err(e) => {
+            eprintln!("shellglass: SSH MOTD disabled — {e:#}");
+            None
+        }
+    }
+}
+
 /// Cap on concurrent *pre-auth* SSH connections — the SSH analogue of sshd's
 /// `MaxStartups`. Auth accepts everyone, so the cheap flood is opening sockets and
 /// stalling in the handshake: each holds a socket + task at no cost to the attacker.
