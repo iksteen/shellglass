@@ -147,6 +147,11 @@ pub struct Live {
     /// is: a viewer connecting mid-stream reads the current tag as its baseline.
     /// Empty and never bumped on standalone (config is fixed at startup).
     reload: watch::Sender<String>,
+    /// Standalone library shutdown signal. Ending the SSE streams is required
+    /// before axum can finish graceful shutdown: each stream is otherwise an
+    /// intentionally infinite in-flight response.
+    #[cfg(any(feature = "serve-api", feature = "hub"))]
+    closed: watch::Sender<bool>,
     /// Live viewer count per [`Transport`] (index = `transport as usize`). Every
     /// transport subscribes to the same `diffs` channel, so its `receiver_count`
     /// can't tell them apart — this tracks each explicitly, bumped on connect and
@@ -205,6 +210,8 @@ impl Live {
         let (diffs, _) = broadcast::channel(BACKLOG);
         let (online, _) = watch::channel(true);
         let (reload, _) = watch::channel(String::new());
+        #[cfg(any(feature = "serve-api", feature = "hub"))]
+        let (closed, _) = watch::channel(false);
         Arc::new(Live {
             state: ArcSwap::from_pointee(State {
                 seq: 0,
@@ -216,6 +223,8 @@ impl Live {
             online,
             reload,
             #[cfg(any(feature = "serve-api", feature = "hub"))]
+            closed,
+            #[cfg(any(feature = "serve-api", feature = "hub"))]
             viewers: std::array::from_fn(|_| AtomicUsize::new(0)),
         })
     }
@@ -223,15 +232,23 @@ impl Live {
     /// Seed a publisher from a backend's frame channel and spawn a task forwarding
     /// every frame into it. Used by the standalone server (the hub feeds its `Live`
     /// from the push stream instead).
-    pub fn spawn(mut rx: watch::Receiver<Arc<Frame>>) -> Arc<Live> {
+    pub fn spawn(rx: watch::Receiver<Arc<Frame>>) -> Arc<Live> {
+        Self::spawn_managed(rx).0
+    }
+
+    /// [`spawn`](Self::spawn), retaining the forwarding task so a bounded
+    /// library server can stop it when its listener shuts down.
+    pub(crate) fn spawn_managed(
+        mut rx: watch::Receiver<Arc<Frame>>,
+    ) -> (Arc<Live>, tokio::task::JoinHandle<()>) {
         let live = Live::new(rx.borrow_and_update().clone());
         let fwd = Arc::clone(&live);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             while rx.changed().await.is_ok() {
                 fwd.publish(rx.borrow_and_update().clone());
             }
         });
-        live
+        (live, task)
     }
 
     /// Publish the next frame (standalone path): encode its delta from the current
@@ -322,6 +339,13 @@ impl Live {
         }
     }
 
+    /// End every SSE stream so a standalone server's graceful shutdown can
+    /// complete even while viewers are connected.
+    #[cfg(feature = "serve-api")]
+    pub(crate) fn close_viewers(&self) {
+        self.closed.send_replace(true);
+    }
+
     /// Count a viewer on `transport` for as long as the returned guard lives. Held by
     /// the SSE stream ([`Live::connect`]) / the SSH view loop ([`crate::ssh`]).
     #[cfg(any(feature = "serve-api", feature = "hub"))]
@@ -407,7 +431,22 @@ impl Live {
         // ignores the unknown event.
         let reload = WatchStream::new(self.reload.subscribe())
             .map(|tag| Ok::<_, Infallible>(Event::default().event("reload").data(tag)));
-        let mut resp = Sse::new(hello.chain(head).chain(tail).merge(status).merge(reload))
+        let mut closed = self.closed.subscribe();
+        let until_closed = async move {
+            if *closed.borrow_and_update() {
+                return;
+            }
+            while closed.changed().await.is_ok() {
+                if *closed.borrow_and_update() {
+                    return;
+                }
+            }
+        };
+        let events = futures_util::StreamExt::take_until(
+            hello.chain(head).chain(tail).merge(status).merge(reload),
+            until_closed,
+        );
+        let mut resp = Sse::new(events)
             .keep_alive(KeepAlive::default())
             .into_response();
         // Tell nginx (and other proxies that honor it) not to buffer this response:

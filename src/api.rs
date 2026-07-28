@@ -98,10 +98,10 @@ where
     serve_with_shutdown(start, presentation, options, std::future::pending()).await
 }
 
-/// [`serve`], stopping gracefully when `shutdown` resolves: in-flight responses
-/// finish, then the listener closes and this returns. An embedder that owns the
-/// process lifetime (a GUI, a test, a supervisor) needs this rather than the
-/// run-forever default.
+/// [`serve`], stopping gracefully when `shutdown` resolves. Long-lived SSE and
+/// SSH viewers are closed, source-forwarding tasks stop, and an active recording
+/// is flushed before this returns. An embedder that owns the process lifetime (a
+/// GUI, a test, a supervisor) needs this rather than the run-forever default.
 #[cfg(feature = "serve-api")]
 pub async fn serve_with_shutdown<F, S>(
     start: F,
@@ -142,7 +142,7 @@ where
     let images = Arc::new(std::sync::Mutex::new(diff::ImageStore::new(
         64 * 1024 * 1024,
     )));
-    {
+    let image_task = {
         let images = Arc::clone(&images);
         let mut rx = rx.clone();
         tokio::spawn(async move {
@@ -169,18 +169,18 @@ where
                     return;
                 }
             }
-        });
-    }
-    let live = diff::Live::spawn(rx);
-    if let Some((listener, key)) = ssh_ready {
+        })
+    };
+    let (live, frame_task) = diff::Live::spawn_managed(rx);
+    let ssh_task = ssh_ready.map(|(listener, key)| {
         let target = crate::ssh::Target::Single(Arc::clone(&live));
         let motd = crate::ssh::load_motd(options.ssh_motd_file.as_deref(), options.ssh_motd_delay);
         tokio::spawn(async move {
             if let Err(error) = crate::ssh::serve(listener, key, target, motd).await {
                 eprintln!("shellglass: ssh server error: {error}");
             }
-        });
-    }
+        })
+    });
     let font_css = render::font_face_css(&presentation.fonts, "fonts/");
     let cfg_json = render::render_config_json(&presentation.config, &presentation.resolver);
     live.set_reload_tag(&crate::proto::config_tag(&[
@@ -188,8 +188,8 @@ where
         &cfg_json,
         &presentation.template,
     ]));
-    let _record_stop = options.record_dir.map(|dir| {
-        let (recorder, _done) = crate::record::start(dir);
+    let recording = options.record_dir.map(|dir| {
+        let (recorder, writer_task) = crate::record::start(dir);
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let live = Arc::clone(&live);
         let config = Arc::clone(&presentation.config);
@@ -197,7 +197,7 @@ where
         let fonts = Arc::clone(&presentation.fonts);
         let record_font_css = font_css.clone();
         let record_cfg_json = cfg_json.clone();
-        tokio::spawn(async move {
+        let record_task = tokio::spawn(async move {
             let register = tokio::task::spawn_blocking(move || {
                 let css = render::head_css(&record_font_css, &config);
                 serde_json::to_string(&crate::proto::RegisterBody {
@@ -214,7 +214,7 @@ where
             .expect("register build task");
             crate::record::record_live(live, register, recorder, stopped).await;
         });
-        stop
+        (stop, record_task, writer_task)
     });
     let state = AppState {
         font_css: Arc::new(font_css),
@@ -222,15 +222,38 @@ where
         resolver: presentation.resolver,
         fonts: presentation.fonts,
         template: presentation.template,
-        live,
+        live: Arc::clone(&live),
         images,
     };
-    axum::serve(
+    let shutdown = async move {
+        shutdown.await;
+        live.close_viewers();
+    };
+    let result = axum::serve(
         listener,
         server::app_with_cors(state, &options.cors_origins),
     )
     .with_graceful_shutdown(shutdown)
-    .await?;
+    .await;
+
+    // Unlike the stock CLI (whose PTY exits the process), an embedder may keep
+    // this runtime alive and start another server. Do not leave source or SSH
+    // tasks — or an unflushed recording — behind after graceful shutdown.
+    image_task.abort();
+    frame_task.abort();
+    let _ = image_task.await;
+    let _ = frame_task.await;
+    if let Some(task) = ssh_task {
+        task.abort();
+        let _ = task.await;
+    }
+    if let Some((stop, record_task, writer_task)) = recording {
+        let _ = stop.send(());
+        let _ = record_task.await;
+        let _ = writer_task.await;
+    }
+
+    result?;
     Ok(())
 }
 
@@ -308,13 +331,26 @@ mod tests {
         let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = reservation.local_addr().unwrap();
         drop(reservation);
+        let ssh_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ssh_addr = ssh_reservation.local_addr().unwrap();
+        drop(ssh_reservation);
+        let key_path = std::env::temp_dir().join(format!(
+            "shellglass-api-test-{}-{}.key",
+            std::process::id(),
+            ssh_addr.port()
+        ));
+        let _ = std::fs::remove_file(&key_path);
+
         let (_publisher, source) = external_source(frame("LIBRARY_API_MARKER"));
         let presentation = Presentation::from_config(Config::default()).unwrap();
+        let mut options = ServeOptions::new(addr.to_string());
+        options.ssh_bind = Some(ssh_addr.to_string());
+        options.ssh_host_key = Some(key_path.clone());
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(serve_with_shutdown(
             move || Ok(source),
             presentation,
-            ServeOptions::new(addr.to_string()),
+            options,
             async move {
                 let _ = stopped.await;
             },
@@ -356,9 +392,22 @@ mod tests {
             events.extend_from_slice(&chunk);
         }
 
-        drop(stream);
+        // Keep the infinite SSE response open: shutdown must close it rather
+        // than waiting forever for the viewer to disconnect first.
         let _ = stop.send(());
-        task.await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("serve_with_shutdown waited on its SSE viewer")
+            .unwrap()
+            .unwrap();
+        drop(stream);
+
+        // Graceful shutdown is an embedding boundary, not process exit: every
+        // auxiliary listener must be gone before the future returns.
+        let rebound = std::net::TcpListener::bind(ssh_addr)
+            .expect("SSH listener survived serve_with_shutdown");
+        drop(rebound);
+        let _ = std::fs::remove_file(key_path);
     }
 
     #[tokio::test]
