@@ -337,7 +337,7 @@ fn screen_thread(
     ready_tx: mpsc::Sender<Msg>,
     frame_tx: watch::Sender<Arc<Frame>>,
     raw: RawMode,
-    mut parser: SgParser,
+    parser: SgParser,
     seq_seen: SeqSeen,
     cell: (u16, u16),
     intercept: (bool, bool, bool),
@@ -347,8 +347,7 @@ fn screen_thread(
 ) {
     let mut out = std::io::stdout();
     let mut connected = true; // teeing shell output to the terminal
-    let mut last_frame = Instant::now();
-    let mut dirty = false;
+    let mut screen = ScreenState::with_parser(parser, caps);
     // Deferred-image decode worker: sixel/kitty-raw payloads decode + PNG-
     // encode OFF this thread, so the tee to the local terminal never stalls
     // behind a deflate (a sixel video would otherwise slow the terminal
@@ -393,26 +392,9 @@ fn screen_thread(
     // vt100's own scrolling/eviction/reflow — each frame we just read the
     // surviving tags back (see `resolve_images`), no scroll heuristics.
     let mut interceptor = Interceptor::with(intercept.0, intercept.1, intercept.2, transcode, cell);
-    let mut sync = SyncGate::new();
-    let mut images: Vec<Placed> = Vec::new();
-    // Ready-but-overwritten placements held for the double-buffer swap
-    // (see resolve_images): shown until their pending successor's bytes land.
-    let mut zombies: Vec<Placed> = Vec::new();
     let mut image_seq = std::num::NonZeroU32::MIN;
-    let mut bridge = CursorBridge::default();
     loop {
-        // Wake at the soonest of: the frame interval (when dirty) and the
-        // cursor-hide grace expiry (when bridging a hidden cursor, so the real
-        // hide still ships even if the app then goes quiet). Neither ⇒ block.
-        let wait = {
-            let mut d = dirty.then(|| MIN_FRAME.saturating_sub(last_frame.elapsed()));
-            if let Some(t) = bridge.hidden_since.filter(|_| bridge.shown.is_some()) {
-                let rem = CURSOR_HIDE_GRACE.saturating_sub(t.elapsed());
-                d = Some(d.map_or(rem, |x| x.min(rem)));
-            }
-            d
-        };
-        let msg = match wait {
+        let msg = match screen.wait() {
             Some(d) => match msg_rx.recv_timeout(d) {
                 Ok(m) => Some(m),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
@@ -435,7 +417,7 @@ fn screen_thread(
                         let _ = out.flush();
                     }
                     match step {
-                        Step::Passthrough(x) => parser.process(&x), // → vt100 too
+                        Step::Passthrough(x) => screen.process(&x), // → vt100 too
                         Step::TerminalOnly(_) => {}                 // already teed
                         Step::Image(_, img) => {
                             // Ready payload (iTerm2 native / kitty PNG): stamp
@@ -448,15 +430,7 @@ fn screen_thread(
                                     bytes: img.bytes.into(),
                                 },
                             ));
-                            stamp_image(
-                                &mut parser,
-                                &mut images,
-                                &mut image_seq,
-                                cell,
-                                img.cells,
-                                img.px,
-                                ready,
-                            );
+                            screen.stamp_image(&mut image_seq, cell, img.cells, img.px, ready);
                         }
                         Step::Deferred(_, d) => {
                             // Heavy decode (sixel / kitty raw): stamp NOW —
@@ -465,15 +439,8 @@ fn screen_thread(
                             // video frames superseded before decoding are
                             // never decoded (their pending placements die by
                             // cell overwrite like any other image).
-                            let id = stamp_image(
-                                &mut parser,
-                                &mut images,
-                                &mut image_seq,
-                                cell,
-                                d.cells,
-                                Some(d.px),
-                                None,
-                            );
+                            let id =
+                                screen.stamp_image(&mut image_seq, cell, d.cells, Some(d.px), None);
                             let _ = job_tx.send((id, d.payload));
                         }
                         Step::Reject(resp) => {
@@ -487,20 +454,10 @@ fn screen_thread(
                         }
                     }
                 }
-                dirty = true;
+                screen.touch();
             }
-            Some(Msg::ImageReady { id, hash, blob }) => {
-                // Fill the pending placement; a miss means it was already
-                // evicted (overwritten/scrolled off) — drop the bytes.
-                if let Some(p) = images.iter_mut().find(|p| p.id == id) {
-                    p.ready = Some((hash, blob));
-                    dirty = true;
-                }
-            }
-            Some(Msg::Resize(rows, cols)) => {
-                parser.screen_mut().set_size(rows, cols);
-                dirty = true;
-            }
+            Some(Msg::ImageReady { id, hash, blob }) => screen.image_ready(id, hash, blob),
+            Some(Msg::Resize(rows, cols)) => screen.set_size(rows, cols),
             Some(Msg::HubDown(msg)) if connected => {
                 connected = false;
                 raw.leave(); // back to cooked so the notice reads normally
@@ -524,11 +481,9 @@ fn screen_thread(
                 // restore the input modes to whatever the app has enabled *now* —
                 // the parser kept processing while paused, so this re-arms mouse
                 // reporting etc. even if the app changed modes mid-outage.
-                let _ = out.write_all(b"\x1b[2J\x1b[H");
-                let _ = out.write_all(&parser.screen().contents_formatted());
-                let _ = out.write_all(&parser.screen().input_mode_formatted());
+                let _ = out.write_all(&screen.repaint());
                 let _ = out.flush();
-                dirty = true;
+                screen.touch();
             }
             Some(Msg::Shutdown) => {
                 raw.restore();
@@ -540,22 +495,8 @@ fn screen_thread(
             Some(_) => {} // redundant HubDown/HubUp — ignore
             None => {}    // frame due
         }
-        // A bridged hidden cursor whose grace has now expired must publish the
-        // real hide even with no new data (dirty=false).
-        let hide_due = bridge.shown.is_some()
-            && bridge
-                .hidden_since
-                .is_some_and(|t| t.elapsed() >= CURSOR_HIDE_GRACE);
-        if (dirty || hide_due) && last_frame.elapsed() >= MIN_FRAME && !sync.hold(parser.screen()) {
-            let _ = frame_tx.send(frame_from_with_defaults(
-                &parser,
-                &mut images,
-                &mut zombies,
-                &mut bridge,
-                caps,
-            ));
-            dirty = false;
-            last_frame = Instant::now();
+        if let Some(frame) = screen.due_frame() {
+            let _ = frame_tx.send(frame);
         }
     }
 }
@@ -933,34 +874,55 @@ fn frame_from_with_defaults(
     Arc::new(Frame::Screen(grid))
 }
 
-/// A headless screen for the detachable session owner ([`crate::session`]): it
-/// drives PTY output through the session parser and produces [`Frame`]s for the
-/// stream pipeline WITHOUT owning any local terminal. Inline-image decoding is
-/// deliberately absent — a detached owner has no local terminal to probe for
-/// image capabilities — so images mirror as their covered cells; everything else
-/// (text, colors, cursor bridging) is full fidelity via the same frame builder.
-#[cfg(all(feature = "push", unix))]
-pub(crate) struct HeadlessScreen {
+/// The mirrored screen plus its frame clock — everything that decides *what* a
+/// viewer sees and *when*. Both owners share it: the local-terminal one
+/// ([`screen_thread`]) and the terminal-less detachable one
+/// ([`crate::session`]). That sharing is the point: the 30fps cap, the
+/// synchronized-update gate and the cursor-hide grace are fidelity rules that
+/// must not drift between the two, and they did while this logic was duplicated.
+///
+/// The owner drives it: feed it bytes/resizes, ask [`Self::wait`] how long to
+/// block for the next event, then ask [`Self::due_frame`] for a frame. Inline
+/// images are stamped by the terminal owner only — a detached owner has no
+/// terminal to probe for image capabilities, so it leaves the vectors empty and
+/// images mirror as their covered cells.
+pub(crate) struct ScreenState {
     parser: SgParser,
     images: Vec<Placed>,
+    /// Ready-but-overwritten placements held for the double-buffer swap (see
+    /// `resolve_images`): shown until their pending successor's bytes land.
     zombies: Vec<Placed>,
     bridge: CursorBridge,
     sync: SyncGate,
+    caps: Caps,
+    last_frame: Instant,
+    dirty: bool,
 }
 
-#[cfg(all(feature = "push", unix))]
-impl HeadlessScreen {
-    pub(crate) fn new(rows: u16, cols: u16) -> HeadlessScreen {
-        HeadlessScreen {
-            parser: new_parser(rows, cols),
+impl ScreenState {
+    /// Wrap a parser the caller already sized, with the terminal's probed caps.
+    fn with_parser(parser: SgParser, caps: Caps) -> ScreenState {
+        ScreenState {
+            parser,
             images: Vec::new(),
             zombies: Vec::new(),
             bridge: CursorBridge::default(),
             sync: SyncGate::new(),
+            caps,
+            last_frame: Instant::now(),
+            dirty: false,
         }
     }
 
+    /// A fresh screen at `rows`×`cols` with default caps — the detachable owner,
+    /// which probes no terminal.
+    #[cfg(all(feature = "push", unix))]
+    pub(crate) fn new(rows: u16, cols: u16) -> ScreenState {
+        Self::with_parser(new_parser(rows, cols), Caps::default())
+    }
+
     /// The blank starting frame, to seed the watch channel before any output.
+    #[cfg(all(feature = "push", unix))]
     pub(crate) fn blank_frame(rows: u16, cols: u16) -> Arc<Frame> {
         frame_from_with_defaults(
             &new_parser(rows, cols),
@@ -973,45 +935,100 @@ impl HeadlessScreen {
 
     pub(crate) fn process(&mut self, bytes: &[u8]) {
         self.parser.process(bytes);
+        self.dirty = true;
     }
 
     pub(crate) fn set_size(&mut self, rows: u16, cols: u16) {
         self.parser.screen_mut().set_size(rows, cols);
+        self.dirty = true;
     }
 
-    /// Should a due publish be held for an in-progress synchronized update
-    /// (DEC 2026)? Same gating as the local mirror: an attached terminal
-    /// answers the inner app's mode queries, so tmux/neovim will wrap redraws
-    /// in BSU/ESU and a gate-less snapshot would ship torn mid-redraw frames.
-    pub(crate) fn hold_frame(&mut self) -> bool {
-        self.sync.hold(self.parser.screen())
+    /// Mark the screen changed by something other than parsed bytes (an image
+    /// payload landing, a repaint the viewer must see).
+    pub(crate) fn touch(&mut self) {
+        self.dirty = true;
     }
 
-    /// Remaining cursor-hide grace while bridging a hidden cursor: the owner's
-    /// loop must wake when it expires so the genuine hide still publishes even
-    /// if the app then goes quiet.
-    pub(crate) fn hide_grace_remaining(&self) -> Option<Duration> {
-        let since = self
+    /// Stamp an inline image at the cursor, returning its placement id.
+    /// Terminal-owner only — takes both the parser and the placement list, which
+    /// is why it lives here rather than at the call site.
+    fn stamp_image(
+        &mut self,
+        seq: &mut std::num::NonZeroU32,
+        cell: (u16, u16),
+        cells: Option<(u16, u16)>,
+        px: Option<(u32, u32)>,
+        ready: Option<(String, crate::model::ImageBlob)>,
+    ) -> std::num::NonZeroU32 {
+        stamp_image(
+            &mut self.parser,
+            &mut self.images,
+            seq,
+            cell,
+            cells,
+            px,
+            ready,
+        )
+    }
+
+    /// Fill a pending placement with its decoded bytes. A miss means the
+    /// placement was already evicted (overwritten/scrolled off) — drop them.
+    fn image_ready(
+        &mut self,
+        id: std::num::NonZeroU32,
+        hash: String,
+        blob: crate::model::ImageBlob,
+    ) {
+        if let Some(p) = self.images.iter_mut().find(|p| p.id == id) {
+            p.ready = Some((hash, blob));
+            self.dirty = true;
+        }
+    }
+
+    /// How long the owner should wait for the next event: the soonest of the
+    /// frame interval (when dirty) and the cursor-hide grace expiry (when
+    /// bridging a hidden cursor, so the real hide still ships even if the app
+    /// then goes quiet). Neither ⇒ `None`, block until something arrives.
+    pub(crate) fn wait(&self) -> Option<Duration> {
+        let mut d = self
+            .dirty
+            .then(|| MIN_FRAME.saturating_sub(self.last_frame.elapsed()));
+        if let Some(t) = self
             .bridge
             .hidden_since
-            .filter(|_| self.bridge.shown.is_some())?;
-        Some(CURSOR_HIDE_GRACE.saturating_sub(since.elapsed()))
+            .filter(|_| self.bridge.shown.is_some())
+        {
+            let rem = CURSOR_HIDE_GRACE.saturating_sub(t.elapsed());
+            d = Some(d.map_or(rem, |x| x.min(rem)));
+        }
+        d
     }
 
-    /// A bridged hidden cursor whose grace has expired: publish even if clean.
-    pub(crate) fn hide_due(&self) -> bool {
-        self.hide_grace_remaining() == Some(Duration::ZERO)
-    }
-
-    /// Snapshot the current screen as a [`Frame`] for the hub pipeline.
-    pub(crate) fn frame(&mut self) -> Arc<Frame> {
-        frame_from_with_defaults(
+    /// The next frame to publish, or `None` if none is due yet. Rate-limited to
+    /// [`MIN_FRAME`], held during a synchronized update (DEC 2026) so viewers
+    /// never see a torn mid-redraw screen, and forced once a bridged hidden
+    /// cursor's grace expires even with no new data.
+    pub(crate) fn due_frame(&mut self) -> Option<Arc<Frame>> {
+        let hide_due = self.bridge.shown.is_some()
+            && self
+                .bridge
+                .hidden_since
+                .is_some_and(|t| t.elapsed() >= CURSOR_HIDE_GRACE);
+        if !(self.dirty || hide_due)
+            || self.last_frame.elapsed() < MIN_FRAME
+            || self.sync.hold(self.parser.screen())
+        {
+            return None;
+        }
+        self.dirty = false;
+        self.last_frame = Instant::now();
+        Some(frame_from_with_defaults(
             &self.parser,
             &mut self.images,
             &mut self.zombies,
             &mut self.bridge,
-            Caps::default(),
-        )
+            self.caps,
+        ))
     }
 
     /// Bytes that repaint the current screen onto a freshly-attached terminal.
