@@ -161,9 +161,11 @@ const SALT: &[u8] = b"shellglass/session-id/v6";
 /// *additive* optional key (an old decoder ignores it, mirror stays correct) needs
 /// no bump, same as before; bump only when an existing message would be *misread*.
 /// Protocol 1 is the baseline shipped with negotiation (it includes the fractional
-/// image `w`/`h`). Protocol 2 replaces client-supplied font CSS and family names
-/// with hash-keyed font assets from which the hub generates `@font-face` rules.
-/// When bumping, also decide [`HUB_PROTOCOL_MIN`].
+/// image `w`/`h`). Protocol 2 does two things: it replaces client-supplied font
+/// CSS and family names with hash-keyed font assets from which the hub generates
+/// `@font-face` rules, and it makes push ownership exclusive — a replacement Close
+/// is fatal to the evicted client, so two clients cannot reconnect and steal the
+/// session back from each other. When bumping, also decide [`HUB_PROTOCOL_MIN`].
 pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The OLDEST wire protocol a hub of this build still serves. The hub accepts a
@@ -192,6 +194,16 @@ pub const PROTOCOL_HEADER: &str = "x-shellglass-protocol";
 pub const HUB_VERSION_HEADER: &str = "x-shellglass-hub-version";
 pub const PROTOCOL_MIN_HEADER: &str = "x-shellglass-protocol-min";
 pub const PROTOCOL_MAX_HEADER: &str = "x-shellglass-protocol-max";
+
+/// Private-use WebSocket Close code sent to the incumbent push connection when a
+/// newer connection claims the same session. The client treats this as fatal: an
+/// evicted client must not reconnect and steal the session back, or two clients
+/// would evict each other forever.
+///
+/// Protocol 2 introduced this contract. Hubs require protocol 2 because a
+/// protocol-1 client treats every Close as transient and would violate the
+/// single-active-connection invariant by reconnecting.
+pub const PUSH_REPLACED_CLOSE_CODE: u16 = 4000;
 
 /// The management-API identity domain. Same derivation as [`session_id`],
 /// DIFFERENT salt: domain separation. A leaked session key can never

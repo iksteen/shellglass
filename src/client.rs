@@ -22,7 +22,7 @@ use crate::fonts::{self, FontFile, Resolver};
 use crate::model::Frame;
 use crate::proto::{
     HUB_VERSION_HEADER, KEY_HEADER, MAX_WS_MESSAGE, PROTOCOL_HEADER, PROTOCOL_MAX_HEADER,
-    PROTOCOL_MIN_HEADER, PROTOCOL_VERSION, RegisterBody,
+    PROTOCOL_MIN_HEADER, PROTOCOL_VERSION, PUSH_REPLACED_CLOSE_CODE, RegisterBody,
 };
 use crate::render;
 use crate::source::{SinkStatus, SourceSession};
@@ -154,6 +154,9 @@ pub async fn run(
         let source = backend.as_mut().expect("backend started on first Ok");
         match run_session(ws, &reg_json, &mut source.frames).await {
             End::LiveDone => break, // PTY backend ended — nothing left to push
+            End::Replaced => {
+                bail!("this push connection was replaced by a newer client for the same session")
+            }
             End::Disconnected => {
                 // Transient — let the next connect decide if it's a real outage, so a
                 // quick reconnect doesn't flash a pause in the terminal.
@@ -195,8 +198,12 @@ fn report_up(sink_status: Option<&dyn SinkStatus>) {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum End {
     LiveDone,
+    /// A newer connection claimed this session. Fatal: reconnecting would steal it
+    /// back and make the two clients evict each other forever.
+    Replaced,
     Disconnected,
 }
 
@@ -411,11 +418,22 @@ async fn run_session(
             }
             msg = ws.next() => match msg {
                 Some(Ok(Message::Pong(_))) => missed = 0, // hub alive
-                Some(Ok(Message::Close { .. })) => return End::Disconnected, // graceful hub shutdown
+                Some(Ok(Message::Close { code, .. })) => return end_for_close(code),
                 Some(Ok(_)) => {} // text/binary/inbound-ping: nothing to do (read-only push)
                 Some(Err(_)) | None => return End::Disconnected, // socket error / closed
             }
         }
+    }
+}
+
+/// A hub Close normally means a transient disconnect (shutdown/restart), except
+/// for the private-use replacement code: that is a deliberate ownership transfer
+/// and reconnecting would undo it.
+fn end_for_close(code: reqwest_websocket::CloseCode) -> End {
+    if u16::from(code) == PUSH_REPLACED_CLOSE_CODE {
+        End::Replaced
+    } else {
+        End::Disconnected
     }
 }
 
@@ -486,7 +504,9 @@ async fn send(ws: &mut WebSocket, msg: Message, timeout: Duration) -> Result<(),
 
 #[cfg(test)]
 mod tests {
-    use super::{Cause, SentBlobs, generic_incompat_message, incompat_message, notice};
+    use super::{
+        Cause, End, SentBlobs, end_for_close, generic_incompat_message, incompat_message, notice,
+    };
 
     // The 426 message names which side is behind and echoes the hub's version —
     // neutered through `proto::neuter` (control-strip + length cap, tested there),
@@ -552,6 +572,24 @@ mod tests {
                 "notice must be control-free: {m:?}"
             );
         }
+    }
+
+    #[test]
+    fn only_replacement_close_is_fatal() {
+        assert_eq!(
+            end_for_close(crate::proto::PUSH_REPLACED_CLOSE_CODE.into()),
+            End::Replaced
+        );
+        assert_eq!(
+            end_for_close(1000_u16.into()),
+            End::Disconnected,
+            "ordinary graceful closes still reconnect"
+        );
+        assert_eq!(
+            end_for_close(1012_u16.into()),
+            End::Disconnected,
+            "hub restart closes still reconnect"
+        );
     }
 
     #[test]
