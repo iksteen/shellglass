@@ -38,7 +38,7 @@ body[data-offline="operator"] .off-op { display:inline; }
 <div id="sg-canvas-host">{{screen}}</div>
 <div class="sg-offline" aria-hidden="true"><span class="off-hub">offline</span><span class="off-op">operator offline</span></div>
 {{script}}
-<script>
+<script nonce="{{nonce}}">
 // Fit the terminal to the frame with `transform: scale`, growing as well as
 // shrinking — an embed fills the box the host page gave it. Paint-time on
 // purpose: mobile WebKit's text autosizer boosts text CSS `zoom` makes tiny

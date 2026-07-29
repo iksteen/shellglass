@@ -141,10 +141,11 @@ pub fn head_css_with_font_aliases(
     )
 }
 
-/// Hub-owned presentation for every embed mode. The pusher contributes no CSS
-/// or render configuration: only verified regular-face hashes select fonts.
-/// All other presentation values are fixed hub literals.
-pub fn hub_embed_head_css(font_css: &str, family_keys: &[String]) -> String {
+/// Protected hub-owned presentation for embeds and forced normal pages. The
+/// pusher contributes no CSS or render configuration: only verified
+/// regular-face hashes select fonts. All other presentation values are fixed
+/// hub literals.
+pub fn hub_head_css(font_css: &str, family_keys: &[String]) -> String {
     format!(
         "{font_css}{}",
         terminal_base_css(&hub_font_stack(family_keys), 14.0, 16.8)
@@ -178,9 +179,9 @@ pub fn default_head_css() -> String {
 /// spelled out (field names are viewer.ts's `Cfg`).
 pub const DEFAULT_RENDER_CFG: &str = r##"{"defFg":"#d0d0d0","defBg":"#000000","fillFont":"monospace","fontPx":14,"lhPx":16.8,"sym":[]}"##;
 
-/// Render config matching [`hub_embed_head_css`]. It is assembled entirely from
+/// Render config matching [`hub_head_css`]. It is assembled entirely from
 /// hub literals and verified regular-face hashes; no pushed JSON is reproduced.
-pub fn hub_embed_render_config_json(family_keys: &[String]) -> String {
+pub fn hub_render_config_json(family_keys: &[String]) -> String {
     let stack = serde_json::to_string(&hub_font_stack(family_keys))
         .expect("a generated font stack serializes");
     format!(
@@ -199,15 +200,36 @@ fn hub_font_stack(family_keys: &[String]) -> String {
 
 /// Fill a viewer `template` with the terminal `<style>`, the (empty) `#screen`
 /// div, and the updater `<script>`. Tokens: `{{style}}`, `{{screen}}`,
-/// `{{script}}`. The screen starts empty — the renderer paints it from the full
-/// frame that heads every SSE stream, one round-trip after load.
+/// `{{script}}`, plus an empty `{{nonce}}`. The screen starts empty — the
+/// renderer paints it from the full frame that heads every SSE stream, one
+/// round-trip after load.
 pub fn page(template: &str, head_css: &str, script: &str) -> String {
-    // `script` already carries its own `<script>` tags (it loads the external
-    // renderer), so inject it raw rather than wrapping it.
+    page_with_nonce(template, head_css, script, "")
+}
+
+/// [`page`] with a per-response CSP nonce available to a hub-owned template as
+/// `{{nonce}}`. Trusted tokens are replaced before `{{style}}`: client CSS
+/// inserted last cannot smuggle its own nonce placeholder and have it expanded.
+pub fn page_with_nonce(template: &str, head_css: &str, script: &str, nonce: &str) -> String {
     template
-        .replace("{{style}}", &format!("<style>\n{head_css}</style>"))
         .replace("{{script}}", script)
         .replace("{{screen}}", "<div id=\"screen\"></div>")
+        .replace("{{nonce}}", nonce)
+        .replace("{{style}}", &format!("<style>\n{head_css}</style>"))
+}
+
+/// Random per-response nonce for a hub-owned page's script CSP.
+pub fn nonce() -> String {
+    use base64::Engine as _;
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("OS randomness for a CSP nonce");
+    base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes)
+}
+
+/// Script policy for a hub-owned viewer template. Only nonce-stamped scripts can
+/// execute; injected plugins, frames, and base-URL changes are blocked too.
+pub fn csp(nonce: &str) -> String {
+    format!("script-src 'nonce-{nonce}'; object-src 'none'; frame-src 'none'; base-uri 'none'")
 }
 
 /// The page's updater block: a tiny inline config the renderer reads (the SSE path
@@ -221,11 +243,16 @@ pub fn page(template: &str, head_css: &str, script: &str) -> String {
 /// hub may sit behind a reverse proxy that mounts it under a subpath, which
 /// neither it nor the client can know — absolute paths would escape the mount.
 pub fn sse_script(events_path: &str, cfg_json: &str) -> String {
-    let cfg = if cfg_json.is_empty() {
-        "null"
-    } else {
-        cfg_json
-    };
+    sse_script_inner(events_path, cfg_json, None)
+}
+
+/// [`sse_script`] with the nonce required by [`csp`] on both trusted scripts.
+pub fn sse_script_with_nonce(events_path: &str, cfg_json: &str, nonce: &str) -> String {
+    sse_script_inner(events_path, cfg_json, Some(nonce))
+}
+
+fn sse_script_inner(events_path: &str, cfg_json: &str, nonce: Option<&str>) -> String {
+    let cfg = cfg_for_script(cfg_json);
     let events = serde_json::to_string(events_path).unwrap_or_else(|_| "\"events\"".into());
     // The inline classic script runs at parse time (setting the config); the module
     // script is deferred by default and runs after, so the config is ready. viewer.js
@@ -235,10 +262,31 @@ pub fn sse_script(events_path: &str, cfg_json: &str) -> String {
     // under a loaded page — new wire format OR just a new viewer.js).
     let proto = crate::diff::PROTO;
     let js = viewer_tag();
+    let nonce = nonce.map(|n| format!(" nonce=\"{n}\"")).unwrap_or_default();
     format!(
-        "<script>window.SHELLGLASS={{events:{events},cfg:{cfg},proto:{proto},js:\"{js}\"}};</script>\n\
-         <script type=\"module\" src=\"viewer.js?v={js}\"></script>"
+        "<script{nonce}>window.SHELLGLASS={{events:{events},cfg:{cfg},proto:{proto},js:\"{js}\"}};</script>\n\
+         <script type=\"module\"{nonce} src=\"viewer.js?v={js}\"></script>"
     )
+}
+
+/// Parse and canonically re-serialize pushed render JSON. Invalid input becomes
+/// `null`, so it cannot alter the surrounding boot object.
+fn cfg_value(raw: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| serde_json::to_string(&value).ok())
+        .unwrap_or_else(|| "null".to_string())
+}
+
+/// JSON safe inside an HTML `<script>` raw-text element. In particular a string
+/// containing `</script>` cannot terminate the trusted boot script.
+fn cfg_for_script(raw: &str) -> String {
+    cfg_value(raw)
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
 }
 
 /// The boot object an iframe-less embed fetches (`GET config`), the JSON form of
@@ -247,11 +295,7 @@ pub fn sse_script(events_path: &str, cfg_json: &str) -> String {
 /// resolves it against the session base. `cfg_json` is [`render_config_json`] or
 /// the client's, relayed by the hub.
 pub fn config_json(events_path: &str, cfg_json: &str) -> String {
-    let cfg = if cfg_json.is_empty() {
-        "null"
-    } else {
-        cfg_json
-    };
+    let cfg = cfg_value(cfg_json);
     let events = serde_json::to_string(events_path).unwrap_or_else(|_| "\"events\"".into());
     format!(
         "{{\"events\":{events},\"cfg\":{cfg},\"proto\":{proto},\"js\":\"{js}\"}}",
@@ -433,16 +477,16 @@ mod tests {
     }
 
     #[test]
-    fn hub_embed_presentation_uses_only_hash_families_and_fixed_defaults() {
+    fn protected_hub_presentation_uses_only_hash_families_and_fixed_defaults() {
         let key = "a".repeat(64);
         let font_css = font_face_rule(&key, false, "fonts/", &key, "woff2");
-        let css = hub_embed_head_css(&font_css, std::slice::from_ref(&key));
+        let css = hub_head_css(&font_css, std::slice::from_ref(&key));
         assert!(css.contains(&format!("font-family:'{key}'")), "{css}");
         assert!(css.contains(&format!("#screen {{ font-family:'{key}',monospace;")));
         assert!(css.contains("font-size:14px"));
         assert!(css.contains("--lh:16.8px"));
 
-        let cfg = hub_embed_render_config_json(std::slice::from_ref(&key));
+        let cfg = hub_render_config_json(std::slice::from_ref(&key));
         let parsed: serde_json::Value = serde_json::from_str(&cfg).unwrap();
         assert_eq!(parsed["fillFont"], format!("'{key}',monospace"));
         assert_eq!(parsed["fontPx"], 14);
@@ -476,11 +520,53 @@ mod tests {
     }
 
     #[test]
+    fn hub_page_nonce_is_available_only_to_the_template_and_trusted_script() {
+        let tmpl = r#"<head>{{style}}</head><body>{{screen}}{{script}}<script nonce="{{nonce}}">OK</script></body>"#;
+        let html = page_with_nonce(
+            tmpl,
+            "/* client placeholders stay literal: {{nonce}} {{script}} */",
+            r#"<script nonce="SAFE">BOOT</script>"#,
+            "SAFE",
+        );
+        assert_eq!(html.matches(r#"nonce="SAFE""#).count(), 2, "{html}");
+        assert!(
+            html.contains("/* client placeholders stay literal: {{nonce}} {{script}} */"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn nonce_script_canonicalizes_config_and_cannot_be_closed_by_json() {
+        let script = sse_script_with_nonce(
+            "events",
+            r#"{"value":"</script><script>CLIENT_XSS</script>&\u2028"}"#,
+            "SAFE",
+        );
+        assert_eq!(script.matches(r#"nonce="SAFE""#).count(), 2, "{script}");
+        assert!(!script.contains("</script><script>CLIENT_XSS"), "{script}");
+        assert!(script.contains(r#"\u003c/script\u003e"#), "{script}");
+        assert!(script.contains(r#"\u0026"#), "{script}");
+
+        let invalid = sse_script("events", "null};CLIENT_XSS();//");
+        assert!(invalid.contains("cfg:null"), "{invalid}");
+        assert!(!invalid.contains("CLIENT_XSS"), "{invalid}");
+    }
+
+    #[test]
+    fn hub_csp_allows_only_nonce_stamped_scripts() {
+        let policy = csp("SAFE");
+        assert!(policy.contains("script-src 'nonce-SAFE'"), "{policy}");
+        assert!(policy.contains("object-src 'none'"), "{policy}");
+        assert!(policy.contains("frame-src 'none'"), "{policy}");
+        assert!(policy.contains("base-uri 'none'"), "{policy}");
+    }
+
+    #[test]
     fn embed_assets_hold_their_contract() {
         // The embed template is a full viewer template (all three tokens),
         // carries the offline takeover, and dispatches sg-zoom so the canvas
         // re-rasterizes on fit changes.
-        for tok in ["{{style}}", "{{screen}}", "{{script}}"] {
+        for tok in ["{{style}}", "{{screen}}", "{{script}}", "{{nonce}}"] {
             assert!(EMBED_TEMPLATE.contains(tok), "embed template missing {tok}");
         }
         assert!(EMBED_TEMPLATE.contains("data-offline"), "offline takeover");
@@ -508,7 +594,7 @@ mod tests {
 
     #[test]
     fn builtin_template_has_all_tokens() {
-        for tok in ["{{style}}", "{{screen}}", "{{script}}"] {
+        for tok in ["{{style}}", "{{screen}}", "{{script}}", "{{nonce}}"] {
             assert!(DEFAULT_TEMPLATE.contains(tok), "template missing {tok}");
         }
         // The canvas mounts OUTSIDE the fit transform (see the embed test).

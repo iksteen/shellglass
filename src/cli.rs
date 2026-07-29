@@ -711,6 +711,19 @@ pub struct HubArgs {
     /// Off by default.
     #[arg(long = "record-dir", value_name = "DIR")]
     record_dir: Option<PathBuf>,
+
+    /// Hub-owned fallback viewer template for normal pages. Pushed templates
+    /// still win unless --force-template is set. The file may use {{style}},
+    /// {{screen}}, {{script}}, and {{nonce}}; hub-owned inline scripts must carry
+    /// nonce="{{nonce}}". Embeds always use the built-in embed template.
+    #[arg(long = "template", value_name = "PATH")]
+    template: Option<PathBuf>,
+
+    /// Ignore the raw template, CSS, and render config pushed by clients. Uses
+    /// --template when provided (or the built-in default) together with
+    /// hub-generated CSS/config; validated hash-keyed fonts remain available.
+    #[arg(long = "force-template")]
+    force_template: bool,
 }
 
 /// How the hub should terminate TLS.
@@ -878,6 +891,14 @@ impl HubArgs {
                 "shellglass: warning — no sessions registered and no --api-allow; the hub will reject all pushes (403)"
             );
         }
+        let template = self
+            .template
+            .as_ref()
+            .map(|path| {
+                std::fs::read_to_string(path)
+                    .with_context(|| format!("reading --template {}", path.display()))
+            })
+            .transpose()?;
         serve_hub(
             HubSetup {
                 allow,
@@ -886,6 +907,8 @@ impl HubArgs {
                 sessions_file: self.sessions_file,
                 cors_origins: self.cors_origin,
                 record_dir: self.record_dir,
+                template,
+                force_template: self.force_template,
             },
             &self.bind,
             tls,
@@ -964,6 +987,8 @@ struct HubSetup {
     sessions_file: Option<PathBuf>,
     cors_origins: Vec<String>,
     record_dir: Option<PathBuf>,
+    template: Option<String>,
+    force_template: bool,
 }
 
 /// Serve the hub, terminating TLS per `tls`. Plain HTTP keeps the `SO_REUSEADDR`
@@ -995,7 +1020,8 @@ async fn serve_hub(
     };
     let mut hub_state = hub::HubState::new(setup.allow, base)
         .with_api_allowed(setup.api_allow)
-        .with_id_salt(setup.id_salt);
+        .with_id_salt(setup.id_salt)
+        .with_template(setup.template, setup.force_template);
     if let Some(dir) = setup.record_dir {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating --record-dir {}", dir.display()))?;

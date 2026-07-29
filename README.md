@@ -150,6 +150,8 @@ Flags by command:
 | `--api-allow <api-id>` | hub | an API id permitted to call the session-management API; repeat per caller. Without it, `/api` is off (404) |
 | `--sessions-file <path>` | hub | persist the session registry across restarts (see [Managing hub sessions](#managing-hub-sessions-over-http)) |
 | `--record-dir <dir>` | serve, hub | record sessions as timestamped native streams (see [Session recording](#session-recording)) |
+| `--template <path>` | hub | hub-owned fallback template for normal pages; combine with `--force-template` to override pushed templates |
+| `--force-template` | hub | ignore pushed template/CSS/render config and use a hub-owned presentation (`--template`, or the built-in default); validated hash-keyed fonts remain available |
 | `--no-record` | push | decline recording on a hub that records (or `SHELLGLASS_NO_RECORD=true`) |
 | `--detachable` | push | run the command in a terminal-less PTY reachable via `attach` — see [Detachable sessions](#detachable-sessions) (Unix only) |
 | `--socket <path>` | push | the detachable session's unix socket (default `$XDG_RUNTIME_DIR/shellglass-<id>.sock`) |
@@ -444,6 +446,13 @@ template = "my-viewer.html"
 Everything around those tokens is yours — nav, wrapper, footer, extra `<style>`.
 Only `{{screen}}`'s `#screen` id is load-bearing (the updater targets it). In hub
 mode the client pushes its template to the hub, so custom pages work off-box too.
+The hub operator can instead provide a fallback with `hub --template <path>`, or
+make it authoritative with `--force-template`. A hub-owned template may also use
+`{{nonce}}`; put `nonce="{{nonce}}"` on each of its inline scripts. The hub then
+serves the page with a matching Content Security Policy. With
+`--force-template` and no `--template`, the built-in normal-page template is
+forced. In either forced form, pushed CSS and render config are also discarded.
+Validated hash-keyed fonts remain available through hub-generated CSS/config.
 
 If your page fits the terminal to a box with `transform: scale`, dispatch a
 `sg-zoom` event after changing the factor (so the canvas re-rasterizes crisp)
@@ -522,10 +531,12 @@ supported (they share one renderer instance) — use `mode="iframe"` for those.
 - The **secret** is a bearer capability. Anyone who has it can push to that
   session; anyone with the **view URL** can watch. Use a long random secret
   (`gen-key`) and share the URL only with people who should see the session.
-- Hub embeds are safe presentation surfaces for an untrusted pusher, but the
-  normal `/s/<slug>/` page intentionally retains that pusher's CSS, render
-  config, and optional template. Do not treat the normal page as trusted HTML;
-  use an embed route or isolate the hub on its own origin.
+- Hub embeds are safe presentation surfaces for an untrusted pusher. A normal
+  `/s/<slug>/` page retains pushed CSS and render config, and by default also
+  the optional pushed template. `hub --force-template` discards all three,
+  substitutes hub-generated CSS/config, and gives the hub-owned template a
+  nonce-restricted script policy. Validated hash-keyed fonts remain available;
+  no client-authored font CSS or family name is reproduced.
 - Ids derive from a fixed application salt, so the same secret yields the same
   public id on every hub: a reused key is linkable across hubs, and a
   precomputed dictionary over weak human-chosen keys works against all
