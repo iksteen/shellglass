@@ -711,6 +711,20 @@ pub struct HubArgs {
     /// Off by default.
     #[arg(long = "record-dir", value_name = "DIR")]
     record_dir: Option<PathBuf>,
+
+    /// Serve this HTML file as the viewer page template instead of the built-in
+    /// one (tokens `{{style}}`/`{{screen}}`/`{{script}}`). Lets an operator
+    /// restyle the page without rebuilding. Used as the fallback when a pusher
+    /// sends no template; combine with `--force-template` to always use it.
+    #[arg(long = "template", value_name = "PATH")]
+    template: Option<PathBuf>,
+
+    /// Ignore any viewer template a pusher pushes and always serve the hub's own
+    /// (`--template`, else the built-in). Keeps every session's chrome uniform
+    /// and stops a pusher injecting arbitrary HTML into the viewer page. Pushed
+    /// CSS/fonts still apply (that's terminal correctness, not chrome).
+    #[arg(long = "force-template")]
+    force_template: bool,
 }
 
 /// How the hub should terminate TLS.
@@ -878,6 +892,14 @@ impl HubArgs {
                 "shellglass: warning — no sessions registered and no --api-allow; the hub will reject all pushes (403)"
             );
         }
+        let template = self
+            .template
+            .as_ref()
+            .map(|p| {
+                std::fs::read_to_string(p)
+                    .with_context(|| format!("reading --template {}", p.display()))
+            })
+            .transpose()?;
         serve_hub(
             HubSetup {
                 allow,
@@ -886,6 +908,8 @@ impl HubArgs {
                 sessions_file: self.sessions_file,
                 cors_origins: self.cors_origin,
                 record_dir: self.record_dir,
+                template,
+                force_template: self.force_template,
             },
             &self.bind,
             tls,
@@ -964,6 +988,10 @@ struct HubSetup {
     sessions_file: Option<PathBuf>,
     cors_origins: Vec<String>,
     record_dir: Option<PathBuf>,
+    /// Contents of `--template` (viewer page override), or `None` for built-in.
+    template: Option<String>,
+    /// `--force-template`: serve the hub's template even when a pusher pushes one.
+    force_template: bool,
 }
 
 /// Serve the hub, terminating TLS per `tls`. Plain HTTP keeps the `SO_REUSEADDR`
@@ -995,7 +1023,8 @@ async fn serve_hub(
     };
     let mut hub_state = hub::HubState::new(setup.allow, base)
         .with_api_allowed(setup.api_allow)
-        .with_id_salt(setup.id_salt);
+        .with_id_salt(setup.id_salt)
+        .with_template(setup.template, setup.force_template);
     if let Some(dir) = setup.record_dir {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating --record-dir {}", dir.display()))?;

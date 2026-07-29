@@ -374,6 +374,16 @@ pub struct HubState {
     /// and served by the management API's recordings routes. `None` =
     /// recording off.
     record_dir: Option<Arc<std::path::PathBuf>>,
+    /// Viewer page template the hub serves as its DEFAULT — the fallback when a
+    /// pusher sends none, and (with [`force_template`]) the template for every
+    /// session. The built-in [`render::DEFAULT_TEMPLATE`] unless overridden by
+    /// `hub --template <file>`, so an operator can restyle the viewer page
+    /// without rebuilding.
+    default_template: Arc<str>,
+    /// `hub --force-template`: ignore any template a pusher pushes and always
+    /// serve [`default_template`]. Keeps every session's chrome uniform and stops
+    /// a pusher injecting arbitrary HTML into the viewer page.
+    force_template: bool,
 }
 
 impl HubState {
@@ -391,6 +401,8 @@ impl HubState {
             hash_slots: Arc::new(Semaphore::new(HASH_SLOTS)),
             shutdown,
             record_dir: None,
+            default_template: render::DEFAULT_TEMPLATE.into(),
+            force_template: false,
         };
         // Every seeded --allow entry gets its placeholder immediately: the
         // view URL works (operator-offline) before any pusher connects.
@@ -461,6 +473,19 @@ impl HubState {
     #[must_use]
     pub fn with_record_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.record_dir = Some(Arc::new(dir));
+        self
+    }
+
+    /// Override the default viewer template (`hub --template <file>`) and/or
+    /// force it over pusher-supplied templates (`hub --force-template`). `None`
+    /// leaves the built-in default in place. Builder style; call before the
+    /// state is cloned into the router.
+    #[must_use]
+    pub fn with_template(mut self, template: Option<String>, force: bool) -> Self {
+        if let Some(t) = template {
+            self.default_template = t.into();
+        }
+        self.force_template = force;
         self
     }
 
@@ -1825,7 +1850,7 @@ async fn view(
                 if embed {
                     render::EMBED_TEMPLATE
                 } else {
-                    render::DEFAULT_TEMPLATE
+                    &st.default_template
                 },
                 &render::default_head_css(),
                 &script,
@@ -1834,11 +1859,13 @@ async fn view(
             .into_response();
     }
     let script = render::sse_script("events", &s.render_cfg);
-    // Empty template = an older client that didn't push one; use the built-in.
-    let template = if embed {
+    // Chrome selection. Embed → always the built-in embed template. Otherwise the
+    // hub's own default template when forced (`--force-template`) or when the
+    // pusher pushed none (empty = older client); else the pusher's template.
+    let template: &str = if embed {
         render::EMBED_TEMPLATE
-    } else if s.template.is_empty() {
-        render::DEFAULT_TEMPLATE
+    } else if st.force_template || s.template.is_empty() {
+        &st.default_template
     } else {
         &s.template
     };
