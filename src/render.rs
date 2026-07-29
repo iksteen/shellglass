@@ -192,7 +192,7 @@ pub fn hub_render_config_json(family_keys: &[String]) -> String {
 fn hub_font_stack(family_keys: &[String]) -> String {
     let mut stack = family_keys
         .iter()
-        .map(|key| format!("'{}'", crate::fonts::css_escape_family(key)))
+        .map(|key| format!("'{key}'"))
         .collect::<Vec<_>>();
     stack.push("monospace".to_string());
     stack.join(",")
@@ -283,8 +283,6 @@ fn cfg_value(raw: &str) -> String {
 fn cfg_for_script(raw: &str) -> String {
     cfg_value(raw)
         .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
-        .replace('&', "\\u0026")
         .replace('\u{2028}', "\\u2028")
         .replace('\u{2029}', "\\u2029")
 }
@@ -544,8 +542,10 @@ mod tests {
         );
         assert_eq!(script.matches(r#"nonce="SAFE""#).count(), 2, "{script}");
         assert!(!script.contains("</script><script>CLIENT_XSS"), "{script}");
-        assert!(script.contains(r#"\u003c/script\u003e"#), "{script}");
-        assert!(script.contains(r#"\u0026"#), "{script}");
+        assert!(
+            script.contains(r#"\u003c/script>\u003cscript>CLIENT_XSS\u003c/script>&\u2028"#),
+            "{script}"
+        );
 
         let invalid = sse_script("events", "null};CLIENT_XSS();//");
         assert!(invalid.contains("cfg:null"), "{invalid}");
