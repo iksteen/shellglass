@@ -299,9 +299,11 @@ rendering model). Terminal resizes (`SIGWINCH`)
 reflow both the PTY and the browser. In hub mode the client pushes frames over a
 **single persistent WebSocket** (not a request per frame), so throughput isn't
 gated by round-trip latency; the hub relays them per session and re-serves the
-client's CSS, fonts, and render config. If the connection drops (hub restart,
-network blip) the client re-registers and reconnects automatically, showing the
-outage in your terminal until it's back.
+client's CSS, fonts, and render config for the normal view page. Hub embed routes
+instead use a fixed template and hub-generated CSS/config; only validated,
+hash-keyed uploaded fonts affect their presentation. If the connection drops
+(hub restart, network blip) the client re-registers and reconnects automatically,
+showing the outage in your terminal until it's back.
 
 ## Inline images
 
@@ -474,7 +476,7 @@ Three render modes, via a `mode` attribute (or `data-mode` on the script tag):
   your page.
 - **shadow** — `mode="shadow"` renders in a shadow root, fully style-isolated
   from the host. (Selection across a shadow boundary is weaker on some browsers.)
-- **iframe** — `mode="iframe"` is the classic sandboxed frame onto the `?embed`
+- **iframe** — `mode="iframe"` is the classic isolated frame onto the `?embed`
   page. The raw form still works with no script at all:
   ```html
   <iframe src="https://hub.example.com/s/demo?embed"
@@ -483,9 +485,12 @@ Three render modes, via a `mode` attribute (or `data-mode` on the script tag):
 
 `data-src`, the element name, its `src`, and the `?embed` URL shape are the
 **stable** contract — reconnects, upgrades and the operator-offline state all
-happen inside. An embed always uses the built-in look; a custom `template`
-doesn't apply (the session's fonts and colors do). Embedding a session is
-exactly as public as its view URL — see the security notes below.
+happen inside. On a hub, every embed uses the built-in template, fixed base
+presentation, and hub-generated render config; pushed CSS/template/render JSON
+never applies. Validated uploaded fonts still render under hash-only family
+names. Standalone `serve` keeps using its local configured presentation.
+Embedding a session is exactly as public as its view URL — see the security
+notes below.
 
 **Sizing.** An unstyled `<shellglass-view>` (light or shadow) renders at the
 terminal's natural size. Give it a `width` and/or `height` in CSS and the
@@ -517,6 +522,10 @@ supported (they share one renderer instance) — use `mode="iframe"` for those.
 - The **secret** is a bearer capability. Anyone who has it can push to that
   session; anyone with the **view URL** can watch. Use a long random secret
   (`gen-key`) and share the URL only with people who should see the session.
+- Hub embeds are safe presentation surfaces for an untrusted pusher, but the
+  normal `/s/<slug>/` page intentionally retains that pusher's CSS, render
+  config, and optional template. Do not treat the normal page as trusted HTML;
+  use an embed route or isolate the hub on its own origin.
 - Ids derive from a fixed application salt, so the same secret yields the same
   public id on every hub: a reused key is linkable across hubs, and a
   precomputed dictionary over weak human-chosen keys works against all

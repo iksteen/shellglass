@@ -13,24 +13,30 @@ use std::fmt::Write as _;
 /// `/push` WebSocket's first message). The hub stores fonts in a hub-wide
 /// content-addressed cache and serves them at `/s/<slug>/fonts/<key>`, where
 /// the key is [`content_key`] — a hash the HUB computes from the pushed bytes.
-/// There is deliberately NO client-chosen key on the wire: the client bakes
-/// its own [`content_key`] into its CSS, and an honest client's URLs match the
-/// hub's derivation; a lying client can only break its own font references,
-/// never overwrite or poison a cache entry another session shares.
+/// The only CSS-facing identifier on the wire is `family_key`: the regular face's
+/// own [`content_key`]. Bold faces reference that same key. The hub verifies this
+/// relationship before generating any CSS, so no free-form font family or
+/// client-authored `@font-face` syntax crosses the trust boundary.
 #[derive(Serialize, Deserialize)]
 pub struct FontAsset {
+    /// Lowercase 64-character [`content_key`] of this family's uploaded regular
+    /// face. For a regular asset this must equal the asset's own derived key; a
+    /// bold asset must reference a valid regular asset in the same registration.
+    pub family_key: String,
     pub mime: String,
     /// base64 of the font file bytes.
     pub b64: String,
+    /// Whether this is the family's bold face.
+    pub bold: bool,
 }
 
 /// Content address of a served asset (fonts AND inline images):
-/// `hex(sha256(mime · 0x00 · bytes))`. Both sides compute it independently —
-/// the client to reference the asset (`fonts/<key>` in its `@font-face` CSS,
-/// `images/<key>` in frame placements), the hub to store/serve the pushed
-/// bytes. There is never a client-claimed key on the wire, so a client can
-/// only break its own references, not overwrite an entry; the mime is part of
-/// the hash so right bytes can't be pre-seeded under a wrong content type.
+/// `hex(sha256(mime · 0x00 · bytes))`. Both sides compute image addresses
+/// independently; for hub fonts the HUB alone uses the address in generated CSS.
+/// Cache addresses are always hub-derived, so a client cannot overwrite an entry.
+/// A font's claimed `family_key` is accepted only after it matches a hub-derived
+/// regular-face address; the MIME is part of the hash so right bytes cannot be
+/// pre-seeded under a wrong content type.
 /// Content-addressed URLs are immutable, so responses cache forever.
 pub fn content_key(mime: &str, bytes: &[u8]) -> String {
     use sha2::Digest as _;
@@ -57,19 +63,14 @@ pub fn config_tag(parts: &[&str]) -> String {
     content_key("shellglass/reload-config/v1", parts.join("\0").as_bytes())
 }
 
-/// Register message: the first message on the `/push` WebSocket — the page CSS, the
-/// viewer template, and the fonts the CSS references. The client renders locally, so
-/// it owns the template too and pushes it here; the hub just fills it per request.
+/// Register message: the first message on the `/push` WebSocket — page-scoped base
+/// CSS, the viewer template, and structured font assets. The hub generates font
+/// CSS from those assets and combines it with the base CSS.
 #[derive(Serialize, Deserialize)]
 pub struct RegisterBody {
+    /// Page-scoped base CSS, without `@font-face` rules. In hub mode the hub
+    /// generates those rules from [`Self::fonts`] and prepends them itself.
     pub css: String,
-    /// Just the `@font-face` rules from `css`, served on its own at `style.css`
-    /// so an iframe-less embed can `<link>` the web fonts without pulling the
-    /// page-scoped base rules (which would leak onto a light-DOM host). Additive
-    /// and `default` (empty): an older client omits it, and the hub falls back to
-    /// serving the full `css` — so no protocol-skew (SALT) bump.
-    #[serde(default)]
-    pub font_css: String,
     /// Viewer HTML template with `{{style}}`/`{{screen}}`/`{{script}}` tokens.
     /// `default` (empty) so the hub falls back to its built-in for older clients.
     #[serde(default)]
@@ -95,9 +96,11 @@ pub struct RegisterBody {
 /// WS ordering then guarantees the hub can serve the bytes by the time any
 /// viewer sees the reference. Never forwarded to viewers (the hub intercepts
 /// it by its distinctive `{"blob":` prefix). Like fonts, the wire carries no
-/// client-chosen key: the hub derives [`content_key`] from the decoded bytes
-/// itself, so a lying client can only break its own placements. Re-sent per
-/// connection (the hub may have restarted); the per-session store dedups.
+/// client-chosen key: the hub sniffs an allowlisted browser-image MIME from the
+/// decoded bytes, requires the claim to match, and derives [`content_key`] itself,
+/// so active content is dropped and a lying client can only break its own
+/// placements. Re-sent per connection (the hub may have restarted); the
+/// per-session store dedups.
 #[derive(Serialize, Deserialize)]
 pub struct BlobMsg {
     pub blob: BlobBody,
@@ -105,7 +108,8 @@ pub struct BlobMsg {
 
 #[derive(Serialize, Deserialize)]
 pub struct BlobBody {
-    /// MIME type (part of the content key).
+    /// Canonical image MIME type (part of the content key); the hub verifies it
+    /// against the bytes.
     pub m: String,
     /// base64 of the image file bytes.
     pub d: String,
@@ -157,15 +161,17 @@ const SALT: &[u8] = b"shellglass/session-id/v6";
 /// *additive* optional key (an old decoder ignores it, mirror stays correct) needs
 /// no bump, same as before; bump only when an existing message would be *misread*.
 /// Protocol 1 is the baseline shipped with negotiation (it includes the fractional
-/// image `w`/`h`). When bumping, also decide [`HUB_PROTOCOL_MIN`].
-pub const PROTOCOL_VERSION: u32 = 1;
+/// image `w`/`h`). Protocol 2 replaces client-supplied font CSS and family names
+/// with hash-keyed font assets from which the hub generates `@font-face` rules.
+/// When bumping, also decide [`HUB_PROTOCOL_MIN`].
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The OLDEST wire protocol a hub of this build still serves. The hub accepts a
 /// client protocol in `[HUB_PROTOCOL_MIN, PROTOCOL_VERSION]`. Keep it below
 /// [`PROTOCOL_VERSION`] while the hub retains backward-compatible handling for an
 /// older wire; raise it (to drop that support) to reject old clients with a clear
 /// "update the push client" message rather than misreading their frames.
-pub const HUB_PROTOCOL_MIN: u32 = 1;
+pub const HUB_PROTOCOL_MIN: u32 = 2;
 
 /// A build must serve the protocol it speaks, else it would 426 its own clients.
 const _: () = assert!(
@@ -174,8 +180,8 @@ const _: () = assert!(
 );
 
 /// Request header carrying [`PROTOCOL_VERSION`] on the `/push` upgrade, alongside
-/// [`KEY_HEADER`]. Absent ⇒ the hub assumes protocol 1 (a client old enough to
-/// omit it predates negotiation but, on a matching id, still speaks the baseline).
+/// [`KEY_HEADER`]. Absent ⇒ the hub assumes protocol 1 (and therefore rejects it
+/// now that [`HUB_PROTOCOL_MIN`] is 2).
 pub const PROTOCOL_HEADER: &str = "x-shellglass-protocol";
 
 /// Response headers on a `426` protocol rejection: the hub's exact version and the
