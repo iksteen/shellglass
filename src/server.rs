@@ -184,22 +184,40 @@ async fn index(
     // The screen starts empty; the renderer paints it from the full frame that
     // heads the SSE stream, one round-trip after load (same as hub-served pages).
     let cfg = render::render_config_json(&state.config, &state.resolver);
+    // Per-response CSP nonce (same scheme as the hub).
+    let nonce = render::nonce();
     // `?embed`: the chrome-less fit-to-frame page (what an <iframe> shows) —
     // the built-in embed template instead of the configured one.
-    let template = if params.contains_key("embed") {
+    let embed = params.contains_key("embed");
+    let template = if embed {
         render::EMBED_TEMPLATE
     } else {
         &state.template
     };
+    // CSP only for a shellglass-owned template — embed, or the baked default when
+    // no custom `template` is configured. A user-supplied template is a designed
+    // feature (it may carry its own un-nonced inline scripts), so it's served
+    // WITHOUT the CSP, matching the hub's rule.
+    let hub_template = embed || state.config.template.is_none();
     // no-cache: the auto-reload path depends on a reload fetching fresh HTML
     // (it carries the fingerprinted /viewer.js?v=… URL and the version pair).
+    use axum::http::{HeaderMap, HeaderValue};
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    if hub_template {
+        headers.insert(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            HeaderValue::try_from(render::csp(&nonce)).expect("CSP is a valid header value"),
+        );
+    }
     (
-        [(CACHE_CONTROL, "no-cache")],
+        headers,
         Html(render::render_page(
             template,
             &state.font_css,
             &state.config,
             &cfg,
+            &nonce,
         )),
     )
         .into_response()

@@ -139,13 +139,19 @@ pub const DEFAULT_RENDER_CFG: &str = r##"{"defFg":"#d0d0d0","defBg":"#000000","f
 /// div, and the updater `<script>`. Tokens: `{{style}}`, `{{screen}}`,
 /// `{{script}}`. The screen starts empty — the renderer paints it from the full
 /// frame that heads every SSE stream, one round-trip after load.
-pub fn page(template: &str, head_css: &str, script: &str) -> String {
-    // `script` already carries its own `<script>` tags (it loads the external
-    // renderer), so inject it raw rather than wrapping it.
+pub fn page(template: &str, head_css: &str, script: &str, nonce: &str) -> String {
+    // `script` already carries its own `<script>` tags (with the real nonce baked
+    // in by `sse_script`), so inject it raw rather than wrapping it.
+    //
+    // ORDER IS A SECURITY PROPERTY: fill the TRUSTED tokens (script, screen,
+    // nonce) first, then insert the untrusted client CSS at `{{style}}` LAST. So a
+    // `{{nonce}}` an attacker hides in the pushed CSS is never substituted, and
+    // any `<script>` it tries to smuggle carries a bogus nonce → refused by CSP.
     template
-        .replace("{{style}}", &format!("<style>\n{head_css}</style>"))
         .replace("{{script}}", script)
         .replace("{{screen}}", "<div id=\"screen\"></div>")
+        .replace("{{nonce}}", nonce)
+        .replace("{{style}}", &format!("<style>\n{head_css}</style>"))
 }
 
 /// The page's updater block: a tiny inline config the renderer reads (the SSE path
@@ -158,24 +164,69 @@ pub fn page(template: &str, head_css: &str, script: &str) -> String {
 /// page's directory-shaped URL (`/` standalone, `/s/<slug>/` on the hub): the
 /// hub may sit behind a reverse proxy that mounts it under a subpath, which
 /// neither it nor the client can know — absolute paths would escape the mount.
-pub fn sse_script(events_path: &str, cfg_json: &str) -> String {
-    let cfg = if cfg_json.is_empty() {
-        "null"
-    } else {
-        cfg_json
-    };
+/// A random per-response CSP nonce (128 bits, base64). Paired with [`csp`] and
+/// the `nonce="…"` attributes [`sse_script`]/[`page`] stamp onto trusted inline
+/// scripts, so an injected `<script>` (which can't guess the nonce) is refused by
+/// the browser — the defense against a client pushing HTML into the page.
+#[must_use]
+pub fn nonce() -> String {
+    use base64::engine::general_purpose::STANDARD_NO_PAD;
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("OS randomness for a CSP nonce");
+    base64::Engine::encode(&STANDARD_NO_PAD, bytes)
+}
+
+/// The viewer page's `Content-Security-Policy` for a given [`nonce`]. Restricts
+/// ONLY scripts — no `default-src`, so styles/fonts/images/SSE are untouched and
+/// the viewer keeps working — but every inline/`src` script must carry the nonce.
+/// That neutralizes any `<script>`/`onerror=` a client smuggles into the pushed
+/// `{{style}}` CSS or elsewhere. Also bars plugin objects and `<base>` hijacking.
+#[must_use]
+pub fn csp(nonce: &str) -> String {
+    format!("script-src 'nonce-{nonce}'; object-src 'none'; base-uri 'none'")
+}
+
+/// Parse client-pushed render-config and re-serialize to canonical JSON, so a
+/// non-JSON payload (e.g. `null};evil()`) can't break out of the object literal
+/// it's embedded in — `null` on garbage. Safe as a JSON *response* (`/config`);
+/// for a `<script>` context use [`cfg_for_script`].
+fn cfg_value(raw: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|v| serde_json::to_string(&v).ok())
+        .unwrap_or_else(|| "null".to_string())
+}
+
+/// [`cfg_value`] plus HTML-`<script>` escaping: `<`/`>`/`&` and the JS line
+/// separators U+2028/U+2029 become `\uXXXX`, so a JSON string value can't carry
+/// `</script>` (or a line-separator) out of the surrounding element.
+fn cfg_for_script(raw: &str) -> String {
+    cfg_value(raw)
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+pub fn sse_script(events_path: &str, cfg_json: &str, nonce: &str) -> String {
+    // `cfg_json` is client-pushed and untrusted — [`cfg_for_script`] parses,
+    // re-serializes, and HTML-escapes it so it can neither break the object
+    // literal nor the <script> element.
+    let cfg = cfg_for_script(cfg_json);
     let events = serde_json::to_string(events_path).unwrap_or_else(|_| "\"events\"".into());
     // The inline classic script runs at parse time (setting the config); the module
     // script is deferred by default and runs after, so the config is ready. viewer.js
     // is an ES module, hence type="module". `proto`/`js` are this binary's wire
     // version and baked-renderer content tag: the SSE stream re-announces both on
     // every (re)connect, and the page reloads itself on mismatch (server upgraded
-    // under a loaded page — new wire format OR just a new viewer.js).
+    // under a loaded page — new wire format OR just a new viewer.js). Both tags
+    // carry the per-response CSP `nonce` (see [`csp`]) so they're allowed to run.
     let proto = crate::diff::PROTO;
     let js = viewer_tag();
     format!(
-        "<script>window.SHELLGLASS={{events:{events},cfg:{cfg},proto:{proto},js:\"{js}\"}};</script>\n\
-         <script type=\"module\" src=\"viewer.js?v={js}\"></script>"
+        "<script nonce=\"{nonce}\">window.SHELLGLASS={{events:{events},cfg:{cfg},proto:{proto},js:\"{js}\"}};</script>\n\
+         <script type=\"module\" nonce=\"{nonce}\" src=\"viewer.js?v={js}\"></script>"
     )
 }
 
@@ -185,11 +236,10 @@ pub fn sse_script(events_path: &str, cfg_json: &str) -> String {
 /// resolves it against the session base. `cfg_json` is [`render_config_json`] or
 /// the client's, relayed by the hub.
 pub fn config_json(events_path: &str, cfg_json: &str) -> String {
-    let cfg = if cfg_json.is_empty() {
-        "null"
-    } else {
-        cfg_json
-    };
+    // Served as application/json (not in a <script>), so no HTML escaping — but
+    // still parse+re-serialize so a garbage push can't make /config emit invalid
+    // JSON that a fetching client fails to parse.
+    let cfg = cfg_value(cfg_json);
     let events = serde_json::to_string(events_path).unwrap_or_else(|_| "\"events\"".into());
     format!(
         "{{\"events\":{events},\"cfg\":{cfg},\"proto\":{proto},\"js\":\"{js}\"}}",
@@ -258,11 +308,18 @@ pub fn render_config_json(config: &Config, resolver: &Resolver) -> String {
 /// Standalone page (local command → local viewer): streams live from `events`
 /// (relative — the page lives at `/`).
 #[cfg(feature = "presentation")]
-pub fn render_page(template: &str, font_css: &str, config: &Config, cfg_json: &str) -> String {
+pub fn render_page(
+    template: &str,
+    font_css: &str,
+    config: &Config,
+    cfg_json: &str,
+    nonce: &str,
+) -> String {
     page(
         template,
         &head_css(font_css, config),
-        &sse_script("events", cfg_json),
+        &sse_script("events", cfg_json, nonce),
+        nonce,
     )
 }
 
@@ -321,13 +378,49 @@ mod tests {
 
     #[test]
     fn page_fills_template_tokens() {
-        let tmpl = "<head>{{style}}</head><body>{{screen}}{{script}}</body>";
-        let html = page(tmpl, "CSS", "<script>JS</script>");
-        assert!(html.contains("<style>\nCSS</style>"), "{html}");
+        let tmpl = "<head>{{style}}</head><body>{{screen}}<script nonce=\"{{nonce}}\">x</script>{{script}}</body>";
+        // The pushed CSS carries a smuggled {{nonce}} token — it must NOT be filled.
+        let html = page(
+            tmpl,
+            "body{}/*{{nonce}}*/",
+            "<script>JS</script>",
+            "NONCE123",
+        );
+        assert!(
+            html.contains("<style>\nbody{}/*{{nonce}}*/</style>"),
+            "{html}"
+        );
         // The screen ships empty — the renderer paints it from the first SSE full.
         assert!(html.contains("<div id=\"screen\"></div>"), "{html}");
         // The script block is injected raw (it carries its own <script> tags).
         assert!(html.contains("<script>JS</script>"), "{html}");
+        // The template's own nonce token is filled with the real nonce...
+        assert!(
+            html.contains("<script nonce=\"NONCE123\">x</script>"),
+            "{html}"
+        );
+        // ...but the token hidden in the untrusted CSS stays literal (style filled
+        // last), so an injected <script> there can't obtain a valid nonce.
+        assert!(
+            html.contains("/*{{nonce}}*/"),
+            "CSS-smuggled nonce token must not be substituted: {html}"
+        );
+    }
+
+    #[test]
+    fn sse_script_neutralizes_pushed_config() {
+        // A non-JSON payload can't break out of the object literal → becomes null.
+        let s = sse_script("events", "null};alert(1);//", "N");
+        assert!(s.contains("cfg:null"), "{s}");
+        assert!(!s.contains("alert(1)"), "config injection leaked: {s}");
+        // A JSON string value containing </script> is escaped, so it can't close
+        // the surrounding <script> element.
+        let s = sse_script("events", "{\"x\":\"</script><script>evil</script>\"}", "N");
+        assert!(!s.contains("<script>evil"), "script breakout leaked: {s}");
+        assert!(s.contains("\\u003c/script"), "expected escaped '<': {s}");
+        // Both script tags carry the CSP nonce.
+        assert!(s.contains("<script nonce=\"N\">"), "{s}");
+        assert!(s.contains("nonce=\"N\" src=\"viewer.js"), "{s}");
     }
 
     #[test]

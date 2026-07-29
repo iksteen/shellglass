@@ -1823,6 +1823,9 @@ async fn view(
     // applies, so an embed's look is predictable for host pages; the pushed
     // CSS/fonts/render config still do (correctness, not chrome).
     let embed = params.contains_key("embed");
+    // Per-response CSP nonce: the only <script>s that run are the ones the hub
+    // stamps it onto, so nothing a client pushes into the page can execute.
+    let nonce = render::nonce();
     let id = st.id_of_view(&slug);
     let map = st.sessions.lock().unwrap();
     let Some(s) = id.and_then(|id| map.get(&id)) else {
@@ -1837,15 +1840,17 @@ async fn view(
         // The extra observer reloads the page the moment the operator comes
         // online: the reload then fetches the REAL page (pushed CSS + fonts),
         // which this placeholder cannot render.
+        let sse = render::sse_script("events", render::DEFAULT_RENDER_CFG, &nonce);
         let script = format!(
-            "{}\n<script>new MutationObserver(() => {{\n\
+            "{sse}\n<script nonce=\"{nonce}\">new MutationObserver(() => {{\n\
              const s = document.body.dataset.offline;\n\
              if (s === undefined || s === \"\") location.reload();\n\
-             }}).observe(document.body, {{ attributes: true, attributeFilter: [\"data-offline\"] }});</script>",
-            render::sse_script("events", render::DEFAULT_RENDER_CFG)
+             }}).observe(document.body, {{ attributes: true, attributeFilter: [\"data-offline\"] }});</script>"
         );
+        // Stub always serves a hub-owned template (embed or default), so it's
+        // CSP-locked regardless of --force-template.
         return (
-            [(CACHE_CONTROL, "no-cache")],
+            view_headers(Some(&nonce)),
             Html(render::page(
                 if embed {
                     render::EMBED_TEMPLATE
@@ -1854,14 +1859,20 @@ async fn view(
                 },
                 &render::default_head_css(),
                 &script,
+                &nonce,
             )),
         )
             .into_response();
     }
-    let script = render::sse_script("events", &s.render_cfg);
+    let script = render::sse_script("events", &s.render_cfg, &nonce);
     // Chrome selection. Embed → always the built-in embed template. Otherwise the
     // hub's own default template when forced (`--force-template`) or when the
     // pusher pushed none (empty = older client); else the pusher's template.
+    // `hub_template` also gates the CSP: a pusher-supplied template is a DESIGNED,
+    // trusted feature and is served WITHOUT the injection-proof CSP (it may carry
+    // its own un-nonced inline scripts); only a hub-owned template is locked down,
+    // which is exactly what `--force-template` buys.
+    let hub_template = embed || st.force_template || s.template.is_empty();
     let template: &str = if embed {
         render::EMBED_TEMPLATE
     } else if st.force_template || s.template.is_empty() {
@@ -1873,10 +1884,30 @@ async fn view(
     // renders nothing itself). no-cache: the auto-reload path depends on a reload
     // fetching fresh HTML (fingerprinted /viewer.js?v=… URL + the version pair).
     (
-        [(CACHE_CONTROL, "no-cache")],
-        Html(render::page(template, &s.css, &script)),
+        view_headers(hub_template.then_some(nonce.as_str())),
+        Html(render::page(template, &s.css, &script, &nonce)),
     )
         .into_response()
+}
+
+/// Response headers for a viewer page: always `no-cache`; and, when a `nonce` is
+/// given, the Content-Security-Policy that only lets scripts carrying it run (see
+/// [`render::csp`]). The nonce is passed ONLY for a hub-owned template
+/// (`--force-template`, embed, or the empty-pushed fallback) — a pusher-supplied
+/// template is a designed, trusted feature and is served without the CSP so its
+/// own inline scripts keep working. So `--force-template` is what makes a viewer
+/// page injection-proof; the default (pusher template) path is trusted by design.
+fn view_headers(csp_nonce: Option<&str>) -> HeaderMap {
+    use axum::http::HeaderValue;
+    let mut h = HeaderMap::new();
+    h.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    if let Some(nonce) = csp_nonce {
+        h.insert(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            HeaderValue::try_from(render::csp(nonce)).expect("CSP is a valid header value"),
+        );
+    }
+    h
 }
 
 async fn events(State(st): State<HubState>, Path(slug): Path<String>) -> Response {

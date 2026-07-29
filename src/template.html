@@ -161,7 +161,7 @@ body[data-offline="operator"] .offline .off-op { display:block; }
   <span>Live over SSE — <a href="https://github.com/iksteen/shellglass">shellglass</a>.</span>
   <span class="stats" id="sg-stats"></span>
 </footer>
-<script>
+<script nonce="{{nonce}}">
 // Fit + zoom + pan. The terminal is scaled with `transform: scale` — paint-time,
 // so mobile WebKit's text autosizer never sees a tiny effective font size (see
 // the .fitbox comment; CSS `zoom` here warped every phone view of a wide
