@@ -306,6 +306,11 @@ impl RecordingsArgs {
 
 /// Each variant is one self-contained mode; clap only accepts the flags that belong
 /// to the chosen subcommand, so incompatible options can't be combined by construction.
+// The per-mode args structs are large (many clap fields, and `PathBuf` is bigger on
+// Windows — where this lint fires but not on Unix). This enum is parsed once at
+// startup and matched immediately, so the inter-variant size gap is irrelevant;
+// boxing a variant would only shift the disparity to the next-largest one.
+#[allow(clippy::large_enum_variant)]
 #[derive(clap::Subcommand, Debug)]
 enum Action {
     /// Generate a secure random secret key, print it with its session id, and exit.
