@@ -170,6 +170,31 @@ pub fn start(command: &[String], sixel_compat: bool) -> Result<SourceSession> {
     };
     // Intercept sixel if the terminal renders it natively OR we're transcoding it.
     let intercept = (caps.kitty, iterm, caps.sixel || transcode.is_some());
+    caps_debug(&format!(
+        "owner=terminal TERM={:?} TERM_PROGRAM={:?} iterm_supported={iterm}",
+        std::env::var("TERM").unwrap_or_default(),
+        std::env::var("TERM_PROGRAM").unwrap_or_default(),
+    ));
+    caps_debug(&format!(
+        "decision: sixel_compat={sixel_compat} transcode={transcode:?} \
+         intercept=(kitty={}, iterm={}, sixel={})",
+        intercept.0, intercept.1, intercept.2
+    ));
+    if transcode.is_some() {
+        caps_debug(
+            "NOTE: transcode is ON — the terminal receives the RE-ENCODED image, \
+             never the original sixel. If it renders nothing while the web mirror \
+             shows the image, this target is wrong for the terminal (TERM_PROGRAM \
+             is inherited, not queried — tmux does not update it per client).",
+        );
+    } else if sixel_compat && caps.sixel {
+        caps_debug("NOTE: --sixel-compat is a no-op here: the terminal does sixel natively.");
+    } else if sixel_compat {
+        caps_debug(
+            "NOTE: --sixel-compat requested but NO transcode target: the terminal \
+             advertises neither kitty nor iTerm2, so sixel is passed through raw.",
+        );
+    }
     // Clear the local terminal so the mirrored session starts from a blank screen,
     // matching the fresh (blank) parser that viewers see (also wipes any handshake
     // reply artifacts).
@@ -1058,6 +1083,17 @@ impl ImagePipe {
         ready: mpsc::Sender<M>,
         wrap: fn(std::num::NonZeroU32, String, crate::model::ImageBlob) -> M,
     ) -> ImagePipe {
+        caps_debug(&format!(
+            "owner=detached (no terminal to probe) intercept=(kitty=true, iterm=true, \
+             sixel=true) transcode=None cell={DEFAULT_CELL_PX:?}"
+        ));
+        caps_debug(
+            "NOTE: every protocol is intercepted for the mirror and the tee forwards \
+             the ORIGINAL bytes, so an attached terminal sees exactly what the app \
+             emitted. It renders that only if it supports the protocol itself — \
+             --sixel-compat does NOT apply to --detachable (it is wired to \
+             pty::start, which this owner does not use).",
+        );
         Self::new((true, true, true), None, DEFAULT_CELL_PX, ready, wrap)
     }
 
@@ -1461,6 +1497,53 @@ fn da_seen(buf: &[u8]) -> bool {
 }
 
 /// Interpret the collected handshake replies.
+/// Append a line to the capability report when `SG_CAPS_DEBUG` is set: a file
+/// path, or `-`/`1`/`stderr` for stderr.
+///
+/// A PATH is the reliable choice for the terminal owner — it clears the screen and
+/// enters raw mode immediately after probing, so anything on stderr is wiped a
+/// few milliseconds later. Under `--daemon` there is no terminal at all and
+/// stderr is already the log file.
+///
+/// Never panics and never blocks the session: a bad path is silently dropped,
+/// because a debugging aid must not be able to take the mirror down.
+pub(crate) fn caps_debug(line: &str) {
+    let Ok(target) = std::env::var("SG_CAPS_DEBUG") else {
+        return;
+    };
+    if target.is_empty() {
+        return;
+    }
+    let line = format!("[shellglass:caps pid={}] {line}\n", std::process::id());
+    match target.as_str() {
+        "-" | "1" | "stderr" => {
+            let _ = std::io::stderr().write_all(line.as_bytes());
+        }
+        path => {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
+    }
+}
+
+/// Raw terminal bytes rendered printable for the capability report — the reply is
+/// mostly escape sequences, and the whole point is to see them exactly.
+pub(crate) fn escape_bytes(b: &[u8]) -> String {
+    b.iter()
+        .map(|&c| match c {
+            0x1b => "\\e".to_string(),
+            b'\\' => "\\\\".to_string(),
+            0x20..=0x7e => (c as char).to_string(),
+            _ => format!("\\x{c:02x}"),
+        })
+        .collect()
+}
+
 fn parse_caps(buf: &[u8]) -> Caps {
     // Reuse the terminal parser's OSC-color grammar rather than maintaining a
     // second parser here. Everything else in the reply stream is non-visual;
@@ -1468,12 +1551,32 @@ fn parse_caps(buf: &[u8]) -> Caps {
     // the two defaults we read.
     let mut colors = vt100::Parser::new(1, 1, 0);
     colors.process(buf);
-    Caps {
+    let caps = Caps {
         kitty: kitty_ok(buf),
         sixel: da_sixel(buf),
         default_fg: colors.screen().default_fg(),
         default_bg: colors.screen().default_bg(),
+    };
+    caps_debug(&format!(
+        "probe reply ({} bytes): {:?}",
+        buf.len(),
+        escape_bytes(buf)
+    ));
+    caps_debug(&format!(
+        "parsed: kitty={} sixel={} default_fg={:?} default_bg={:?} (da_seen={})",
+        caps.kitty,
+        caps.sixel,
+        caps.default_fg,
+        caps.default_bg,
+        da_seen(buf)
+    ));
+    if buf.is_empty() {
+        caps_debug(
+            "NOTE: terminal answered nothing — not a tty, or it never replied to \
+             Primary DA within 2s. All protocols read as unsupported.",
+        );
     }
+    caps
 }
 
 /// A kitty graphics APC reply (`ESC _ G … ; OK … ST`) confirms support.

@@ -332,6 +332,21 @@ small `TERM_PROGRAM` allowlist — and intercepts only those. A protocol your
 terminal doesn't render passes through untouched, so no image appears on the web
 that didn't appear in the terminal, and none is lost that did.
 
+Detachable sessions are the one exception, because they own no terminal to ask —
+see [Detachable sessions](#detachable-sessions).
+
+If an image reaches the web mirror but not your terminal (or the other way
+round), set `SG_CAPS_DEBUG` to a file path and start the session: shellglass
+appends the raw handshake reply, the capabilities it parsed out of it, and the
+interception decision it made. Use a path rather than `stderr` — the terminal
+owner clears the screen right after probing, so stderr is wiped a few
+milliseconds later.
+
+```sh
+SG_CAPS_DEBUG=/tmp/caps.log shellglass serve -- some-command
+cat /tmp/caps.log
+```
+
 Images behave like they do in a cell-based terminal: they scroll with the text,
 clip against the top edge on the way out, and disappear when the screen region
 they occupy is cleared or overwritten. Hub mode included — late-joining viewers
