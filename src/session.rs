@@ -51,7 +51,7 @@ const DETACH_KEY: u8 = 0x1c;
 const C_INPUT: u8 = 0; //   raw input bytes
 const C_RESIZE: u8 = 1; //  {cols:u16 BE, rows:u16 BE}
 const C_DETACH: u8 = 2; //  user detached (Ctrl-\)
-const C_HELLO: u8 = 3; //   first frame: {force:u8}
+const C_HELLO: u8 = 3; //   first frame: {force:u8} + optional ClientCaps (see below)
 // owner -> client:
 const S_DATA: u8 = 0; //    screen bytes (write verbatim to stdout)
 const S_ACCEPTED: u8 = 1; //attach granted; streaming follows
@@ -106,6 +106,65 @@ impl ClientSink {
     }
 }
 
+/// What an attaching client's terminal can render, probed by the CLIENT (it is
+/// the one holding a real terminal) and sent in its hello frame.
+///
+/// The owner caches the most recent set and keeps it after a detach, so a session
+/// left unattended stays configured for the terminal most likely to come back.
+/// A client that sends no capabilities (an older `attach`) reads as "nothing
+/// supported", which disables the transcode rather than guessing.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct ClientCaps {
+    kitty: bool,
+    sixel: bool,
+    iterm: bool,
+    /// Pixel size of one cell, for sizing images with no app-given cell hint.
+    cell: (u16, u16),
+}
+
+impl ClientCaps {
+    /// Probe the terminal this process is attached to. Must run before raw mode
+    /// and before stdin starts being forwarded, so the replies are consumed here
+    /// instead of reaching the session as typed input.
+    fn probe() -> ClientCaps {
+        let caps = crate::pty::probe_caps();
+        ClientCaps {
+            kitty: caps.kitty,
+            sixel: caps.sixel,
+            // TERM_PROGRAM read HERE, in the client's own environment: the session
+            // owner may be a daemon started long ago under a different terminal.
+            iterm: crate::pty::iterm_supported(),
+            cell: crate::pty::cell_px(),
+        }
+    }
+
+    /// Wire form appended to the hello frame: flags byte + cell size.
+    fn encode(self) -> [u8; 5] {
+        let flags =
+            u8::from(self.kitty) | (u8::from(self.sixel) << 1) | (u8::from(self.iterm) << 2);
+        let [cw0, cw1] = self.cell.0.to_be_bytes();
+        let [ch0, ch1] = self.cell.1.to_be_bytes();
+        [flags, cw0, cw1, ch0, ch1]
+    }
+
+    /// Parse the capability tail of a hello payload. Absent or short (a client
+    /// from before this existed) ⇒ defaults, i.e. no transcode.
+    fn decode(tail: &[u8]) -> ClientCaps {
+        if tail.len() < 5 {
+            return ClientCaps::default();
+        }
+        ClientCaps {
+            kitty: tail[0] & 1 != 0,
+            sixel: tail[0] & 2 != 0,
+            iterm: tail[0] & 4 != 0,
+            cell: (
+                u16::from_be_bytes([tail[1], tail[2]]).max(1),
+                u16::from_be_bytes([tail[3], tail[4]]).max(1),
+            ),
+        }
+    }
+}
+
 /// Messages into the single core thread (owns the [`ScreenState`]).
 enum Core {
     Data(Vec<u8>),
@@ -126,6 +185,7 @@ enum Core {
         force: bool,
         cols: u16,
         rows: u16,
+        caps: ClientCaps,
         sink: ClientSink,
         reply: mpsc::Sender<bool>,
     },
@@ -232,6 +292,7 @@ pub fn start_detached(
     command: &[String],
     socket: &Path,
     size: (u16, u16),
+    sixel_compat: bool,
 ) -> Result<SourceSession> {
     let (cols, rows) = size;
     let pair = native_pty_system()
@@ -370,6 +431,7 @@ pub fn start_detached(
                 frame_tx,
                 ScreenState::new(rows, cols),
                 socket,
+                sixel_compat,
             );
         });
     }
@@ -411,10 +473,14 @@ fn handle_client(
     let _ = sink_stream.set_write_timeout(Some(Duration::from_secs(1)));
     let mut read_half = stream;
 
-    // First frame: hello (carries the --force flag). Tolerate its absence.
-    let force = match read_frame(&mut read_half) {
-        Ok((C_HELLO, p)) => p.first().copied().unwrap_or(0) != 0,
-        Ok(_) => false,
+    // First frame: hello (--force flag, then the client's terminal capabilities).
+    // Tolerate its absence, and an older client that sends only the flag.
+    let (force, caps) = match read_frame(&mut read_half) {
+        Ok((C_HELLO, p)) => (
+            p.first().copied().unwrap_or(0) != 0,
+            ClientCaps::decode(p.get(1..).unwrap_or(&[])),
+        ),
+        Ok(_) => (false, ClientCaps::default()),
         Err(_) => return,
     };
     // Second frame: the initial terminal size.
@@ -435,6 +501,7 @@ fn handle_client(
             force,
             cols,
             rows,
+            caps,
             sink: ClientSink {
                 stream: sink_stream,
             },
@@ -477,6 +544,7 @@ fn core_thread(
     frame_tx: watch::Sender<Arc<Frame>>,
     mut screen: ScreenState,
     socket: PathBuf,
+    sixel_compat: bool,
 ) {
     let mut client: Option<(u64, ClientSink)> = None;
     // No terminal was probed (there is none), so every image protocol is
@@ -487,6 +555,10 @@ fn core_thread(
         hash,
         blob,
     });
+    // The capabilities of the most recently attached client's terminal, kept
+    // across detaches so an unattended session stays configured for the terminal
+    // most likely to come back.
+    let mut client_caps = ClientCaps::default();
 
     loop {
         let msg = match screen.wait() {
@@ -530,6 +602,7 @@ fn core_thread(
                 force,
                 cols,
                 rows,
+                caps,
                 mut sink,
                 reply,
             }) => {
@@ -546,6 +619,19 @@ fn core_thread(
                     // GRANTED — a rejected attach must never resize the session.
                     let _ = pty_tx.send(PtyCmd::Resize(rows, cols));
                     screen.set_size(rows, cols);
+                    // Retarget the transcode at THIS client's terminal. Cached
+                    // until another client attaches; a detach keeps it, like size.
+                    if caps != client_caps {
+                        client_caps = caps;
+                        pipe.retarget(
+                            crate::pty::transcode_target(
+                                crate::pty::Caps::graphics(caps.kitty, caps.sixel),
+                                caps.iterm,
+                                sixel_compat,
+                            ),
+                            caps.cell,
+                        );
+                    }
                     let _ = sink.send_accepted();
                     let _ = sink.send_data(&screen.repaint());
                     client = Some((cid, sink));
@@ -609,8 +695,15 @@ pub fn attach(socket: &Path, force: bool) -> Result<()> {
         .with_context(|| format!("connecting to session socket {}", socket.display()))?;
     let mut writer = stream.try_clone().context("cloning socket")?;
 
+    // Probe our own terminal BEFORE raw mode and before stdin is forwarded, so the
+    // replies land here and not in the session as typed input. The owner has no
+    // terminal of its own, so this is the only place the answer can come from.
+    let caps = ClientCaps::probe();
+
     // Handshake BEFORE touching the terminal, so a rejection prints cleanly.
-    write_frame(&mut writer, C_HELLO, &[force as u8]).context("sending hello")?;
+    let mut hello = vec![force as u8];
+    hello.extend_from_slice(&caps.encode());
+    write_frame(&mut writer, C_HELLO, &hello).context("sending hello")?;
     let (cols, rows) = term_size().unwrap_or((80, 24));
     send_resize(&mut writer, cols, rows).context("sending initial size")?;
 
@@ -737,6 +830,16 @@ mod tests {
     /// Send one AttachRequest to a running core, returning our end of the
     /// client socket and the core's accept/reject verdict.
     fn attach_request(core_tx: &mpsc::Sender<Core>, cid: u64, force: bool) -> (UnixStream, bool) {
+        attach_request_caps(core_tx, cid, force, ClientCaps::default())
+    }
+
+    /// Attach with explicit client capabilities.
+    fn attach_request_caps(
+        core_tx: &mpsc::Sender<Core>,
+        cid: u64,
+        force: bool,
+        caps: ClientCaps,
+    ) -> (UnixStream, bool) {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let (reply_tx, reply_rx) = mpsc::channel();
         core_tx
@@ -745,6 +848,7 @@ mod tests {
                 force,
                 cols: 100,
                 rows: 30,
+                caps,
                 sink: ClientSink { stream: theirs },
                 reply: reply_tx,
             })
@@ -768,6 +872,7 @@ mod tests {
                 frame_tx,
                 ScreenState::new(24, 80),
                 sock,
+                false,
             );
         });
 
@@ -822,6 +927,18 @@ mod tests {
         mpsc::Receiver<PtyCmd>,
         watch::Receiver<Arc<Frame>>,
     ) {
+        spawn_core_compat(tag, false)
+    }
+
+    /// Spawn a core thread with an explicit `--sixel-compat` setting.
+    fn spawn_core_compat(
+        tag: &str,
+        sixel_compat: bool,
+    ) -> (
+        mpsc::Sender<Core>,
+        mpsc::Receiver<PtyCmd>,
+        watch::Receiver<Arc<Frame>>,
+    ) {
         let (core_tx, core_rx) = mpsc::channel();
         let (pty_tx, pty_rx) = mpsc::channel();
         let (frame_tx, frame_rx) = watch::channel(ScreenState::blank_frame(24, 80));
@@ -836,6 +953,7 @@ mod tests {
                 frame_tx,
                 ScreenState::new(24, 80),
                 sock,
+                sixel_compat,
             );
         });
         (core_tx, pty_rx, frame_rx)
@@ -919,6 +1037,139 @@ mod tests {
         // And the decoded payload lands in the mirror.
         let images = wait_for_images(&frame_rx, 1);
         assert!(!images[0].hash.is_empty());
+    }
+
+    /// The hello frame carries the client's capabilities, and an older client that
+    /// sends only the force flag still parses — as "nothing supported", which
+    /// disables the transcode rather than guessing at a terminal we can't see.
+    #[test]
+    fn client_caps_round_trip_and_tolerate_legacy_hello() {
+        let caps = ClientCaps {
+            kitty: true,
+            sixel: false,
+            iterm: true,
+            cell: (9, 19),
+        };
+        assert_eq!(ClientCaps::decode(&caps.encode()), caps);
+
+        // A hello with no capability tail (pre-capability `attach`).
+        assert_eq!(ClientCaps::decode(&[]), ClientCaps::default());
+        assert_eq!(ClientCaps::decode(&[0b101]), ClientCaps::default());
+        assert!(!ClientCaps::default().kitty);
+    }
+
+    /// A sixel-less, kitty-capable client must flip the transcode on: this is the
+    /// path that makes `--sixel-compat` mean something in detachable mode, where
+    /// the owner has no terminal of its own to probe.
+    #[test]
+    fn attaching_client_retargets_the_transcode() {
+        let (core_tx, _pty_rx, frame_rx) = spawn_core_compat("retarget", true);
+
+        let kitty_client = ClientCaps {
+            kitty: true,
+            sixel: false,
+            iterm: false,
+            cell: (10, 20),
+        };
+        let (mut c, ok) = attach_request_caps(&core_tx, 1, false, kitty_client);
+        assert!(ok);
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(read_frame(&mut c).unwrap().0, S_ACCEPTED);
+        assert_eq!(read_frame(&mut c).unwrap().0, S_DATA); // repaint
+
+        let sixel: &[u8] = b"\x1bPq\"1;1;4;2#0;2;100;0;0#0~~~~$-\x1b\\";
+        core_tx.send(Core::Data(sixel.to_vec())).unwrap();
+
+        // The terminal must NOT get raw sixel now — it gets kitty instead.
+        let (tag, payload) = read_frame(&mut c).unwrap();
+        assert_eq!(tag, S_DATA);
+        assert_ne!(
+            payload, sixel,
+            "raw sixel must not reach a sixel-less terminal"
+        );
+        assert!(
+            payload.windows(3).any(|w| w == b"\x1b_G"),
+            "expected a kitty transmission, got {:?}",
+            String::from_utf8_lossy(&payload)
+        );
+
+        // And the mirror still gets the image, as always.
+        assert!(!wait_for_images(&frame_rx, 1)[0].hash.is_empty());
+    }
+
+    /// Capabilities are CACHED from the attached client and REPLACED when another
+    /// attaches: a kitty-only terminal gets the transcode, and a sixel-native one
+    /// taking over with --force turns it back off and receives raw sixel.
+    #[test]
+    fn new_client_replaces_the_cached_capabilities() {
+        let (core_tx, _pty_rx, _frame_rx) = spawn_core_compat("recap", true);
+        let sixel: &[u8] = b"\x1bPq\"1;1;4;2#0;2;100;0;0#0~~~~$-\x1b\\";
+
+        // First client: kitty only -> sixel is transcoded away.
+        let (mut a, ok) = attach_request_caps(
+            &core_tx,
+            1,
+            false,
+            ClientCaps {
+                kitty: true,
+                sixel: false,
+                iterm: false,
+                cell: (10, 20),
+            },
+        );
+        assert!(ok);
+        a.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(read_frame(&mut a).unwrap().0, S_ACCEPTED);
+        assert_eq!(read_frame(&mut a).unwrap().0, S_DATA);
+        core_tx.send(Core::Data(sixel.to_vec())).unwrap();
+        assert_ne!(read_frame(&mut a).unwrap().1, sixel);
+
+        // Second client takes over: sixel-native, so the transcode must switch off.
+        let (mut b, ok) = attach_request_caps(
+            &core_tx,
+            2,
+            true,
+            ClientCaps {
+                kitty: false,
+                sixel: true,
+                iterm: false,
+                cell: (8, 16),
+            },
+        );
+        assert!(ok);
+        b.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(read_frame(&mut b).unwrap().0, S_ACCEPTED);
+        assert_eq!(read_frame(&mut b).unwrap().0, S_DATA); // repaint
+
+        core_tx.send(Core::Data(sixel.to_vec())).unwrap();
+        assert_eq!(
+            read_frame(&mut b).unwrap().1,
+            sixel,
+            "a sixel-native client must get the original sixel"
+        );
+    }
+
+    /// Without --sixel-compat the transcode stays off even for a kitty client:
+    /// the experimental path must remain opt-in, exactly as in the local mirror.
+    #[test]
+    fn retarget_respects_the_opt_in_flag() {
+        let (core_tx, _pty_rx, _frame_rx) = spawn_core_compat("noflag", false);
+        let kitty_client = ClientCaps {
+            kitty: true,
+            sixel: false,
+            iterm: false,
+            cell: (10, 20),
+        };
+        let (mut c, ok) = attach_request_caps(&core_tx, 1, false, kitty_client);
+        assert!(ok);
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(read_frame(&mut c).unwrap().0, S_ACCEPTED);
+        assert_eq!(read_frame(&mut c).unwrap().0, S_DATA);
+
+        let sixel: &[u8] = b"\x1bPq\"1;1;4;2#0;2;100;0;0#0~~~~$-\x1b\\";
+        core_tx.send(Core::Data(sixel.to_vec())).unwrap();
+        let (_, payload) = read_frame(&mut c).unwrap();
+        assert_eq!(payload, sixel, "flag off ⇒ sixel passes through verbatim");
     }
 
     /// The kitty file/shm exfiltration guard now covers attached clients too: a

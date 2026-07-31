@@ -828,23 +828,17 @@ impl PushArgs {
                 Some(sock) => sock,
                 None => crate::session::default_socket_path(&proto::session_id(&self.key.key)),
             };
-            // The detachable owner runs its own source (session::start_detached),
-            // not pty::start, so the transcode flag never reaches it. Say so
-            // rather than dropping it silently: the symptom otherwise is an image
-            // that mirrors to the web but stays invisible in the terminal.
-            if self.source.sixel_compat {
-                eprintln!(
-                    "shellglass: warning: --sixel-compat has no effect with --detachable; \
-                     sixel is mirrored to the web, but an attached terminal receives the \
-                     original sixel and renders it only if it supports sixel itself"
-                );
-            }
             println!("shellglass: detached session on {}", sock.display());
             println!(
                 "shellglass: attach with `shellglass attach {}`",
                 sock.display()
             );
-            Some((self.source.command(), sock, parse_size(&self.size)?))
+            Some((
+                self.source.command(),
+                sock,
+                parse_size(&self.size)?,
+                self.source.sixel_compat,
+            ))
         } else {
             None
         };
@@ -856,8 +850,8 @@ impl PushArgs {
         options.no_record = self.no_record;
         let source: SourceFactory = {
             #[cfg(unix)]
-            if let Some((cmd, sock, size)) = detached {
-                Box::new(move || crate::session::start_detached(&cmd, &sock, size))
+            if let Some((cmd, sock, size, sixel_compat)) = detached {
+                Box::new(move || crate::session::start_detached(&cmd, &sock, size, sixel_compat))
             } else {
                 Box::new(move || self.source.start())
             }

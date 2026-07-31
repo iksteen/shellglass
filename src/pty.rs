@@ -154,20 +154,7 @@ pub fn start(command: &[String], sixel_compat: bool) -> Result<SourceSession> {
     // tab-completion suggestion.
     let caps = probe_caps();
     let iterm = iterm_supported();
-    // EXPERIMENTAL (opt-in via --sixel-compat): terminal renders kitty/iTerm2
-    // graphics but NOT sixel → transcode sixel into that protocol so sixel-emitting
-    // tools (esp. through tmux, which carries sixel in its grid model) show up
-    // locally and mirror to the web. When sixel is native, or the flag is off,
-    // `transcode` is None and the fast raw path is kept untouched.
-    let transcode = if !sixel_compat || caps.sixel {
-        None
-    } else if caps.kitty {
-        Some(crate::images::GfxProto::Kitty)
-    } else if iterm {
-        Some(crate::images::GfxProto::Iterm)
-    } else {
-        None
-    };
+    let transcode = transcode_target(caps, iterm, sixel_compat);
     // Intercept sixel if the terminal renders it natively OR we're transcoding it.
     let intercept = (caps.kitty, iterm, caps.sixel || transcode.is_some());
     caps_debug(&format!(
@@ -1088,13 +1075,30 @@ impl ImagePipe {
              sixel=true) transcode=None cell={DEFAULT_CELL_PX:?}"
         ));
         caps_debug(
-            "NOTE: every protocol is intercepted for the mirror and the tee forwards \
-             the ORIGINAL bytes, so an attached terminal sees exactly what the app \
-             emitted. It renders that only if it supports the protocol itself — \
-             --sixel-compat does NOT apply to --detachable (it is wired to \
-             pty::start, which this owner does not use).",
+            "NOTE: every protocol is intercepted for the mirror; the tee forwards the \
+             ORIGINAL bytes, so an attached terminal sees what the app emitted and \
+             renders it if it supports that protocol. The transcode target is not \
+             known yet — it is set from the capabilities each attaching client \
+             probes on its own terminal (look for a later 'retarget:' line).",
         );
         Self::new((true, true, true), None, DEFAULT_CELL_PX, ready, wrap)
+    }
+
+    /// Point the transcode at a newly attached client's terminal. Its capabilities
+    /// are cached until another client attaches (a detach keeps them, exactly like
+    /// the last attached size), so an unattended session keeps behaving the way the
+    /// terminal that will most likely come back expects.
+    #[cfg(all(feature = "push", unix))]
+    pub(crate) fn retarget(
+        &mut self,
+        transcode: Option<crate::images::GfxProto>,
+        cell: (u16, u16),
+    ) {
+        caps_debug(&format!(
+            "retarget: transcode={transcode:?} cell={cell:?} (attached client's terminal)"
+        ));
+        self.cell = cell;
+        self.interceptor.retarget(transcode, cell);
     }
 
     /// Route one PTY read: split it into [`Step`]s, tee what the terminal should
@@ -1346,14 +1350,69 @@ fn term_geom() -> Option<TermGeom> {
     None
 }
 
+impl Caps {
+    /// Graphics support only, with the terminal's default colors left unknown —
+    /// what a remote client can tell us about its own terminal.
+    #[cfg(all(feature = "push", unix))]
+    pub(crate) fn graphics(kitty: bool, sixel: bool) -> Caps {
+        Caps {
+            kitty,
+            sixel,
+            ..Caps::default()
+        }
+    }
+}
+
+/// EXPERIMENTAL (opt-in via `--sixel-compat`): which protocol to transcode sixel
+/// INTO for a terminal that renders kitty/iTerm2 but not sixel, so sixel-emitting
+/// tools (esp. through tmux, which carries sixel in its grid model) show up
+/// locally and mirror to the web. `None` = sixel is native, or the flag is off,
+/// or there is nothing to transcode into — the fast raw path is kept untouched.
+///
+/// Shared by both owners so the rule cannot drift: the terminal owner resolves it
+/// once from its own probe, the detachable owner re-resolves it per attaching
+/// client (each client brings its own terminal).
+pub(crate) fn transcode_target(
+    caps: Caps,
+    iterm: bool,
+    sixel_compat: bool,
+) -> Option<crate::images::GfxProto> {
+    if !sixel_compat || caps.sixel {
+        None
+    } else if caps.kitty {
+        Some(crate::images::GfxProto::Kitty)
+    } else if iterm {
+        Some(crate::images::GfxProto::Iterm)
+    } else {
+        None
+    }
+}
+
+/// Pixel size of one cell on our controlling terminal, for sizing images the app
+/// gave no cell hint for. Falls back to a typical console cell when the terminal
+/// reports no pixel dimensions.
+///
+/// The terminal owner derives this from the geometry it already queried; this is
+/// for the `attach` client, which reports its own terminal's cell size to a
+/// detached session that has none.
+#[cfg(all(feature = "push", unix))]
+pub(crate) fn cell_px() -> (u16, u16) {
+    term_geom().map_or(FALLBACK_CELL, |g| {
+        (
+            (g.px_w / g.cols.max(1)).max(1),
+            (g.px_h / g.rows.max(1)).max(1),
+        )
+    })
+}
+
 /// Graphics-protocol support the controlling terminal advertises, learned from a
 /// capability handshake rather than a `TERM` signature.
 #[derive(Clone, Copy, Default)]
-struct Caps {
+pub(crate) struct Caps {
     /// Kitty graphics — the `a=q` query drew an `OK` response.
-    kitty: bool,
+    pub(crate) kitty: bool,
     /// Sixel — Primary DA listed feature `4`.
-    sixel: bool,
+    pub(crate) sixel: bool,
     /// The outer terminal's active default foreground/background (OSC 10/11).
     default_fg: Option<(u8, u8, u8)>,
     default_bg: Option<(u8, u8, u8)>,
@@ -1370,7 +1429,7 @@ const CAP_QUERY: &[u8] =
 /// tty or the terminal stays silent. Must run before the stdin→PTY bridge starts,
 /// so the replies are consumed here and not forwarded to the child.
 #[cfg(unix)]
-fn probe_caps() -> Caps {
+pub(crate) fn probe_caps() -> Caps {
     use rustix::termios::{OptionalActions, SpecialCodeIndex, tcgetattr, tcsetattr};
     use std::os::fd::AsFd;
     let stdin = std::io::stdin();
@@ -1484,7 +1543,7 @@ fn probe_caps() -> Caps {
 /// can only detect by a `TERM_PROGRAM` signature — a deliberate, documented
 /// exception to the query-don't-sniff rule.
 // ponytail: extend the list as other terminals adopt the iTerm2 protocol.
-fn iterm_supported() -> bool {
+pub(crate) fn iterm_supported() -> bool {
     matches!(
         std::env::var("TERM_PROGRAM").as_deref(),
         Ok("iTerm.app" | "WezTerm" | "vscode" | "mintty" | "Hyper" | "rio")

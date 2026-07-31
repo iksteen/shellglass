@@ -269,6 +269,15 @@ impl SixelCache {
     /// Cap the retained PNGs; a scrolling session usually holds just the one image.
     const CAP: usize = 32 << 20;
 
+    /// Forget every memoized transcode. Used when the target terminal changes:
+    /// the cached kitty ids were transmitted to the OLD terminal, so reusing them
+    /// would place a placeholder for image data the new one never received.
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+        self.total = 0;
+    }
+
     fn get(&self, hash: &u64) -> Option<&CachedSixel> {
         self.map.get(hash)
     }
@@ -382,6 +391,24 @@ impl Interceptor {
             cell,
             ..Default::default()
         }
+    }
+
+    /// Point the EXPERIMENTAL sixel transcode at a different protocol and cell
+    /// size — for an owner whose terminal can CHANGE (the detachable session,
+    /// where each attaching client brings its own capabilities).
+    ///
+    /// Clearing `sixel_cache` is the load-bearing part: it memoizes "this sixel
+    /// was already transmitted as kitty image id N", and re-emissions send only
+    /// the placeholder. Those ids live in the OLD terminal. Carrying them over
+    /// would place a placeholder in the new one for image data it never received
+    /// — an empty box instead of a picture.
+    pub fn retarget(&mut self, transcode: Option<GfxProto>, cell: (u16, u16)) {
+        if self.transcode == transcode && self.cell == cell {
+            return; // same terminal shape: keep the cache, it is still valid
+        }
+        self.transcode = transcode;
+        self.cell = cell;
+        self.sixel_cache.clear();
     }
 
     /// True if `s` is a nonempty proper prefix of an *enabled* start marker — a

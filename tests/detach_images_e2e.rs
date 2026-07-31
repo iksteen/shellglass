@@ -22,7 +22,7 @@ fn detached_pty_mirrors_a_real_sixel() {
         r#"printf '\033Pq"1;1;4;2#0;2;100;0;0#0~~~~$-\033\\'; sleep 2"#.into(),
     ];
 
-    let session = shellglass::session::start_detached(&cmd, &sock, (80, 24))
+    let session = shellglass::session::start_detached(&cmd, &sock, (80, 24), false)
         .expect("starting the detached session");
     let rx = session.frames.clone();
 

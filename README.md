@@ -103,11 +103,14 @@ only the ones a terminal claims — the web mirror is the reference view here, a
 an attached terminal still receives the original bytes, so it renders exactly
 what it would have anyway.
 
-That cuts both ways: an attached terminal shows an image only if it supports
-that protocol *itself*. **`--sixel-compat` does not apply here** — it is wired to
-the ordinary (terminal-owning) source, so a session started with both flags
-mirrors sixel to the web while a non-sixel terminal shows nothing. Detachable
-mode warns about this at startup. One rough edge: attaching repaints from the terminal
+The owner has no terminal of its own to ask, so **the attaching client probes its
+own terminal** and reports what it can render in its handshake. Those
+capabilities are cached and reused until another client attaches, at which point
+they are replaced — a detach keeps them, exactly like the last attached size.
+`--sixel-compat` works here too: a client whose terminal does kitty or iTerm2 but
+not sixel gets the transcode, and one with native sixel gets the sixel untouched.
+Because the probe runs in the client, `TERM_PROGRAM` is read in *your* shell
+rather than in whatever environment a `--daemon` was started from. One rough edge: attaching repaints from the terminal
 grid, which holds no image data, so images already on screen reappear on the
 attached terminal only when the app next redraws them — the web mirror keeps
 showing them throughout.
