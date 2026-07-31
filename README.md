@@ -101,7 +101,13 @@ Inline images (sixel, kitty, iTerm2) are mirrored in this mode too. With no
 local terminal to probe, the owner intercepts every image protocol rather than
 only the ones a terminal claims — the web mirror is the reference view here, and
 an attached terminal still receives the original bytes, so it renders exactly
-what it would have anyway. One rough edge: attaching repaints from the terminal
+what it would have anyway.
+
+That cuts both ways: an attached terminal shows an image only if it supports
+that protocol *itself*. **`--sixel-compat` does not apply here** — it is wired to
+the ordinary (terminal-owning) source, so a session started with both flags
+mirrors sixel to the web while a non-sixel terminal shows nothing. Detachable
+mode warns about this at startup. One rough edge: attaching repaints from the terminal
 grid, which holds no image data, so images already on screen reappear on the
 attached terminal only when the app next redraws them — the web mirror keeps
 showing them throughout.

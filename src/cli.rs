@@ -828,6 +828,17 @@ impl PushArgs {
                 Some(sock) => sock,
                 None => crate::session::default_socket_path(&proto::session_id(&self.key.key)),
             };
+            // The detachable owner runs its own source (session::start_detached),
+            // not pty::start, so the transcode flag never reaches it. Say so
+            // rather than dropping it silently: the symptom otherwise is an image
+            // that mirrors to the web but stays invisible in the terminal.
+            if self.source.sixel_compat {
+                eprintln!(
+                    "shellglass: warning: --sixel-compat has no effect with --detachable; \
+                     sixel is mirrored to the web, but an attached terminal receives the \
+                     original sixel and renders it only if it supports sixel itself"
+                );
+            }
             println!("shellglass: detached session on {}", sock.display());
             println!(
                 "shellglass: attach with `shellglass attach {}`",
