@@ -95,9 +95,16 @@ and the session is exposed on a unix socket for `shellglass attach`, which
 connects a real terminal — driving input and size — until `` Ctrl-\ `` detaches
 it again. The session then holds the last attached dimensions (`--size` sets
 the initial/no-client size). One client at a time: a second `attach` is refused
-unless it takes over with `--force`, which kicks the incumbent. Unix only;
-inline images aren't mirrored in this mode (there is no local terminal to probe
-for image capabilities).
+unless it takes over with `--force`, which kicks the incumbent. Unix only.
+
+Inline images (sixel, kitty, iTerm2) are mirrored in this mode too. With no
+local terminal to probe, the owner intercepts every image protocol rather than
+only the ones a terminal claims — the web mirror is the reference view here, and
+an attached terminal still receives the original bytes, so it renders exactly
+what it would have anyway. One rough edge: attaching repaints from the terminal
+grid, which holds no image data, so images already on screen reappear on the
+attached terminal only when the app next redraws them — the web mirror keeps
+showing them throughout.
 
 ```sh
 # start a persistent stream at 160x50 (the socket path is printed)
