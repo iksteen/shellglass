@@ -39,7 +39,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use tokio::sync::{Semaphore, broadcast};
+use tokio::sync::{Semaphore, broadcast, oneshot};
 use tower_http::compression::CompressionLayer;
 // ponytail: pinned to axum's tungstenite (0.29) so the downcast below matches the
 // concrete error axum boxes. On an axum WebSocket-stack bump, move this in lockstep —
@@ -79,10 +79,12 @@ struct Session {
     /// dies with the session. Keys the current frame references are protected
     /// from the byte-cap eviction (see [`diff::ImageStore`]).
     images: Arc<Mutex<diff::ImageStore>>,
-    /// Per-session kick: the management API's DELETE fires this so the live
-    /// `/push` WebSocket Closes immediately (the pusher's next reconnect then
-    /// 403s — its id is gone from the registry).
-    kick: broadcast::Sender<()>,
+    /// The one push connection that currently owns this session. A new connection
+    /// atomically replaces this slot and tells the incumbent it was replaced; API
+    /// deletion tells it the session was removed. The serial prevents an evicted
+    /// connection's cleanup from marking its replacement offline.
+    active_push: Option<ActivePush>,
+    next_push_serial: u64,
     /// False for a registry STUB: the session is allowed but its pusher has
     /// never registered. The view route serves the built-in placeholder
     /// (default template + default CSS, no fonts, operator-offline) instead
@@ -115,6 +117,22 @@ struct FontEntry {
     bytes: bytes::Bytes,
     /// Number of sessions whose `fonts` set contains this key.
     refs: usize,
+}
+
+struct ActivePush {
+    serial: u64,
+    stop: oneshot::Sender<PushStop>,
+}
+
+struct PushClaim {
+    serial: u64,
+    stop: oneshot::Receiver<PushStop>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PushStop {
+    Replaced,
+    Removed,
 }
 
 /// The offline-stub frame: a blank 80×24 screen with a red `shellglass: <msg>`
@@ -475,7 +493,6 @@ impl HubState {
         }
         let live = diff::Live::new(Arc::new(waiting_frame("waiting for operator…")));
         live.set_online(false);
-        let (kick, _) = broadcast::channel(1);
         map.insert(
             id.to_string(),
             Session {
@@ -488,7 +505,8 @@ impl HubState {
                 live,
                 fonts: std::collections::HashSet::new(),
                 images: Arc::new(Mutex::new(diff::ImageStore::new(IMAGE_STORE_CAP))),
-                kick,
+                active_push: None,
+                next_push_serial: 0,
                 registered: false,
             },
         );
@@ -594,6 +612,42 @@ impl HubState {
         self.registry.read().unwrap().by_id.contains_key(id)
     }
 
+    /// Atomically make a new authorized WebSocket the session's sole pusher.
+    /// Claiming happens before the upgrade completes, so connection arrival order
+    /// determines ownership. The old connection receives an explicit replacement
+    /// signal; protocol 2 clients exit instead of reconnecting.
+    fn claim_push(&self, id: &str) -> Option<PushClaim> {
+        let mut map = self.sessions.lock().unwrap();
+        let s = map.get_mut(id)?;
+        if let Some(old) = s.active_push.take() {
+            let _ = old.stop.send(PushStop::Replaced);
+        }
+        s.next_push_serial = s.next_push_serial.wrapping_add(1);
+        let serial = s.next_push_serial;
+        let (stop_tx, stop) = oneshot::channel();
+        s.active_push = Some(ActivePush {
+            serial,
+            stop: stop_tx,
+        });
+        // Keep the incumbent's last online state during the short handoff. The
+        // replacement registers immediately; if it instead disconnects first,
+        // release_push marks the session offline.
+        Some(PushClaim { serial, stop })
+    }
+
+    /// Release a connection only if it still owns the session. Cleanup from an
+    /// evicted connection is therefore harmless to its live replacement.
+    fn release_push(&self, id: &str, serial: u64) {
+        let mut map = self.sessions.lock().unwrap();
+        let Some(s) = map.get_mut(id) else {
+            return;
+        };
+        if s.active_push.as_ref().map(|p| p.serial) == Some(serial) {
+            s.active_push = None;
+            s.live.set_online(false);
+        }
+    }
+
     /// Register a session at runtime (the management API's POST). Same
     /// validation and uniqueness rules as `--allow`, as results instead of
     /// startup errors.
@@ -691,7 +745,9 @@ impl HubState {
             );
             drop(cache);
             drop(map);
-            let _ = s.kick.send(());
+            if let Some(active) = s.active_push {
+                let _ = active.stop.send(PushStop::Removed);
+            }
         }
     }
 
@@ -1465,7 +1521,8 @@ async fn ws_push(
     // version). SALT is frozen now, so a legit client authorizes even across
     // protocol changes — this check, not an id rotation, is what catches a wire
     // skew, and answers with an actionable 426 (which side to upgrade, to what
-    // minimum) instead of a misleading 403. Absent header ⇒ protocol 1 (baseline).
+    // minimum) instead of a misleading 403. Absent header ⇒ protocol 1, which this
+    // hub rejects because it cannot honor the replacement-Close contract.
     let client_proto = headers
         .get(proto::PROTOCOL_HEADER)
         .and_then(|v| v.to_str().ok())
@@ -1486,9 +1543,15 @@ async fn ws_push(
     // unfragmented frame, so the frame limit (16 MiB by default) would otherwise
     // reject a 16–64 MiB register before the message limit ever applied. A frame
     // over the cap is rejected at its header — the body is never buffered.
+    // Claim only after authorization + protocol negotiation: a rejected client
+    // must not disturb the live pusher. The API may have deleted the session in
+    // the small gap since authorize.
+    let Some(claim) = st.claim_push(&id) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
     ws.max_message_size(proto::MAX_WS_MESSAGE)
         .max_frame_size(proto::MAX_WS_MESSAGE)
-        .on_upgrade(move |socket| push_session(st, id, base, socket))
+        .on_upgrade(move |socket| push_session(st, id, base, claim, socket))
 }
 
 /// Drive one push connection: the first Text is the [`proto::RegisterBody`] (creates
@@ -1496,12 +1559,16 @@ async fn ws_push(
 /// session's matrix + forwarded to viewers. Ends on Close, a socket error, or the
 /// shutdown signal (sends a Close so the pusher reconnects promptly). On exit the
 /// session + its last frame are **kept** so viewers still see the frozen screen.
-async fn push_session(st: HubState, id: String, base: String, mut socket: WebSocket) {
+async fn push_session(
+    st: HubState,
+    id: String,
+    base: String,
+    mut claim: PushClaim,
+    mut socket: WebSocket,
+) {
     let mut shutdown = st.shutdown.subscribe();
     // None until the register message arrives; the state machine is "have we a Live".
     let mut live: Option<Arc<diff::Live>> = None;
-    // The session's kick channel (management-API delete), armed at register.
-    let mut kick: Option<broadcast::Receiver<()>> = None;
     // Session recording (`--record-dir`, declinable in the client's register):
     // armed at register, then fed every Text message VERBATIM — the recording
     // is the timestamped push transcript itself (register, blobs, wire), no
@@ -1510,22 +1577,31 @@ async fn push_session(st: HubState, id: String, base: String, mut socket: WebSoc
     let mut recorder: Option<crate::record::Recorder> = None;
     loop {
         tokio::select! {
-            _ = shutdown.recv() => {
-                let _ = socket.send(Message::Close(None)).await;
+            // Once a replacement is claimed, stop consuming the old socket before
+            // it can publish another frame over the new owner's state.
+            biased;
+            stop = &mut claim.stop => {
+                match stop {
+                    Ok(PushStop::Replaced) => {
+                        eprintln!("shellglass: push {id} replaced by a newer connection — closing");
+                        let _ = socket
+                            .send(Message::Close(Some(CloseFrame {
+                                code: proto::PUSH_REPLACED_CLOSE_CODE,
+                                reason: "replaced by a newer push connection".into(),
+                            })))
+                            .await;
+                    }
+                    Ok(PushStop::Removed) => {
+                        // Its reconnect gets 403 because the id is already gone.
+                        eprintln!("shellglass: push {id} removed by the management API — closing");
+                        let _ = socket.send(Message::Close(None)).await;
+                    }
+                    Err(_) => {}
+                }
                 break;
             }
-            _ = async {
-                match kick.as_mut() {
-                    Some(k) => { let _ = k.recv().await; }
-                    None => std::future::pending::<()>().await,
-                }
-            } => {
-                // Deleted by the management API: Close so the pusher notices at
-                // once; its reconnect then 403s (the id is gone). The session
-                // state was already dropped — don't touch the orphaned Live.
-                eprintln!("shellglass: push {id} removed by the management API — closing");
+            _ = shutdown.recv() => {
                 let _ = socket.send(Message::Close(None)).await;
-                live = None;
                 break;
             }
             msg = socket.recv() => {
@@ -1569,10 +1645,15 @@ async fn push_session(st: HubState, id: String, base: String, mut socket: WebSoc
                         None => match serde_json::from_str::<proto::RegisterBody>(t.as_str()) {
                             Ok(reg) => {
                                 let no_record = reg.no_record;
-                                match register_session(&st, &id, &base, reg) {
-                                Some((l, k)) => {
+                                match register_claimed_session(
+                                    &st,
+                                    &id,
+                                    &base,
+                                    claim.serial,
+                                    reg,
+                                ) {
+                                Ok(l) => {
                                     live = Some(l);
-                                    kick = Some(k);
                                     if !no_record && let Some(dir) = &st.record_dir {
                                         let (rec, done) = crate::record::start(dir.join(&id));
                                         rec.event(t.as_str()); // the register, verbatim
@@ -1595,12 +1676,16 @@ async fn push_session(st: HubState, id: String, base: String, mut socket: WebSoc
                                         });
                                     }
                                 }
-                                // Deleted between the upgrade's authorize and this
-                                // register — the API raced the connect; close.
-                                None => {
-                                    eprintln!(
-                                        "shellglass: push {id} was removed before it registered — closing"
-                                    );
+                                Err(PushStop::Replaced) => {
+                                    let _ = socket
+                                        .send(Message::Close(Some(CloseFrame {
+                                            code: proto::PUSH_REPLACED_CLOSE_CODE,
+                                            reason: "replaced by a newer push connection".into(),
+                                        })))
+                                        .await;
+                                    break;
+                                }
+                                Err(PushStop::Removed) => {
                                     let _ = socket.send(Message::Close(None)).await;
                                     break;
                                 }
@@ -1639,15 +1724,9 @@ async fn push_session(st: HubState, id: String, base: String, mut socket: WebSoc
             }
         }
     }
-    // Pusher gone (drop, error, or shutdown): flag the operator offline so viewers
-    // see the session is no longer live. The session + last frame are kept, so the
-    // frozen screen stays up. `None` = died before registering; nothing to flag.
-    // ponytail: last-writer-wins if two pushers share one id — the rarer one exiting
-    // marks the session offline while the other still streams. Single-pusher is the
-    // norm; add a refcount if concurrent pushers become real.
-    if let Some(l) = &live {
-        l.set_online(false);
-    }
+    // Only the current owner may mark the session offline. If this connection was
+    // replaced, its serial no longer matches and cleanup is a no-op.
+    st.release_push(&id, claim.serial);
 }
 
 /// Store an uploaded image payload in the session's image store, keyed by the
@@ -1688,19 +1767,37 @@ fn store_blob(st: &HubState, id: &str, live: &diff::Live, msg: &str) {
     );
 }
 
-/// Create or refresh the session for `id` from a register message; returns its
-/// `Live` plus a receiver for the session's kick channel (fired when the
-/// management API deletes the session). New sessions get a "waiting…" screen
-/// (replaced by the first pushed frame) and announce their view URL once —
-/// reconnects hit the refresh branch, so no spam. `None` = the session was
-/// deleted between the upgrade's authorize and this register (the API raced
-/// the connect); the caller closes.
+/// Register the current owner of a push connection. A newer connection may claim
+/// the session while this one is decoding its font bundle, so ownership is checked
+/// under the session lock immediately before any shared state is changed.
+fn register_claimed_session(
+    st: &HubState,
+    id: &str,
+    base: &str,
+    serial: u64,
+    reg: proto::RegisterBody,
+) -> Result<Arc<diff::Live>, PushStop> {
+    register_session_inner(st, id, base, Some(serial), reg)
+}
+
+/// Test helper for registration behavior independent of a WebSocket claim.
+#[cfg(test)]
 fn register_session(
     st: &HubState,
     id: &str,
     base: &str,
     reg: proto::RegisterBody,
-) -> Option<(Arc<diff::Live>, broadcast::Receiver<()>)> {
+) -> Option<Arc<diff::Live>> {
+    register_session_inner(st, id, base, None, reg).ok()
+}
+
+fn register_session_inner(
+    st: &HubState,
+    id: &str,
+    base: &str,
+    serial: Option<u64>,
+    reg: proto::RegisterBody,
+) -> Result<Arc<diff::Live>, PushStop> {
     // Decode first, then establish family identities from valid regular faces.
     // A regular face owns only its own hub-derived content key; a bold face can
     // reference that key only when the regular was uploaded in this registration.
@@ -1766,81 +1863,49 @@ fn register_session(
     // page-scoped base CSS; prepend the hub-generated font rules. Their URLs are
     // page-relative, so the canonical `/s/<slug>/` page resolves them correctly
     // for any slug and behind any subpath mount.
-    let slug = st.slug_of(id)?;
+    let slug = st.slug_of(id).ok_or(PushStop::Removed)?;
     let css = format!("{font_css}{}", reg.css);
     let hub_css = render::hub_head_css(&font_css, &embed_family_keys);
     let hub_render_cfg = render::hub_render_config_json(&embed_family_keys);
     let mut map = st.sessions.lock().unwrap();
-    if let Some(s) = map.get_mut(id) {
-        // The common path: every allowed id has at least a stub (ensure_stub),
-        // so a first register is "stub becomes real" and a reconnect is a
-        // refresh. Either way the pushed base CSS/config/fonts replace what's
-        // stored, and viewers sitting on the placeholder page reload through
-        // its operator-online hook (see the view route).
-        s.css = css;
-        s.font_css = font_css;
-        s.hub_css = hub_css;
-        s.hub_render_cfg = hub_render_cfg;
-        s.template = reg.template;
-        s.render_cfg = reg.render_cfg;
-        // Swap the session's font stakes: new fonts enter the shared cache,
-        // ones only this session referenced are evicted.
-        let mut cache = st.fonts.lock().unwrap();
-        retarget_fonts(&mut cache, &s.fonts, &keys, incoming);
-        drop(cache);
-        s.fonts = keys;
-        // Tag the pushed page config so open viewers notice a font/CSS change on a
-        // re-register and re-fetch (frames carry no CSS — a live mirror can't learn
-        // the fonts changed any other way). An unchanged config hashes the same, so
-        // a plain reconnect doesn't reload anyone.
-        s.live.set_reload_tag(&proto::config_tag(&[
-            &s.css,
-            &s.font_css,
-            &s.render_cfg,
-            &s.template,
-            &s.hub_css,
-            &s.hub_render_cfg,
-        ]));
-        if !s.registered {
-            s.registered = true;
-            println!("shellglass: session connected — view at {base}/s/{slug}/");
-        }
-        // Coming (back) online — new stubs start offline, dropped pushers were
-        // marked offline by push_session.
-        s.live.set_online(true);
-        Some((Arc::clone(&s.live), s.kick.subscribe()))
-    } else {
-        // Fallback only: an authorized id always has a stub, but keep the
-        // create path for the theoretical gap.
-        let live = diff::Live::new(Arc::new(waiting_frame("waiting for client…")));
-        let (kick, kick_rx) = broadcast::channel(1);
-        let mut cache = st.fonts.lock().unwrap();
-        retarget_fonts(
-            &mut cache,
-            &std::collections::HashSet::new(),
-            &keys,
-            incoming,
-        );
-        drop(cache);
-        map.insert(
-            id.to_string(),
-            Session {
-                css,
-                font_css,
-                hub_css,
-                hub_render_cfg,
-                template: reg.template,
-                render_cfg: reg.render_cfg,
-                live: Arc::clone(&live),
-                fonts: keys,
-                images: Arc::new(Mutex::new(diff::ImageStore::new(IMAGE_STORE_CAP))),
-                kick,
-                registered: true,
-            },
-        );
-        println!("shellglass: session connected — view at {base}/s/{slug}/");
-        Some((live, kick_rx))
+    let s = map.get_mut(id).ok_or(PushStop::Removed)?;
+    if let Some(serial) = serial
+        && s.active_push.as_ref().map(|p| p.serial) != Some(serial)
+    {
+        return Err(PushStop::Replaced);
     }
+    // Every allowed id has a stub (ensure_stub), so a first register is "stub
+    // becomes real" and a reconnect refreshes the same Live.
+    s.css = css;
+    s.font_css = font_css;
+    s.hub_css = hub_css;
+    s.hub_render_cfg = hub_render_cfg;
+    s.template = reg.template;
+    s.render_cfg = reg.render_cfg;
+    // Swap the session's font stakes: new fonts enter the shared cache, ones
+    // only this session referenced are evicted.
+    let mut cache = st.fonts.lock().unwrap();
+    retarget_fonts(&mut cache, &s.fonts, &keys, incoming);
+    drop(cache);
+    s.fonts = keys;
+    // Tag the pushed page config so open viewers notice a font/CSS change on a
+    // re-register and re-fetch (frames carry no CSS — a live mirror can't learn
+    // the fonts changed any other way). An unchanged config hashes the same, so
+    // a plain reconnect doesn't reload anyone.
+    s.live.set_reload_tag(&proto::config_tag(&[
+        &s.css,
+        &s.font_css,
+        &s.render_cfg,
+        &s.template,
+        &s.hub_css,
+        &s.hub_render_cfg,
+    ]));
+    if !s.registered {
+        s.registered = true;
+        println!("shellglass: session connected — view at {base}/s/{slug}/");
+    }
+    s.live.set_online(true);
+    Ok(Arc::clone(&s.live))
 }
 
 /// Serve a font from the shared cache (the page's `@font-face` points here).
@@ -2554,7 +2619,7 @@ mod tests {
             parse_allow(&[format!("{a}:one"), format!("{b}:two")]).unwrap(),
             "http://h".into(),
         );
-        let (live_a, _k) = register_session(&st, &a, "http://h", reg("x")).unwrap();
+        let live_a = register_session(&st, &a, "http://h", reg("x")).unwrap();
         register_session(&st, &b, "http://h", reg("x")).unwrap();
 
         let bytes = b"\x89PNG\r\n\x1a\nPNG-ISH-BYTES";
@@ -2732,7 +2797,7 @@ mod tests {
 
         // First register (the WS's first message) adopts the stub's Live —
         // placeholder viewers already subscribed aren't orphaned.
-        let (live1, _kick1) = register_session(&st, &id, "http://h", reg("a{}")).unwrap();
+        let live1 = register_session(&st, &id, "http://h", reg("a{}")).unwrap();
         assert!(
             Arc::ptr_eq(&stub, &live1),
             "register must adopt the stub's Live"
@@ -2741,7 +2806,7 @@ mod tests {
 
         // A reconnect re-registers: the CSS refreshes but the same Live is reused, so
         // viewers already subscribed don't get orphaned.
-        let (live2, _kick2) = register_session(&st, &id, "http://h", reg("b{}")).unwrap();
+        let live2 = register_session(&st, &id, "http://h", reg("b{}")).unwrap();
         assert!(
             Arc::ptr_eq(&live1, &live2),
             "reconnect must reuse the session's Live, not replace it"
@@ -2754,13 +2819,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn newest_push_evicts_old_owner_without_old_cleanup_taking_it_offline() {
+        let id = session_id("secret");
+        let st = HubState::new(
+            parse_allow(std::slice::from_ref(&id)).unwrap(),
+            "http://h".into(),
+        );
+
+        let first = st.claim_push(&id).unwrap();
+        let live =
+            register_claimed_session(&st, &id, "http://h", first.serial, reg("a{}")).unwrap();
+        assert!(live.is_online());
+
+        let second = st.claim_push(&id).unwrap();
+        assert_eq!(first.stop.await.unwrap(), PushStop::Replaced);
+        assert!(
+            live.is_online(),
+            "claim handoff must not flash the operator offline"
+        );
+        assert!(
+            matches!(
+                register_claimed_session(&st, &id, "http://h", first.serial, reg("stale{}")),
+                Err(PushStop::Replaced)
+            ),
+            "an evicted connection cannot win a register race"
+        );
+        let live2 =
+            register_claimed_session(&st, &id, "http://h", second.serial, reg("b{}")).unwrap();
+        assert!(Arc::ptr_eq(&live, &live2));
+        assert!(live2.is_online());
+
+        st.release_push(&id, first.serial);
+        assert!(
+            live2.is_online(),
+            "evicted owner's cleanup must not take its replacement offline"
+        );
+        st.release_push(&id, second.serial);
+        assert!(!live2.is_online(), "current owner's exit marks it offline");
+    }
+
+    #[tokio::test]
     async fn snapshot_serves_the_current_full_frame() {
         let id = session_id("secret");
         let st = HubState::new(
             parse_allow(&[format!("{id}:one")]).unwrap(),
             "http://h".into(),
         );
-        let (live, _kick) = register_session(&st, &id, "http://h", reg("a{}")).unwrap();
+        let live = register_session(&st, &id, "http://h", reg("a{}")).unwrap();
         let want = live.snapshot().to_string();
 
         let router = app(st);
