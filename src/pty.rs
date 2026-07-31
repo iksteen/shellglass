@@ -968,6 +968,13 @@ impl ScreenState {
     }
 }
 
+/// Fallback pixel size of one cell, for an owner that never probed a terminal
+/// (the detachable session). Only natural-size images — the ones the app gave no
+/// cell hint for — consult it, to derive how many cells they cover; a typical
+/// 8×16 cell keeps that estimate close for the common console fonts.
+#[cfg(all(feature = "push", unix))]
+pub(crate) const DEFAULT_CELL_PX: (u16, u16) = (8, 16);
+
 /// The inline-image half of the pipeline, shared by both owners.
 ///
 /// Inline images live outside vt100's byte stream (it drops the sequences). The
@@ -1032,6 +1039,26 @@ impl ImagePipe {
             cell,
             jobs: job_tx,
         }
+    }
+
+    /// The pipe for an owner that probed no terminal (the detachable session):
+    /// intercept EVERY protocol.
+    ///
+    /// The local mirror instead intercepts only what the terminal renders, so the
+    /// web shows exactly what the local screen shows. A detached owner has no such
+    /// screen to be faithful to — it may have no client attached at all, and the
+    /// one that attaches later is not known in advance — so the mirror is the
+    /// reference view and gets every protocol. This costs nothing at the tee:
+    /// `Step::Image`/`Deferred` still forward the ORIGINAL bytes, so an attached
+    /// terminal renders (or ignores) exactly what it would have without us. It
+    /// also extends the kitty file/shm rejection — the arbitrary-file exfiltration
+    /// guard — to attached clients, which a verbatim byte tee bypasses entirely.
+    #[cfg(all(feature = "push", unix))]
+    pub(crate) fn unprobed<M: Send + 'static>(
+        ready: mpsc::Sender<M>,
+        wrap: fn(std::num::NonZeroU32, String, crate::model::ImageBlob) -> M,
+    ) -> ImagePipe {
+        Self::new((true, true, true), None, DEFAULT_CELL_PX, ready, wrap)
     }
 
     /// Route one PTY read: split it into [`Step`]s, tee what the terminal should

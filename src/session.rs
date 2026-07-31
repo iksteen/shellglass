@@ -15,11 +15,19 @@
 //! last one that was attached".
 //!
 //! Unix only (unix-domain sockets + termios). Frame fidelity matches the local
-//! mirror for text/colors/cursor; inline-image decoding is not wired into the
-//! headless owner (see [`crate::pty::ScreenState`]).
+//! mirror for text/colors/cursor AND inline images: the owner drives the same
+//! [`ImagePipe`], but since it probes no terminal it intercepts every image
+//! protocol (see [`ImagePipe::unprobed`] for why that is the right default here).
+//! The attached terminal is unaffected — the pipe tees the original bytes, so it
+//! renders sixel/kitty/iTerm2 natively exactly as it would without us.
+//!
+//! One gap remains: the accept-time repaint replays the vt100 grid
+//! (`contents_formatted`), which holds no image bytes, so images already on
+//! screen do not reappear on the newly attached terminal until the app redraws
+//! them. They are in the web mirror throughout.
 
 use crate::model::Frame;
-use crate::pty::{RawMode, ScreenState};
+use crate::pty::{ImagePipe, RawMode, ScreenState};
 use crate::source::{SinkStatus, SourceSession};
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -102,6 +110,14 @@ impl ClientSink {
 enum Core {
     Data(Vec<u8>),
     Resize(u16, u16), // rows, cols (parser side)
+    /// A deferred image's payload, decoded/encoded by the [`ImagePipe`] worker —
+    /// fills the pending placement with the same `id` (dropped if it was already
+    /// overwritten/evicted).
+    ImageReady {
+        id: std::num::NonZeroU32,
+        hash: String,
+        blob: crate::model::ImageBlob,
+    },
     /// A connection wants to attach. The core is the sole owner of the
     /// one-client-at-a-time policy: it accepts (optionally kicking the incumbent
     /// when `force`) or rejects, replying so the handler knows whether to pump.
@@ -345,9 +361,11 @@ pub fn start_detached(
     {
         let socket = socket.to_path_buf();
         let pty_tx = pty_tx.clone();
+        let ready_tx = core_tx.clone(); // decode worker answers the core loop
         thread::spawn(move || {
             core_thread(
                 core_rx,
+                ready_tx,
                 pty_tx,
                 frame_tx,
                 ScreenState::new(rows, cols),
@@ -454,12 +472,21 @@ fn handle_client(
 /// the frame clock, so pacing and fidelity match the local mirror by construction.
 fn core_thread(
     rx: mpsc::Receiver<Core>,
+    ready_tx: mpsc::Sender<Core>,
     pty_tx: mpsc::Sender<PtyCmd>,
     frame_tx: watch::Sender<Arc<Frame>>,
     mut screen: ScreenState,
     socket: PathBuf,
 ) {
     let mut client: Option<(u64, ClientSink)> = None;
+    // No terminal was probed (there is none), so every image protocol is
+    // intercepted for the mirror; the tee still forwards the original bytes, so
+    // an attached terminal renders exactly what it would have anyway.
+    let mut pipe = ImagePipe::unprobed(ready_tx, |id, hash, blob| Core::ImageReady {
+        id,
+        hash,
+        blob,
+    });
 
     loop {
         let msg = match screen.wait() {
@@ -476,13 +503,27 @@ fn core_thread(
 
         match msg {
             Some(Core::Data(b)) => {
-                screen.process(&b);
-                if let Some((_, sink)) = client.as_mut()
-                    && sink.send_data(&b).is_err()
+                // Collect the tee rather than writing it per step: one socket
+                // frame per PTY read, exactly as before the interceptor landed.
+                let mut tee = Vec::new();
+                pipe.feed(
+                    &mut screen,
+                    &b,
+                    |bytes| tee.extend_from_slice(bytes),
+                    |resp| {
+                        // A refused kitty file/shm transmission: answer the app
+                        // so a detect-mode client falls back to direct.
+                        let _ = pty_tx.send(PtyCmd::Input(resp.to_vec()));
+                    },
+                );
+                if !tee.is_empty()
+                    && let Some((_, sink)) = client.as_mut()
+                    && sink.send_data(&tee).is_err()
                 {
                     client = None;
                 }
             }
+            Some(Core::ImageReady { id, hash, blob }) => screen.image_ready(id, hash, blob),
             Some(Core::Resize(rows, cols)) => screen.set_size(rows, cols),
             Some(Core::AttachRequest {
                 cid,
@@ -718,8 +759,16 @@ mod tests {
         let (frame_tx, _frame_rx) = watch::channel(ScreenState::blank_frame(24, 80));
         let sock =
             std::env::temp_dir().join(format!("shellglass-test-{}.sock", std::process::id()));
+        let ready_tx = core_tx.clone();
         thread::spawn(move || {
-            core_thread(core_rx, pty_tx, frame_tx, ScreenState::new(24, 80), sock);
+            core_thread(
+                core_rx,
+                ready_tx,
+                pty_tx,
+                frame_tx,
+                ScreenState::new(24, 80),
+                sock,
+            );
         });
 
         // First client: accepted, and only now does the PTY track its terminal.
@@ -751,5 +800,164 @@ mod tests {
         assert_eq!(tag, S_DATA);
         let (tag, _) = read_frame(&mut first).unwrap();
         assert_eq!(tag, S_KICKED);
+    }
+
+    /// A 1x1 transparent PNG, base64 as an iTerm2 inline-image payload.
+    fn png_b64() -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode([
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ])
+    }
+
+    /// Spawn a core thread on a unique socket, returning its handles.
+    fn spawn_core(
+        tag: &str,
+    ) -> (
+        mpsc::Sender<Core>,
+        mpsc::Receiver<PtyCmd>,
+        watch::Receiver<Arc<Frame>>,
+    ) {
+        let (core_tx, core_rx) = mpsc::channel();
+        let (pty_tx, pty_rx) = mpsc::channel();
+        let (frame_tx, frame_rx) = watch::channel(ScreenState::blank_frame(24, 80));
+        let sock =
+            std::env::temp_dir().join(format!("shellglass-test-{}-{tag}.sock", std::process::id()));
+        let ready_tx = core_tx.clone();
+        thread::spawn(move || {
+            core_thread(
+                core_rx,
+                ready_tx,
+                pty_tx,
+                frame_tx,
+                ScreenState::new(24, 80),
+                sock,
+            );
+        });
+        (core_tx, pty_rx, frame_rx)
+    }
+
+    /// Attach a client and drain the accept + repaint frames.
+    fn attach_and_drain(core_tx: &mpsc::Sender<Core>, cid: u64) -> UnixStream {
+        let (mut c, ok) = attach_request(core_tx, cid, false);
+        assert!(ok);
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(read_frame(&mut c).unwrap().0, S_ACCEPTED);
+        assert_eq!(read_frame(&mut c).unwrap().0, S_DATA); // accept-time repaint
+        c
+    }
+
+    /// Poll the frame stream until a frame carries `n` image placements.
+    fn wait_for_images(
+        rx: &watch::Receiver<Arc<Frame>>,
+        n: usize,
+    ) -> Vec<crate::model::ImagePlacement> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            {
+                let Frame::Screen(grid) = &**rx.borrow();
+                if grid.images.len() == n {
+                    return grid.images.clone();
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("no frame with {n} image placement(s) within the deadline");
+    }
+
+    /// The detachable owner probes no terminal, so it intercepts EVERY image
+    /// protocol: the mirror gets the placement (this is the whole fix), while the
+    /// attached terminal still receives the original bytes verbatim.
+    #[test]
+    fn detached_owner_mirrors_inline_images() {
+        let (core_tx, _pty_rx, frame_rx) = spawn_core("img");
+        let mut client = attach_and_drain(&core_tx, 1);
+
+        let seq = format!("\x1b]1337;File=inline=1;width=4;height=2:{}\x07", png_b64());
+        core_tx.send(Core::Data(seq.clone().into_bytes())).unwrap();
+
+        // Fidelity: the attached terminal renders it natively, exactly as it
+        // would have without the interceptor in the path.
+        let (tag, payload) = read_frame(&mut client).unwrap();
+        assert_eq!(tag, S_DATA);
+        assert_eq!(payload, seq.as_bytes(), "tee must forward original bytes");
+
+        // The mirror: a real placement, at the cursor, sized as the app asked.
+        let images = wait_for_images(&frame_rx, 1);
+        assert_eq!(images[0].row, 0);
+        assert_eq!(images[0].col, 0);
+        assert_eq!(images[0].cols, Some(4.0));
+        assert_eq!(images[0].rows, Some(2.0));
+        assert!(
+            !images[0].hash.is_empty(),
+            "placement must address a payload"
+        );
+    }
+
+    /// Sixel is DEFERRED (decoded off the core thread), so this covers the full
+    /// async round trip in the detachable owner: stamp on arrival, worker decode,
+    /// `Core::ImageReady` back into the core loop, placement published. A pending
+    /// placement is invisible in frames, so seeing one at all proves it completed.
+    #[test]
+    fn detached_owner_mirrors_deferred_sixel() {
+        let (core_tx, _pty_rx, frame_rx) = spawn_core("sixel");
+        let mut client = attach_and_drain(&core_tx, 1);
+
+        // 4x2 sixel with raster attributes (dims known up front, pixels deferred).
+        let sixel: &[u8] = b"\x1bPq\"1;1;4;2#0;2;100;0;0#0~~~~$-\x1b\\";
+        core_tx.send(Core::Data(sixel.to_vec())).unwrap();
+
+        // The attached terminal still gets the raw DCS to render natively.
+        let (tag, payload) = read_frame(&mut client).unwrap();
+        assert_eq!(tag, S_DATA);
+        assert_eq!(payload, sixel);
+
+        // And the decoded payload lands in the mirror.
+        let images = wait_for_images(&frame_rx, 1);
+        assert!(!images[0].hash.is_empty());
+    }
+
+    /// The kitty file/shm exfiltration guard now covers attached clients too: a
+    /// verbatim byte tee would have handed the terminal a sequence naming a path
+    /// on the untrusted stream. It is suppressed, and the app is answered so a
+    /// detect-mode client falls back to direct transmission (which we do mirror).
+    #[test]
+    fn detached_owner_rejects_kitty_file_transmission() {
+        let (core_tx, pty_rx, _frame_rx) = spawn_core("kitty");
+        let mut client = attach_and_drain(&core_tx, 1);
+
+        // t=f: "the payload is a filesystem path" — the vector we refuse.
+        let path = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode("/etc/passwd")
+        };
+        let seq = format!("\x1b_Gi=7,s=1,v=1,a=T,t=f;{path}\x1b\\");
+        core_tx.send(Core::Data(seq.into_bytes())).unwrap();
+
+        // The app gets a kitty error naming its request id, so it retries direct.
+        // Skip the attach-time resize; the injected error is the next input.
+        let injected = loop {
+            match pty_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(PtyCmd::Input(b)) => break b,
+                Ok(PtyCmd::Resize(..)) => continue,
+                Err(_) => panic!("expected a kitty error injected back to the app"),
+            }
+        };
+        let injected = String::from_utf8_lossy(&injected).into_owned();
+        assert!(injected.contains("i=7"), "error must echo the request id");
+
+        // And the terminal never saw the refused sequence. Nothing else is
+        // pending, so a short read timeout is the assertion.
+        client
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        assert!(
+            read_frame(&mut client).is_err(),
+            "a rejected transmission must not reach the terminal"
+        );
     }
 }
