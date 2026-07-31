@@ -52,7 +52,7 @@ const INITIAL_SEND_TIMEOUT: Duration = Duration::from_secs(60);
 /// Backoff between reconnect attempts.
 const RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
 
-// ponytail: 8 positional args, one call site — an args struct would be ceremony
+// ponytail: 9 positional args, one call site — an args struct would be ceremony
 // for no reader benefit. Bundle them if a second caller ever appears.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -64,9 +64,16 @@ pub async fn run(
     template: Arc<String>,
     // Decline hub-side session recording (rides the register message).
     no_record: bool,
-    // Starts the PTY backend (raw mode, the command itself). Invoked only after the
-    // hub has accepted the WebSocket upgrade, so a down or misconfigured hub is
-    // reported — and retried — before the command runs and the terminal is taken over.
+    // Skip the "don't take the terminal until the hub accepts" gate below and
+    // start the command immediately, connecting (and reconnecting) to the hub
+    // entirely in the background. For an embedder where the terminal is the
+    // point regardless of hub reachability (e.g. every shell tab is a session,
+    // hub or no hub) rather than a producer that only exists to be pushed.
+    eager_start: bool,
+    // Starts the PTY backend (raw mode, the command itself). With `eager_start`
+    // false (shellglass's own default), invoked only after the hub has accepted
+    // the WebSocket upgrade, so a down or misconfigured hub is reported — and
+    // retried — before the command runs and the terminal is taken over.
     start: impl FnOnce() -> Result<SourceSession>,
 ) -> Result<()> {
     let base = base_url.trim_end_matches('/').to_string();
@@ -107,10 +114,16 @@ pub async fn run(
     }
 
     let mut start = Some(start);
-    // The PTY backend, started after the first successful upgrade. Until then outage
-    // reports go to stderr (the terminal is still ours); after, the notifier
-    // pauses/restores the raw session cleanly.
-    let mut backend: Option<SourceSession> = None;
+    // The PTY backend. With `eager_start`, taken immediately — the command runs
+    // and the terminal is live before the first connect attempt even starts, so
+    // outage reports go straight to the sink_status (not stderr) from attempt one.
+    // Otherwise (shellglass's own default) started after the first successful
+    // upgrade; until then outage reports go to stderr (the terminal is still ours).
+    let mut backend: Option<SourceSession> = if eager_start {
+        Some(start.take().expect("started once")()?)
+    } else {
+        None
+    };
     // Whether we've reported the hub as down (so we report down/up once per outage,
     // not every retry).
     let mut down = false;

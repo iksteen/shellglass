@@ -112,7 +112,14 @@ impl SinkStatus for Notifier {
 /// implementation owns the terminal pause/repaint behavior. Puts the terminal in
 /// raw mode, bridges stdin/stdout, and exits the frame stream when the command exits.
 /// `sixel_compat` opts into the EXPERIMENTAL sixel→kitty/iTerm2 transcode.
-pub fn start(command: &[String], sixel_compat: bool) -> Result<SourceSession> {
+///
+/// `passive`: when true, hub connectivity never touches the real terminal at
+/// all — no pause, no clear, no notice — the session just mirrors (or doesn't)
+/// silently in the background. For an embedder where the wrapped terminal is
+/// the point regardless of whether anything's watching (e.g. every shell tab
+/// running as a session, hub or no hub), rather than shellglass's own default
+/// of a terminal that exists to be watched and should say so when it isn't.
+pub fn start(command: &[String], sixel_compat: bool, passive: bool) -> Result<SourceSession> {
     let geom = term_geom().unwrap_or(TermGeom {
         cols: 80,
         rows: 24,
@@ -312,6 +319,7 @@ pub fn start(command: &[String], sixel_compat: bool) -> Result<SourceSession> {
         let parser = vt100::Parser::new_with_callbacks(rows, cols, 0, seqlog);
         screen_thread(
             msg_rx, ready_tx, frame_tx, raw, parser, seq_seen, cell, transcode, caps, inject,
+            passive,
         );
     });
 
@@ -373,6 +381,7 @@ fn screen_thread(
     transcode: Option<crate::images::GfxProto>,
     caps: Caps,
     inject: Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
+    passive: bool,
 ) {
     let mut out = std::io::stdout();
     let mut connected = true; // teeing shell output to the terminal
@@ -413,7 +422,7 @@ fn screen_thread(
             }
             Some(Msg::ImageReady(ready)) => screen.image_ready(ready),
             Some(Msg::Resize(rows, cols)) => screen.set_size(rows, cols),
-            Some(Msg::HubDown(msg)) if connected => {
+            Some(Msg::HubDown(msg)) if connected && !passive => {
                 connected = false;
                 raw.leave(); // back to cooked so the notice reads normally
                 // The app may have left the screen mid-redraw or with dangling
@@ -429,7 +438,7 @@ fn screen_thread(
                 let _ = write!(out, "\x1b[33mshellglass: {msg}\x1b[0m\r\n");
                 let _ = out.flush();
             }
-            Some(Msg::HubUp) if !connected => {
+            Some(Msg::HubUp) if !connected && !passive => {
                 connected = true;
                 raw.enter();
                 // Repaint the (now up-to-date) screen over the notice text, and
@@ -447,7 +456,7 @@ fn screen_thread(
                 report_unmirrored(&seq_seen);
                 std::process::exit(0);
             }
-            Some(_) => {} // redundant HubDown/HubUp — ignore
+            Some(_) => {} // redundant HubDown/HubUp, or any HubDown/HubUp at all in passive mode — ignore
             None => {}    // frame due
         }
         if let Some(frame) = screen.due_frame() {
