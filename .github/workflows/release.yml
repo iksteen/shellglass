@@ -96,16 +96,18 @@ jobs:
           fi
 
       - name: Package
-        # All seven binaries: the universal `shellglass` plus the per-mode builds
+        # All eight binaries: the universal `shellglass` plus the per-mode builds
         # (thin mains over the same clap actions — a hub-only box wants just
         # shellglass-hub). The default feature set builds every one, so they all
         # sit in the profile dir; list them by name so the tarball holds the
-        # binaries only, not the dir's build artifacts.
+        # binaries only, not the dir's build artifacts. shellglass-attach is
+        # Unix-only (it only bails on Windows), so the zip below ships seven.
         run: |
           tar -czf shellglass-${{ matrix.target }}.tar.gz \
             -C target/${{ matrix.target }}/dist \
             shellglass shellglass-serve shellglass-push shellglass-hub \
-            shellglass-sessions shellglass-recordings shellglass-keytool
+            shellglass-sessions shellglass-recordings shellglass-keytool \
+            shellglass-attach
 
       - uses: softprops/action-gh-release@v3
         with:
