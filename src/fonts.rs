@@ -119,8 +119,8 @@ fn system_db() -> &'static Database {
 /// wins, otherwise `fontdb` finds the installed file. `.ttc` faces are extracted to
 /// standalone web fonts. Missing/unreadable fonts are soft failures (warn + skip)
 /// so the page still renders with browser fallback. Run once at startup by the
-/// process that owns the fonts (standalone or push client); the hub just serves
-/// what the client uploads.
+/// process that owns the fonts (standalone or push client); the hub validates the
+/// structured metadata, generates CSS, and serves the uploaded bytes.
 #[cfg(feature = "presentation")]
 pub fn collect_fonts(config: &Config) -> Vec<FontFile> {
     let db = system_db();
@@ -481,22 +481,65 @@ fn parse_range(spec: &str) -> Result<RangeInclusive<u32>> {
     }
 }
 
-/// Encode located fonts for upload to the hub. The key is the font's index and
-/// MUST match the URL index [`crate::render::font_face_css`] bakes into the CSS.
+/// Hub-mode font upload plus the mapping from local config family names to the
+/// regular face's content hash. The aliases are used only while building the
+/// pushed base CSS/render config; standalone serve keeps the configured names.
 #[cfg(feature = "presentation")]
-pub fn font_assets(fonts: &[FontFile]) -> Vec<crate::proto::FontAsset> {
-    fonts
-        .iter()
-        .map(|f| crate::proto::FontAsset {
-            mime: f.mime.to_string(),
-            b64: B64.encode(&f.bytes),
-        })
-        .collect()
+pub struct HubFontBundle {
+    pub assets: Vec<crate::proto::FontAsset>,
+    pub aliases: std::collections::HashMap<String, String>,
 }
 
-/// Family names go inside a single-quoted CSS string; neutralize quotes/backslashes.
+/// Encode located fonts for upload to the hub. Each family is named by the
+/// content key of its first regular face; bold faces reference that same key.
+/// A bold-only family is omitted because it cannot establish a family identity.
+#[cfg(feature = "presentation")]
+pub fn hub_font_bundle(fonts: &[FontFile]) -> HubFontBundle {
+    let mut aliases = std::collections::HashMap::new();
+    for f in fonts.iter().filter(|f| !f.bold) {
+        aliases.entry(f.family.clone()).or_insert_with(|| f.key());
+    }
+
+    let assets = fonts
+        .iter()
+        .filter_map(|f| {
+            let family_key = aliases.get(&f.family)?;
+            // `collect_fonts` produces one regular face per family. Keep this
+            // invariant explicit if a future/custom producer supplies duplicates.
+            if !f.bold && f.key() != *family_key {
+                return None;
+            }
+            Some(crate::proto::FontAsset {
+                family_key: family_key.clone(),
+                mime: f.mime.to_string(),
+                b64: B64.encode(&f.bytes),
+                bold: f.bold,
+            })
+        })
+        .collect();
+    HubFontBundle { assets, aliases }
+}
+
+/// Family names go inside a single-quoted CSS string which may itself be embedded
+/// in an HTML `<style>` element. Escape CSS syntax plus `<`: the HTML raw-text
+/// parser recognizes `</style>` even inside CSS quotes, so leaving `<` literal
+/// would turn an operator-controlled family name into a script-tag breakout.
 pub(crate) fn css_escape_family(name: &str) -> String {
-    name.replace('\\', "\\\\").replace('\'', "\\'")
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '<' => out.push_str("\\3c "),
+            c if c.is_control() => {
+                let _ = write!(out, "\\{:x} ", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(all(test, feature = "presentation"))]
@@ -526,6 +569,47 @@ mod tests {
             referenced_families(&cfg),
             vec!["Menlo".to_string(), "NF".to_string()]
         );
+    }
+
+    #[test]
+    fn hub_font_bundle_keys_family_by_its_regular_face() {
+        let fonts = vec![
+            FontFile {
+                family: "Family".into(),
+                mime: "font/woff2",
+                format: "woff2",
+                bytes: vec![1, 2, 3],
+                bold: false,
+            },
+            FontFile {
+                family: "Family".into(),
+                mime: "font/woff2",
+                format: "woff2",
+                bytes: vec![4, 5, 6],
+                bold: true,
+            },
+            FontFile {
+                family: "Bold only".into(),
+                mime: "font/woff2",
+                format: "woff2",
+                bytes: vec![7, 8, 9],
+                bold: true,
+            },
+        ];
+        let bundle = hub_font_bundle(&fonts);
+        let family_key = fonts[0].key();
+        assert_eq!(bundle.aliases.get("Family"), Some(&family_key));
+        assert!(!bundle.aliases.contains_key("Bold only"));
+        assert_eq!(bundle.assets.len(), 2);
+        assert!(
+            bundle
+                .assets
+                .iter()
+                .all(|asset| asset.family_key == family_key)
+        );
+        assert!(!bundle.assets[0].bold);
+        assert!(bundle.assets[1].bold);
+        assert_eq!(B64.decode(&bundle.assets[1].b64).unwrap(), [4, 5, 6]);
     }
 
     #[test]

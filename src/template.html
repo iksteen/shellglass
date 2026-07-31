@@ -5,9 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>shellglass</title>
 <link rel="icon" type="image/svg+xml" href="favicon.svg">
-<!-- Tokens filled at serve time (double-brace style/screen/script): style = terminal
-     CSS + @font-face; screen = the live #screen div the renderer fills; script = the
-     scripts that boot it. -->
+<!-- Tokens filled at serve time (double-brace style/screen/script/nonce): style =
+     terminal CSS + @font-face; screen = the live #screen div the renderer fills;
+     script = the scripts that boot it; nonce = the CSP nonce on hub-owned pages. -->
 {{style}}
 <style>
 :root {
@@ -161,7 +161,7 @@ body[data-offline="operator"] .offline .off-op { display:block; }
   <span>Live over SSE — <a href="https://github.com/iksteen/shellglass">shellglass</a>.</span>
   <span class="stats" id="sg-stats"></span>
 </footer>
-<script>
+<script nonce="{{nonce}}">
 // Fit + zoom + pan. The terminal is scaled with `transform: scale` — paint-time,
 // so mobile WebKit's text autosizer never sees a tiny effective font size (see
 // the .fitbox comment; CSS `zoom` here warped every phone view of a wide

@@ -4,8 +4,8 @@
 //! and the renderer paints it from the full frame that heads every SSE stream.
 
 // The Config/Resolver-consuming assembly is mirror-side (serve/push build the
-// page + render config from local state); the hub only uses the baked assets,
-// `page` and `sse_script` on client-pushed strings.
+// page + render config from local state). The hub also uses `font_face_rule` to
+// turn structured uploaded font metadata into CSS; it never accepts font CSS.
 #[cfg(feature = "presentation")]
 use crate::config::Config;
 use crate::fonts::FontFile;
@@ -13,7 +13,8 @@ use crate::fonts::FontFile;
 use crate::fonts::Resolver;
 #[cfg(feature = "presentation")]
 use serde::Serialize;
-use std::fmt::Write as _;
+#[cfg(feature = "presentation")]
+use std::collections::HashMap;
 
 /// The compiled browser renderer (`viewer/viewer.ts` → JS), baked into the binary
 /// and served verbatim at `/viewer.js` by both the standalone server and the hub.
@@ -48,17 +49,35 @@ pub fn viewer_tag() -> &'static str {
 pub fn font_face_css(fonts: &[FontFile], url_prefix: &str) -> String {
     let mut css = String::new();
     for f in fonts {
-        let _ = writeln!(
-            css,
-            "@font-face {{ font-family:'{}'; font-weight:{}; src:url(\"{}{}\") format('{}'); }}",
-            crate::fonts::css_escape_family(&f.family),
-            if f.bold { "bold" } else { "normal" },
+        css.push_str(&font_face_rule(
+            &f.family,
+            f.bold,
             url_prefix,
-            f.key(),
+            &f.key(),
             f.format,
-        );
+        ));
     }
     css
+}
+
+/// One hub/serve-generated `@font-face` rule. Every free-form field has already
+/// been reduced to data: `family` is CSS+HTML escaped here, while `key` and
+/// `format` are hub-derived allowlisted tokens in hub mode.
+pub fn font_face_rule(
+    family: &str,
+    bold: bool,
+    url_prefix: &str,
+    key: &str,
+    format: &str,
+) -> String {
+    format!(
+        "@font-face {{ font-family:'{}'; font-weight:{}; src:url(\"{}{}\") format('{}'); }}\n",
+        crate::fonts::css_escape_family(family),
+        if bold { "bold" } else { "normal" },
+        url_prefix,
+        key,
+        format,
+    )
 }
 
 #[cfg(feature = "presentation")]
@@ -87,12 +106,23 @@ pub const EMBED_TEMPLATE: &str = include_str!("template_embed.html");
 /// `viewer.js`, imported per element.
 pub const EMBED_JS: &str = include_str!("embed.js");
 
-/// Everything that goes inside `<style>`: the served-font `@font-face` rules plus
-/// the config-derived base CSS. Computed by whoever owns the config (the standalone
-/// server or a push client); the hub just stores and re-emits it, so it renders
-/// nothing.
+/// Everything that goes inside `<style>`: optional served-font `@font-face` rules
+/// plus config-derived base CSS. Standalone serve passes its locally generated
+/// rules; a push client passes an empty string and the hub prepends rules generated
+/// from the uploaded structured font metadata.
 #[cfg(feature = "presentation")]
 pub fn head_css(font_css: &str, config: &Config) -> String {
+    head_css_with_font_aliases(font_css, config, &HashMap::new())
+}
+
+/// Hub-mode base CSS. Every located configured family is replaced by the
+/// validated wire identity the hub will use in its generated `@font-face` rules.
+#[cfg(feature = "presentation")]
+pub fn head_css_with_font_aliases(
+    font_css: &str,
+    config: &Config,
+    aliases: &HashMap<String, String>,
+) -> String {
     // The terminal backdrop lives on #screen (not body) so a template controls the
     // surrounding page background; #screen stays black wherever it's placed.
     // text-size-adjust: iOS Safari inflates the used font-size of wide text
@@ -101,19 +131,39 @@ pub fn head_css(font_css: &str, config: &Config) -> String {
     // widens the whole terminal box (~2x aspect distortion) while the px
     // line-height pins row height, and the canvas glyphs land ~2x too big
     // for the grid. 100% opts the terminal out without disabling user zoom.
-    let base_css = format!(
+    format!(
+        "{font_css}{}",
+        terminal_base_css(
+            &font_stack(config, aliases),
+            config.font_size_px,
+            config.line_height_px(),
+        )
+    )
+}
+
+/// Protected hub-owned presentation for embeds and forced normal pages. The
+/// pusher contributes no CSS or render configuration: only verified
+/// regular-face hashes select fonts. All other presentation values are fixed
+/// hub literals.
+pub fn hub_head_css(font_css: &str, family_keys: &[String]) -> String {
+    format!(
+        "{font_css}{}",
+        terminal_base_css(&hub_font_stack(family_keys), 14.0, 16.8)
+    )
+}
+
+fn terminal_base_css(stack: &str, font_px: f32, line_height_px: f32) -> String {
+    format!(
         "html,body {{ margin:0; }}\n\
          #screen {{ font-family:{stack}; font-size:{fs}px; --lh:{lh}px; \
          line-height:var(--lh); color:{fg}; background:#000; \
          -webkit-text-size-adjust:100%; text-size-adjust:100%; }}\n\
          .screen {{ position:relative; white-space:pre; overflow:hidden; }}\n\
          .row {{ position:relative; height:var(--lh); contain:layout style; }}\n",
-        stack = font_stack(config),
-        fs = config.font_size_px,
-        lh = config.line_height_px(),
-        fg = hex(DEFAULT_FG),
-    );
-    format!("{font_css}{base_css}")
+        fs = font_px,
+        lh = line_height_px,
+        fg = "#d0d0d0",
+    )
 }
 
 /// The base terminal CSS with nothing but built-in defaults — no config, no
@@ -122,30 +172,64 @@ pub fn head_css(font_css: &str, config: &Config) -> String {
 /// deliberately ignored until the pusher provides them, and the hub-only build
 /// has no `Config` anyway. Keep the structure in lockstep with [`head_css`].
 pub fn default_head_css() -> String {
-    "html,body { margin:0; }\n\
-     #screen { font-family:monospace; font-size:14px; --lh:16.8px; \
-     line-height:var(--lh); color:#d0d0d0; background:#000; \
-     -webkit-text-size-adjust:100%; text-size-adjust:100%; }\n\
-     .screen { position:relative; white-space:pre; overflow:hidden; }\n\
-     .row { position:relative; height:var(--lh); contain:layout style; }\n"
-        .to_string()
+    terminal_base_css("monospace", 14.0, 16.8)
 }
 
 /// Render config matching [`default_head_css`] — the viewer's own defaults,
 /// spelled out (field names are viewer.ts's `Cfg`).
 pub const DEFAULT_RENDER_CFG: &str = r##"{"defFg":"#d0d0d0","defBg":"#000000","fillFont":"monospace","fontPx":14,"lhPx":16.8,"sym":[]}"##;
 
+/// Render config matching [`hub_head_css`]. It is assembled entirely from
+/// hub literals and verified regular-face hashes; no pushed JSON is reproduced.
+pub fn hub_render_config_json(family_keys: &[String]) -> String {
+    let stack = serde_json::to_string(&hub_font_stack(family_keys))
+        .expect("a generated font stack serializes");
+    format!(
+        r##"{{"defFg":"#d0d0d0","defBg":"#000000","fillFont":{stack},"fontPx":14,"lhPx":16.8,"sym":[]}}"##
+    )
+}
+
+fn hub_font_stack(family_keys: &[String]) -> String {
+    let mut stack = family_keys
+        .iter()
+        .map(|key| format!("'{key}'"))
+        .collect::<Vec<_>>();
+    stack.push("monospace".to_string());
+    stack.join(",")
+}
+
 /// Fill a viewer `template` with the terminal `<style>`, the (empty) `#screen`
 /// div, and the updater `<script>`. Tokens: `{{style}}`, `{{screen}}`,
-/// `{{script}}`. The screen starts empty — the renderer paints it from the full
-/// frame that heads every SSE stream, one round-trip after load.
+/// `{{script}}`, plus an empty `{{nonce}}`. The screen starts empty — the
+/// renderer paints it from the full frame that heads every SSE stream, one
+/// round-trip after load.
 pub fn page(template: &str, head_css: &str, script: &str) -> String {
-    // `script` already carries its own `<script>` tags (it loads the external
-    // renderer), so inject it raw rather than wrapping it.
+    page_with_nonce(template, head_css, script, "")
+}
+
+/// [`page`] with a per-response CSP nonce available to a hub-owned template as
+/// `{{nonce}}`. Trusted tokens are replaced before `{{style}}`: client CSS
+/// inserted last cannot smuggle its own nonce placeholder and have it expanded.
+pub fn page_with_nonce(template: &str, head_css: &str, script: &str, nonce: &str) -> String {
     template
-        .replace("{{style}}", &format!("<style>\n{head_css}</style>"))
         .replace("{{script}}", script)
         .replace("{{screen}}", "<div id=\"screen\"></div>")
+        .replace("{{nonce}}", nonce)
+        .replace("{{style}}", &format!("<style>\n{head_css}</style>"))
+}
+
+/// Random per-response nonce for a hub-owned page's script CSP.
+pub fn nonce() -> String {
+    use base64::Engine as _;
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("OS randomness for a CSP nonce");
+    base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes)
+}
+
+/// Script policy for a hub-owned viewer template. Only nonce-stamped scripts can
+/// execute; injected plugins, frames, and base-URL changes are blocked too.
+pub fn csp(nonce: &str) -> String {
+    format!("script-src 'nonce-{nonce}'; object-src 'none'; frame-src 'none'; base-uri 'none'")
 }
 
 /// The page's updater block: a tiny inline config the renderer reads (the SSE path
@@ -159,11 +243,16 @@ pub fn page(template: &str, head_css: &str, script: &str) -> String {
 /// hub may sit behind a reverse proxy that mounts it under a subpath, which
 /// neither it nor the client can know — absolute paths would escape the mount.
 pub fn sse_script(events_path: &str, cfg_json: &str) -> String {
-    let cfg = if cfg_json.is_empty() {
-        "null"
-    } else {
-        cfg_json
-    };
+    sse_script_inner(events_path, cfg_json, None)
+}
+
+/// [`sse_script`] with the nonce required by [`csp`] on both trusted scripts.
+pub fn sse_script_with_nonce(events_path: &str, cfg_json: &str, nonce: &str) -> String {
+    sse_script_inner(events_path, cfg_json, Some(nonce))
+}
+
+fn sse_script_inner(events_path: &str, cfg_json: &str, nonce: Option<&str>) -> String {
+    let cfg = cfg_for_script(cfg_json);
     let events = serde_json::to_string(events_path).unwrap_or_else(|_| "\"events\"".into());
     // The inline classic script runs at parse time (setting the config); the module
     // script is deferred by default and runs after, so the config is ready. viewer.js
@@ -173,10 +262,29 @@ pub fn sse_script(events_path: &str, cfg_json: &str) -> String {
     // under a loaded page — new wire format OR just a new viewer.js).
     let proto = crate::diff::PROTO;
     let js = viewer_tag();
+    let nonce = nonce.map(|n| format!(" nonce=\"{n}\"")).unwrap_or_default();
     format!(
-        "<script>window.SHELLGLASS={{events:{events},cfg:{cfg},proto:{proto},js:\"{js}\"}};</script>\n\
-         <script type=\"module\" src=\"viewer.js?v={js}\"></script>"
+        "<script{nonce}>window.SHELLGLASS={{events:{events},cfg:{cfg},proto:{proto},js:\"{js}\"}};</script>\n\
+         <script type=\"module\"{nonce} src=\"viewer.js?v={js}\"></script>"
     )
+}
+
+/// Parse and canonically re-serialize pushed render JSON. Invalid input becomes
+/// `null`, so it cannot alter the surrounding boot object.
+fn cfg_value(raw: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| serde_json::to_string(&value).ok())
+        .unwrap_or_else(|| "null".to_string())
+}
+
+/// JSON safe inside an HTML `<script>` raw-text element. In particular a string
+/// containing `</script>` cannot terminate the trusted boot script.
+fn cfg_for_script(raw: &str) -> String {
+    cfg_value(raw)
+        .replace('<', "\\u003c")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
 }
 
 /// The boot object an iframe-less embed fetches (`GET config`), the JSON form of
@@ -185,11 +293,7 @@ pub fn sse_script(events_path: &str, cfg_json: &str) -> String {
 /// resolves it against the session base. `cfg_json` is [`render_config_json`] or
 /// the client's, relayed by the hub.
 pub fn config_json(events_path: &str, cfg_json: &str) -> String {
-    let cfg = if cfg_json.is_empty() {
-        "null"
-    } else {
-        cfg_json
-    };
+    let cfg = cfg_value(cfg_json);
     let events = serde_json::to_string(events_path).unwrap_or_else(|_| "\"events\"".into());
     format!(
         "{{\"events\":{events},\"cfg\":{cfg},\"proto\":{proto},\"js\":\"{js}\"}}",
@@ -205,6 +309,17 @@ pub fn config_json(events_path: &str, cfg_json: &str) -> String {
 /// override family first). Injected once per page.
 #[cfg(feature = "presentation")]
 pub fn render_config_json(config: &Config, resolver: &Resolver) -> String {
+    render_config_json_with_font_aliases(config, resolver, &HashMap::new())
+}
+
+/// Hub-mode render config, using the same content-hash family aliases as
+/// [`head_css_with_font_aliases`] for base, symbol-map, and no-boost families.
+#[cfg(feature = "presentation")]
+pub fn render_config_json_with_font_aliases(
+    config: &Config,
+    resolver: &Resolver,
+    aliases: &HashMap<String, String>,
+) -> String {
     #[derive(Serialize)]
     struct RenderConfig {
         #[serde(rename = "defFg")]
@@ -224,7 +339,7 @@ pub fn render_config_json(config: &Config, resolver: &Resolver) -> String {
         #[serde(rename = "noBoost", skip_serializing_if = "Vec::is_empty")]
         no_boost: Vec<String>,
     }
-    let stack = font_stack(config);
+    let stack = font_stack(config, aliases);
     let sym = resolver
         .entries()
         .iter()
@@ -232,7 +347,7 @@ pub fn render_config_json(config: &Config, resolver: &Resolver) -> String {
             (
                 *r.start(),
                 *r.end(),
-                format!("{},{}", quote_family(fam), stack),
+                format!("{},{}", quote_family(fam, aliases), stack),
             )
         })
         .collect();
@@ -240,7 +355,7 @@ pub fn render_config_json(config: &Config, resolver: &Resolver) -> String {
         .fonts
         .iter()
         .filter(|(_, f)| f.weight_boost == Some(false))
-        .map(|(k, _)| k.clone())
+        .map(|(k, _)| aliases.get(k).unwrap_or(k).clone())
         .collect();
     no_boost.sort(); // HashMap order is nondeterministic; keep the emitted JSON stable
     let cfg = RenderConfig {
@@ -270,11 +385,11 @@ pub fn render_page(template: &str, font_css: &str, config: &Config, cfg_json: &s
 /// last resort appended unless already present. The browser resolves each glyph
 /// against this stack, giving Kitty-style per-character fallback for free.
 #[cfg(feature = "presentation")]
-fn font_stack(config: &Config) -> String {
+fn font_stack(config: &Config, aliases: &HashMap<String, String>) -> String {
     let mut fams: Vec<String> = config
         .default_font
         .iter()
-        .map(|f| quote_family(f))
+        .map(|f| quote_family(f, aliases))
         .collect();
     if !config.default_font.iter().any(|f| f == "monospace") {
         fams.push("monospace".to_string());
@@ -289,12 +404,13 @@ fn hex((r, g, b): (u8, u8, u8)) -> String {
 
 /// Quote a font family unless it's a CSS generic keyword.
 #[cfg(feature = "presentation")]
-fn quote_family(name: &str) -> String {
+fn quote_family(name: &str, aliases: &HashMap<String, String>) -> String {
     const GENERICS: [&str; 5] = ["monospace", "serif", "sans-serif", "cursive", "fantasy"];
     if GENERICS.contains(&name) {
         name.to_string()
     } else {
-        format!("'{}'", name.replace('\\', "\\\\").replace('\'', "\\'"))
+        let name = aliases.get(name).map(String::as_str).unwrap_or(name);
+        format!("'{}'", crate::fonts::css_escape_family(name))
     }
 }
 
@@ -304,7 +420,7 @@ fn quote_family(name: &str) -> String {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, FontSource, SymbolMap};
 
     #[test]
     fn font_list_becomes_a_css_fallback_stack() {
@@ -320,6 +436,77 @@ mod tests {
     }
 
     #[test]
+    fn hub_rendering_aliases_every_reference_to_a_loaded_family() {
+        let mut cfg = Config::default();
+        cfg.default_font = vec!["Text".into()];
+        cfg.symbol_map = vec![SymbolMap {
+            ranges: vec!["U+E0B0".into()],
+            font: "Icons".into(),
+        }];
+        cfg.fonts.insert(
+            "Text".into(),
+            FontSource {
+                weight_boost: Some(false),
+                ..FontSource::default()
+            },
+        );
+        let resolver = Resolver::build(&cfg).unwrap();
+        let aliases = HashMap::from([
+            ("Text".into(), "a".repeat(64)),
+            ("Icons".into(), "b".repeat(64)),
+        ]);
+
+        let css = head_css_with_font_aliases("", &cfg, &aliases);
+        assert!(
+            css.contains(&format!("font-family:'{}',monospace", "a".repeat(64))),
+            "{css}"
+        );
+        assert!(!css.contains("'Text'"), "{css}");
+
+        let json = render_config_json_with_font_aliases(&cfg, &resolver, &aliases);
+        assert!(json.contains(&format!(r#""fillFont":"'{}',monospace""#, "a".repeat(64))));
+        assert!(json.contains(&format!(
+            r#""'{}','{}',monospace""#,
+            "b".repeat(64),
+            "a".repeat(64)
+        )));
+        assert!(json.contains(&format!(r#""noBoost":["{}"]"#, "a".repeat(64))));
+        assert!(!json.contains("Text") && !json.contains("Icons"), "{json}");
+    }
+
+    #[test]
+    fn protected_hub_presentation_uses_only_hash_families_and_fixed_defaults() {
+        let key = "a".repeat(64);
+        let font_css = font_face_rule(&key, false, "fonts/", &key, "woff2");
+        let css = hub_head_css(&font_css, std::slice::from_ref(&key));
+        assert!(css.contains(&format!("font-family:'{key}'")), "{css}");
+        assert!(css.contains(&format!("#screen {{ font-family:'{key}',monospace;")));
+        assert!(css.contains("font-size:14px"));
+        assert!(css.contains("--lh:16.8px"));
+
+        let cfg = hub_render_config_json(std::slice::from_ref(&key));
+        let parsed: serde_json::Value = serde_json::from_str(&cfg).unwrap();
+        assert_eq!(parsed["fillFont"], format!("'{key}',monospace"));
+        assert_eq!(parsed["fontPx"], 14);
+        assert_eq!(parsed["lhPx"], 16.8);
+        assert_eq!(parsed["sym"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn font_family_css_cannot_close_an_inline_style_element() {
+        let mut cfg = Config::default();
+        cfg.default_font = vec!["</style><script>alert(1)</script>".into()];
+        let css = head_css("", &cfg);
+        assert!(!css.contains("</style>"), "{css}");
+        assert!(!css.contains("<script>"), "{css}");
+        assert!(css.contains("\\3c /style>"), "{css}");
+
+        let rule = font_face_rule(&cfg.default_font[0], false, "fonts/", "abc", "woff2");
+        assert!(!rule.contains("</style>"), "{rule}");
+        assert!(rule.contains("\\3c /style>"), "{rule}");
+    }
+
+    #[test]
     fn page_fills_template_tokens() {
         let tmpl = "<head>{{style}}</head><body>{{screen}}{{script}}</body>";
         let html = page(tmpl, "CSS", "<script>JS</script>");
@@ -331,11 +518,55 @@ mod tests {
     }
 
     #[test]
+    fn hub_page_nonce_is_available_only_to_the_template_and_trusted_script() {
+        let tmpl = r#"<head>{{style}}</head><body>{{screen}}{{script}}<script nonce="{{nonce}}">OK</script></body>"#;
+        let html = page_with_nonce(
+            tmpl,
+            "/* client placeholders stay literal: {{nonce}} {{script}} */",
+            r#"<script nonce="SAFE">BOOT</script>"#,
+            "SAFE",
+        );
+        assert_eq!(html.matches(r#"nonce="SAFE""#).count(), 2, "{html}");
+        assert!(
+            html.contains("/* client placeholders stay literal: {{nonce}} {{script}} */"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn nonce_script_canonicalizes_config_and_cannot_be_closed_by_json() {
+        let script = sse_script_with_nonce(
+            "events",
+            r#"{"value":"</script><script>CLIENT_XSS</script>&\u2028"}"#,
+            "SAFE",
+        );
+        assert_eq!(script.matches(r#"nonce="SAFE""#).count(), 2, "{script}");
+        assert!(!script.contains("</script><script>CLIENT_XSS"), "{script}");
+        assert!(
+            script.contains(r#"\u003c/script>\u003cscript>CLIENT_XSS\u003c/script>&\u2028"#),
+            "{script}"
+        );
+
+        let invalid = sse_script("events", "null};CLIENT_XSS();//");
+        assert!(invalid.contains("cfg:null"), "{invalid}");
+        assert!(!invalid.contains("CLIENT_XSS"), "{invalid}");
+    }
+
+    #[test]
+    fn hub_csp_allows_only_nonce_stamped_scripts() {
+        let policy = csp("SAFE");
+        assert!(policy.contains("script-src 'nonce-SAFE'"), "{policy}");
+        assert!(policy.contains("object-src 'none'"), "{policy}");
+        assert!(policy.contains("frame-src 'none'"), "{policy}");
+        assert!(policy.contains("base-uri 'none'"), "{policy}");
+    }
+
+    #[test]
     fn embed_assets_hold_their_contract() {
         // The embed template is a full viewer template (all three tokens),
         // carries the offline takeover, and dispatches sg-zoom so the canvas
         // re-rasterizes on fit changes.
-        for tok in ["{{style}}", "{{screen}}", "{{script}}"] {
+        for tok in ["{{style}}", "{{screen}}", "{{script}}", "{{nonce}}"] {
             assert!(EMBED_TEMPLATE.contains(tok), "embed template missing {tok}");
         }
         assert!(EMBED_TEMPLATE.contains("data-offline"), "offline takeover");
@@ -363,7 +594,7 @@ mod tests {
 
     #[test]
     fn builtin_template_has_all_tokens() {
-        for tok in ["{{style}}", "{{screen}}", "{{script}}"] {
+        for tok in ["{{style}}", "{{screen}}", "{{script}}", "{{nonce}}"] {
             assert!(DEFAULT_TEMPLATE.contains(tok), "template missing {tok}");
         }
         // The canvas mounts OUTSIDE the fit transform (see the embed test).

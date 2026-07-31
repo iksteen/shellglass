@@ -193,19 +193,23 @@ where
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let live = Arc::clone(&live);
         let config = Arc::clone(&presentation.config);
+        let resolver = Arc::clone(&presentation.resolver);
         let template = Arc::clone(&presentation.template);
         let fonts = Arc::clone(&presentation.fonts);
-        let record_font_css = font_css.clone();
-        let record_cfg_json = cfg_json.clone();
         let record_task = tokio::spawn(async move {
             let register = tokio::task::spawn_blocking(move || {
-                let css = render::head_css(&record_font_css, &config);
+                let hub_fonts = crate::fonts::hub_font_bundle(&fonts);
                 serde_json::to_string(&crate::proto::RegisterBody {
-                    css,
-                    render_cfg: record_cfg_json,
+                    // A recording speaks the push contract: the hub/player
+                    // reconstructs font CSS from the structured font assets.
+                    css: render::head_css_with_font_aliases("", &config, &hub_fonts.aliases),
+                    render_cfg: render::render_config_json_with_font_aliases(
+                        &config,
+                        &resolver,
+                        &hub_fonts.aliases,
+                    ),
                     template: (*template).clone(),
-                    fonts: crate::fonts::font_assets(&fonts),
-                    font_css: record_font_css,
+                    fonts: hub_fonts.assets,
                     no_record: false,
                 })
                 .expect("register body serializes")

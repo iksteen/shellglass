@@ -76,18 +76,20 @@ pub async fn run(
         .http1_only()
         .build()
         .context("building HTTP client")?;
-    // Font URLs are page-RELATIVE: the hub serves the view at /s/<slug>/ and
-    // the fonts under it, so `fonts/<i>` resolves for any slug and behind any
-    // subpath mount — the client needs to know nothing about either (SALT v5;
-    // the hub stores this CSS verbatim). Upload the font bytes alongside.
-    let font_css = render::font_face_css(&fonts, "fonts/");
-    let css = render::head_css(&font_css, &config);
+    // The hub generates page-relative font URLs and complete @font-face rules
+    // from the structured assets below. Send only page-scoped base CSS, with
+    // every located family aliased to its regular face's content hash.
+    let hub_fonts = fonts::hub_font_bundle(&fonts);
+    let css = render::head_css_with_font_aliases("", &config, &hub_fonts.aliases);
     let reg = RegisterBody {
         css,
-        font_css,
         template: (*template).clone(),
-        render_cfg: render::render_config_json(&config, &resolver),
-        fonts: fonts::font_assets(&fonts),
+        render_cfg: render::render_config_json_with_font_aliases(
+            &config,
+            &resolver,
+            &hub_fonts.aliases,
+        ),
+        fonts: hub_fonts.assets,
         no_record,
     };
     let reg_json = serde_json::to_string(&reg).context("encoding register payload")?;

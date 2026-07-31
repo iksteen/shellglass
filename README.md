@@ -150,6 +150,8 @@ Flags by command:
 | `--api-allow <api-id>` | hub | an API id permitted to call the session-management API; repeat per caller. Without it, `/api` is off (404) |
 | `--sessions-file <path>` | hub | persist the session registry across restarts (see [Managing hub sessions](#managing-hub-sessions-over-http)) |
 | `--record-dir <dir>` | serve, hub | record sessions as timestamped native streams (see [Session recording](#session-recording)) |
+| `--template <path>` | hub | hub-owned fallback template for normal pages; combine with `--force-template` to override pushed templates |
+| `--force-template` | hub | ignore pushed template/CSS/render config and use a hub-owned presentation (`--template`, or the built-in default); validated hash-keyed fonts remain available |
 | `--no-record` | push | decline recording on a hub that records (or `SHELLGLASS_NO_RECORD=true`) |
 | `--detachable` | push | run the command in a terminal-less PTY reachable via `attach` — see [Detachable sessions](#detachable-sessions) (Unix only) |
 | `--socket <path>` | push | the detachable session's unix socket (default `$XDG_RUNTIME_DIR/shellglass-<id>.sock`) |
@@ -299,9 +301,11 @@ rendering model). Terminal resizes (`SIGWINCH`)
 reflow both the PTY and the browser. In hub mode the client pushes frames over a
 **single persistent WebSocket** (not a request per frame), so throughput isn't
 gated by round-trip latency; the hub relays them per session and re-serves the
-client's CSS, fonts, and render config. If the connection drops (hub restart,
-network blip) the client re-registers and reconnects automatically, showing the
-outage in your terminal until it's back.
+client's CSS, fonts, and render config for the normal view page. Hub embed routes
+instead use a fixed template and hub-generated CSS/config; only validated,
+hash-keyed uploaded fonts affect their presentation. If the connection drops
+(hub restart, network blip) the client re-registers and reconnects automatically,
+showing the outage in your terminal until it's back.
 
 ## Inline images
 
@@ -442,6 +446,13 @@ template = "my-viewer.html"
 Everything around those tokens is yours — nav, wrapper, footer, extra `<style>`.
 Only `{{screen}}`'s `#screen` id is load-bearing (the updater targets it). In hub
 mode the client pushes its template to the hub, so custom pages work off-box too.
+The hub operator can instead provide a fallback with `hub --template <path>`, or
+make it authoritative with `--force-template`. A hub-owned template may also use
+`{{nonce}}`; put `nonce="{{nonce}}"` on each of its inline scripts. The hub then
+serves the page with a matching Content Security Policy. With
+`--force-template` and no `--template`, the built-in normal-page template is
+forced. In either forced form, pushed CSS and render config are also discarded.
+Validated hash-keyed fonts remain available through hub-generated CSS/config.
 
 If your page fits the terminal to a box with `transform: scale`, dispatch a
 `sg-zoom` event after changing the factor (so the canvas re-rasterizes crisp)
@@ -474,7 +485,7 @@ Three render modes, via a `mode` attribute (or `data-mode` on the script tag):
   your page.
 - **shadow** — `mode="shadow"` renders in a shadow root, fully style-isolated
   from the host. (Selection across a shadow boundary is weaker on some browsers.)
-- **iframe** — `mode="iframe"` is the classic sandboxed frame onto the `?embed`
+- **iframe** — `mode="iframe"` is the classic isolated frame onto the `?embed`
   page. The raw form still works with no script at all:
   ```html
   <iframe src="https://hub.example.com/s/demo?embed"
@@ -483,9 +494,12 @@ Three render modes, via a `mode` attribute (or `data-mode` on the script tag):
 
 `data-src`, the element name, its `src`, and the `?embed` URL shape are the
 **stable** contract — reconnects, upgrades and the operator-offline state all
-happen inside. An embed always uses the built-in look; a custom `template`
-doesn't apply (the session's fonts and colors do). Embedding a session is
-exactly as public as its view URL — see the security notes below.
+happen inside. On a hub, every embed uses the built-in template, fixed base
+presentation, and hub-generated render config; pushed CSS/template/render JSON
+never applies. Validated uploaded fonts still render under hash-only family
+names. Standalone `serve` keeps using its local configured presentation.
+Embedding a session is exactly as public as its view URL — see the security
+notes below.
 
 **Sizing.** An unstyled `<shellglass-view>` (light or shadow) renders at the
 terminal's natural size. Give it a `width` and/or `height` in CSS and the
@@ -517,6 +531,12 @@ supported (they share one renderer instance) — use `mode="iframe"` for those.
 - The **secret** is a bearer capability. Anyone who has it can push to that
   session; anyone with the **view URL** can watch. Use a long random secret
   (`gen-key`) and share the URL only with people who should see the session.
+- Hub embeds are safe presentation surfaces for an untrusted pusher. A normal
+  `/s/<slug>/` page retains pushed CSS and render config, and by default also
+  the optional pushed template. `hub --force-template` discards all three,
+  substitutes hub-generated CSS/config, and gives the hub-owned template a
+  nonce-restricted script policy. Validated hash-keyed fonts remain available;
+  no client-authored font CSS or family name is reproduced.
 - Ids derive from a fixed application salt, so the same secret yields the same
   public id on every hub: a reused key is linkable across hubs, and a
   precomputed dictionary over weak human-chosen keys works against all
