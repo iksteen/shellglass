@@ -348,51 +348,9 @@ fn screen_thread(
     let mut out = std::io::stdout();
     let mut connected = true; // teeing shell output to the terminal
     let mut screen = ScreenState::with_parser(parser, caps);
-    // Deferred-image decode worker: sixel/kitty-raw payloads decode + PNG-
-    // encode OFF this thread, so the tee to the local terminal never stalls
-    // behind a deflate (a sixel video would otherwise slow the terminal
-    // itself, 4–12× measured). Newest wins: jobs superseded while one was
-    // being processed are drained and dropped — their placements stay
-    // pending until cell overwrite evicts them — and having skipped ANY job
-    // is the backpressure signal that switches PNG encoding to the fast
-    // compression level until the worker catches up.
-    let (job_tx, job_rx) =
-        mpsc::channel::<(std::num::NonZeroU32, crate::images::DeferredPayload)>();
-    std::thread::spawn(move || {
-        while let Ok(mut job) = job_rx.recv() {
-            let mut superseded = false;
-            while let Ok(newer) = job_rx.try_recv() {
-                job = newer;
-                superseded = true;
-            }
-            let Some((png, _px)) = crate::images::finish_deferred(&job.1, superseded) else {
-                continue; // undecodable payload: the placement stays pending → evicted
-            };
-            let mime = "image/png".to_string();
-            let hash = crate::proto::content_key(&mime, &png);
-            let blob = crate::model::ImageBlob {
-                mime,
-                bytes: png.into(),
-            };
-            if ready_tx
-                .send(Msg::ImageReady {
-                    id: job.0,
-                    hash,
-                    blob,
-                })
-                .is_err()
-            {
-                break; // screen thread gone
-            }
-        }
+    let mut pipe = ImagePipe::new(intercept, transcode, cell, ready_tx, |id, hash, blob| {
+        Msg::ImageReady { id, hash, blob }
     });
-    // Inline images live outside vt100's byte stream (it drops the sequences).
-    // The interceptor pulls them out; each is placed at the cursor by stamping
-    // per-cell image tags into the parser grid (`place_data`), which then ride
-    // vt100's own scrolling/eviction/reflow — each frame we just read the
-    // surviving tags back (see `resolve_images`), no scroll heuristics.
-    let mut interceptor = Interceptor::with(intercept.0, intercept.1, intercept.2, transcode, cell);
-    let mut image_seq = std::num::NonZeroU32::MIN;
     loop {
         let msg = match screen.wait() {
             Some(d) => match msg_rx.recv_timeout(d) {
@@ -407,54 +365,25 @@ fn screen_thread(
         };
         match msg {
             Some(Msg::Data(b)) => {
-                // The interceptor splits the read into routed steps. Every step
-                // except a rejection tees its bytes to the local terminal (which
-                // renders sixel/kitty/iTerm2 natively); the match then handles the
-                // mirror/app effect. `Step::tee` is the one place the tee lives.
-                for step in interceptor.feed(&b) {
-                    if let Some(bytes) = step.tee().filter(|_| connected) {
-                        let _ = out.write_all(bytes); // immediate, not rate-limited
-                        let _ = out.flush();
-                    }
-                    match step {
-                        Step::Passthrough(x) => screen.process(&x), // → vt100 too
-                        Step::TerminalOnly(_) => {}                 // already teed
-                        Step::Image(_, img) => {
-                            // Ready payload (iTerm2 native / kitty PNG): stamp
-                            // and record in one step.
-                            let hash = crate::proto::content_key(&img.mime, &img.bytes);
-                            let ready = Some((
-                                hash,
-                                crate::model::ImageBlob {
-                                    mime: img.mime,
-                                    bytes: img.bytes.into(),
-                                },
-                            ));
-                            screen.stamp_image(&mut image_seq, cell, img.cells, img.px, ready);
+                // The tee is immediate (not rate-limited) and pauses with the
+                // hub-outage notice; a rejection answers the app through the
+                // shared PTY writer to provoke a fallback to direct transmission.
+                pipe.feed(
+                    &mut screen,
+                    &b,
+                    |bytes| {
+                        if connected {
+                            let _ = out.write_all(bytes);
+                            let _ = out.flush();
                         }
-                        Step::Deferred(_, d) => {
-                            // Heavy decode (sixel / kitty raw): stamp NOW —
-                            // cursor semantics can't wait — and let the worker
-                            // owe the bytes. Newest-wins on the worker side:
-                            // video frames superseded before decoding are
-                            // never decoded (their pending placements die by
-                            // cell overwrite like any other image).
-                            let id =
-                                screen.stamp_image(&mut image_seq, cell, d.cells, Some(d.px), None);
-                            let _ = job_tx.send((id, d.payload));
+                    },
+                    |resp| {
+                        if let Ok(mut w) = inject.lock() {
+                            let _ = w.write_all(resp);
+                            let _ = w.flush();
                         }
-                        Step::Reject(resp) => {
-                            // Suppressed from the terminal (tee() was None), so it
-                            // never services the refused transmission; answer the app
-                            // ourselves to provoke a fallback to direct.
-                            if let Ok(mut w) = inject.lock() {
-                                let _ = w.write_all(&resp);
-                                let _ = w.flush();
-                            }
-                        }
-                    }
-                }
-                screen.touch();
+                    },
+                );
             }
             Some(Msg::ImageReady { id, hash, blob }) => screen.image_ready(id, hash, blob),
             Some(Msg::Resize(rows, cols)) => screen.set_size(rows, cols),
@@ -883,9 +812,7 @@ fn frame_from_with_defaults(
 ///
 /// The owner drives it: feed it bytes/resizes, ask [`Self::wait`] how long to
 /// block for the next event, then ask [`Self::due_frame`] for a frame. Inline
-/// images are stamped by the terminal owner only — a detached owner has no
-/// terminal to probe for image capabilities, so it leaves the vectors empty and
-/// images mirror as their covered cells.
+/// images reach it through an [`ImagePipe`], which both owners drive.
 pub(crate) struct ScreenState {
     parser: SgParser,
     images: Vec<Placed>,
@@ -973,7 +900,7 @@ impl ScreenState {
 
     /// Fill a pending placement with its decoded bytes. A miss means the
     /// placement was already evicted (overwritten/scrolled off) — drop them.
-    fn image_ready(
+    pub(crate) fn image_ready(
         &mut self,
         id: std::num::NonZeroU32,
         hash: String,
@@ -1038,6 +965,124 @@ impl ScreenState {
         buf.extend_from_slice(&self.parser.screen().contents_formatted());
         buf.extend_from_slice(&self.parser.screen().input_mode_formatted());
         buf
+    }
+}
+
+/// The inline-image half of the pipeline, shared by both owners.
+///
+/// Inline images live outside vt100's byte stream (it drops the sequences). The
+/// interceptor pulls them out of the raw PTY read and returns ordered [`Step`]s;
+/// each image is placed at the cursor by stamping per-cell image tags into the
+/// parser grid, which then ride vt100's own scrolling/eviction/reflow — each
+/// frame just reads the surviving tags back (see `resolve_images`), no scroll
+/// heuristics.
+///
+/// It owns the deferred-decode worker: sixel/kitty-raw payloads decode + PNG-
+/// encode OFF the owner's thread, so the tee never stalls behind a deflate (a
+/// sixel video would otherwise slow the terminal itself, 4–12× measured). Newest
+/// wins: jobs superseded while one was being processed are drained and dropped —
+/// their placements stay pending until cell overwrite evicts them — and having
+/// skipped ANY job is the backpressure signal that switches PNG encoding to the
+/// fast compression level until the worker catches up.
+pub(crate) struct ImagePipe {
+    interceptor: Interceptor,
+    seq: std::num::NonZeroU32,
+    cell: (u16, u16),
+    jobs: mpsc::Sender<(std::num::NonZeroU32, crate::images::DeferredPayload)>,
+}
+
+impl ImagePipe {
+    /// Build the pipe and spawn its decode worker. The worker answers on the
+    /// owner's own message channel, so a ready payload is applied in the same
+    /// single-threaded loop as everything else; `wrap` adapts the answer to that
+    /// owner's message type.
+    pub(crate) fn new<M: Send + 'static>(
+        intercept: (bool, bool, bool),
+        transcode: Option<crate::images::GfxProto>,
+        cell: (u16, u16),
+        ready: mpsc::Sender<M>,
+        wrap: fn(std::num::NonZeroU32, String, crate::model::ImageBlob) -> M,
+    ) -> ImagePipe {
+        let (job_tx, job_rx) =
+            mpsc::channel::<(std::num::NonZeroU32, crate::images::DeferredPayload)>();
+        std::thread::spawn(move || {
+            while let Ok(mut job) = job_rx.recv() {
+                let mut superseded = false;
+                while let Ok(newer) = job_rx.try_recv() {
+                    job = newer;
+                    superseded = true;
+                }
+                let Some((png, _px)) = crate::images::finish_deferred(&job.1, superseded) else {
+                    continue; // undecodable payload: the placement stays pending → evicted
+                };
+                let mime = "image/png".to_string();
+                let hash = crate::proto::content_key(&mime, &png);
+                let blob = crate::model::ImageBlob {
+                    mime,
+                    bytes: png.into(),
+                };
+                if ready.send(wrap(job.0, hash, blob)).is_err() {
+                    break; // owner gone
+                }
+            }
+        });
+        ImagePipe {
+            interceptor: Interceptor::with(intercept.0, intercept.1, intercept.2, transcode, cell),
+            seq: std::num::NonZeroU32::MIN,
+            cell,
+            jobs: job_tx,
+        }
+    }
+
+    /// Route one PTY read: split it into [`Step`]s, tee what the terminal should
+    /// see, drive vt100, and stamp/queue any inline image.
+    ///
+    /// `tee` takes the bytes bound for whatever terminal the owner serves (the
+    /// local one, or an attached client); a rejection tees nothing and instead
+    /// hands `inject` a kitty error bound for the APP, so a detect-mode client
+    /// falls back to direct transmission — which we do mirror. `Step::tee` is the
+    /// single source of truth for what reaches a terminal.
+    pub(crate) fn feed(
+        &mut self,
+        screen: &mut ScreenState,
+        bytes: &[u8],
+        mut tee: impl FnMut(&[u8]),
+        mut inject: impl FnMut(&[u8]),
+    ) {
+        for step in self.interceptor.feed(bytes) {
+            if let Some(b) = step.tee() {
+                tee(b);
+            }
+            match step {
+                Step::Passthrough(x) => screen.process(&x), // → vt100 too
+                Step::TerminalOnly(_) => {}                 // already teed
+                Step::Image(_, img) => {
+                    // Ready payload (iTerm2 native / kitty PNG): stamp and
+                    // record in one step.
+                    let hash = crate::proto::content_key(&img.mime, &img.bytes);
+                    let ready = Some((
+                        hash,
+                        crate::model::ImageBlob {
+                            mime: img.mime,
+                            bytes: img.bytes.into(),
+                        },
+                    ));
+                    screen.stamp_image(&mut self.seq, self.cell, img.cells, img.px, ready);
+                }
+                Step::Deferred(_, d) => {
+                    // Heavy decode (sixel / kitty raw): stamp NOW — cursor
+                    // semantics can't wait — and let the worker owe the bytes.
+                    // Newest-wins on the worker side: video frames superseded
+                    // before decoding are never decoded (their pending
+                    // placements die by cell overwrite like any other image).
+                    let id =
+                        screen.stamp_image(&mut self.seq, self.cell, d.cells, Some(d.px), None);
+                    let _ = self.jobs.send((id, d.payload));
+                }
+                Step::Reject(resp) => inject(&resp),
+            }
+        }
+        screen.touch();
     }
 }
 
