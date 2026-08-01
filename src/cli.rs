@@ -833,7 +833,12 @@ impl PushArgs {
                 "shellglass: attach with `shellglass attach {}`",
                 sock.display()
             );
-            Some((self.source.command(), sock, parse_size(&self.size)?))
+            Some((
+                self.source.command(),
+                sock,
+                parse_size(&self.size)?,
+                self.source.sixel_compat,
+            ))
         } else {
             None
         };
@@ -845,8 +850,10 @@ impl PushArgs {
         options.no_record = self.no_record;
         let source: SourceFactory = {
             #[cfg(unix)]
-            if let Some((cmd, sock, size)) = detached {
-                Box::new(move || crate::session::start_detached(&cmd, &sock, size))
+            if let Some((cmd, sock, size, sixel_compat)) = detached {
+                Box::new(move || {
+                    crate::session::start_detached_with_compat(&cmd, &sock, size, sixel_compat)
+                })
             } else {
                 Box::new(move || self.source.start())
             }

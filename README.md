@@ -93,11 +93,13 @@ collision or a non-URL-safe slug is a startup error.
 `dtach(1)` model): the stream to the hub stays live with **no** local terminal,
 and the session is exposed on a unix socket for `shellglass attach`, which
 connects a real terminal — driving input and size — until `` Ctrl-\ `` detaches
-it again. The session then holds the last attached dimensions (`--size` sets
-the initial/no-client size). One client at a time: a second `attach` is refused
-unless it takes over with `--force`, which kicks the incumbent. Unix only;
-inline images aren't mirrored in this mode (there is no local terminal to probe
-for image capabilities).
+it again. The session then retains that terminal's dimensions and graphics
+capabilities, so kitty/iTerm2/sixel images and capability auto-detection keep
+working while detached. A later terminal replaces the cached profile only after
+its attach and capability probe succeed; before the first successful attach,
+graphics interception stays disabled. (`--size` sets the initial/no-client
+dimensions.) One client at a time: a second `attach` is refused unless it takes
+over with `--force`, which kicks the incumbent. Unix only.
 
 ```sh
 # start a persistent stream at 160x50 (the socket path is printed)

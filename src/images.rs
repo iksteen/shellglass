@@ -83,6 +83,10 @@ pub enum Step {
     /// `.0` → the terminal, `.1` is stamped now (dims known up front) and filled
     /// when the worker answers — the screen thread never blocks on a deflate.
     Deferred(Vec<u8>, DeferredImage),
+    /// A graphics capability query. The original bytes still reach an attached
+    /// terminal; `.1` is a candidate app response used only by a detached owner
+    /// that has cached this protocol from its last attached terminal.
+    Query(Vec<u8>, Vec<u8>),
     /// A kitty file/shm transmission we refuse (its payload is a filesystem path /
     /// shm name and the stream is untrusted — the exfiltration vector). SUPPRESSED
     /// from the local terminal (nothing teed); `.0` is a kitty error echoing the
@@ -102,7 +106,8 @@ impl Step {
             Step::Passthrough(b)
             | Step::TerminalOnly(b)
             | Step::Image(b, _)
-            | Step::Deferred(b, _) => Some(b),
+            | Step::Deferred(b, _)
+            | Step::Query(b, _) => Some(b),
             Step::Reject(_) => None,
         }
     }
@@ -134,6 +139,9 @@ enum Segment {
     /// native graphics protocol (kitty/iTerm2), `image` is the PNG for the mirror.
     /// Routes to a `Step::Image` whose tee bytes are the transcode, not the sixel.
     Transcoded { tee: Vec<u8>, image: Image },
+    /// A query that draws nothing, with the response a detached virtual terminal
+    /// may return from its cached capabilities.
+    Query(Vec<u8>),
 }
 
 /// The stamp-now, decode-later form of an image (see [`Segment::Deferred`]).
@@ -382,6 +390,24 @@ impl Interceptor {
             cell,
             ..Default::default()
         }
+    }
+
+    /// Change which protocols are intercepted without discarding an in-flight
+    /// sequence or multipart transfer. The completed old transfer is therefore
+    /// handled coherently; subsequent scans use the new terminal profile.
+    pub fn configure(
+        &mut self,
+        do_kitty: bool,
+        do_iterm: bool,
+        do_sixel: bool,
+        transcode: Option<GfxProto>,
+        cell: (u16, u16),
+    ) {
+        self.do_kitty = do_kitty;
+        self.do_iterm = do_iterm;
+        self.do_sixel = do_sixel;
+        self.transcode = transcode;
+        self.cell = cell;
     }
 
     /// True if `s` is a nonempty proper prefix of an *enabled* start marker — a
@@ -701,6 +727,17 @@ impl Interceptor {
         let ctrl = parse_kv(control, b',');
         let more = ctrl.get("m").map(|v| v == "1").unwrap_or(false);
 
+        // A direct capability query is safe to answer from a cached terminal
+        // profile while detached. File/shm queries retain the security fallback:
+        // reject them so a detect-mode client retries with direct transmission.
+        if ctrl.get("a").map(String::as_str) == Some("q") {
+            return match ctrl.get("t").map(String::as_str) {
+                Some("f" | "t" | "s") => Segment::Reject(kitty_reject(&ctrl)),
+                None | Some("d") => Segment::Query(kitty_reply(&ctrl, "OK")),
+                _ => Segment::Drop,
+            };
+        }
+
         // Start an accumulator on the first chunk of a transfer — the one that
         // carries the format/medium/size control keys (continuation chunks only
         // repeat `m`).
@@ -827,9 +864,14 @@ fn kitty_direct_image(acc: KittyAccum) -> Option<Segment> {
 /// request's image id (`i`) and/or number (`I`) so the client correlates it. Any
 /// error code makes a detect-mode client treat the medium as unsupported and fall
 /// back to direct transmission; `EBADF` (the code kitty uses for an unreadable
-/// transmission) is the honest one. A query (`a=q`) and a real transmit are
-/// answered the same — either way we decline the medium.
+/// transmission) is the honest one. File/shm queries and real transmissions are
+/// answered the same — either way we decline that unsafe medium.
 fn kitty_reject(ctrl: &std::collections::HashMap<String, String>) -> Vec<u8> {
+    kitty_reply(ctrl, "EBADF:file transmission not supported")
+}
+
+/// Build a kitty response, echoing the identifiers used to correlate queries.
+fn kitty_reply(ctrl: &std::collections::HashMap<String, String>, status: &str) -> Vec<u8> {
     let mut keys = String::new();
     if let Some(i) = ctrl.get("i") {
         keys.push_str(&format!("i={i}"));
@@ -840,7 +882,7 @@ fn kitty_reject(ctrl: &std::collections::HashMap<String, String>) -> Vec<u8> {
         }
         keys.push_str(&format!("I={n}"));
     }
-    format!("\x1b_G{keys};EBADF:file transmission not supported\x1b\\").into_bytes()
+    format!("\x1b_G{keys};{status}\x1b\\").into_bytes()
 }
 
 /// Inflate a zlib stream (kitty `o=z` payloads).
@@ -1214,6 +1256,7 @@ fn push_tee(out: &mut Vec<Step>, bytes: &[u8], seg: Segment) {
     out.push(match seg {
         Segment::Image(i) => Step::Image(bytes.to_vec(), i),
         Segment::Deferred(d) => Step::Deferred(bytes.to_vec(), d),
+        Segment::Query(r) => Step::Query(bytes.to_vec(), r),
         Segment::Drop => Step::TerminalOnly(bytes.to_vec()),
         Segment::Reject(r) => Step::Reject(r),
         // Transcode: the tee is the re-encoded bytes, NOT the original sixel.
@@ -1253,7 +1296,10 @@ mod tests {
                         px: Some(px),
                     })
                 }
-                Step::Passthrough(_) | Step::TerminalOnly(_) | Step::Reject(_) => None,
+                Step::Passthrough(_)
+                | Step::TerminalOnly(_)
+                | Step::Query(_, _)
+                | Step::Reject(_) => None,
             })
             .collect()
     }
@@ -1711,6 +1757,19 @@ mod tests {
                 "non-display action rendered an image: {seq:?}"
             );
         }
+    }
+
+    #[test]
+    fn kitty_direct_query_is_routed_with_a_correlated_cached_reply() {
+        let query = b"\x1b_Gi=7,I=42,a=q,s=1,v=1,t=d,f=24;AAAA\x1b\\";
+        let mut it = Interceptor::new();
+        let steps = it.feed(query);
+        assert_eq!(tee_bytes(&steps), query);
+        assert!(matches!(
+            steps.as_slice(),
+            [Step::Query(_, response)]
+                if response == b"\x1b_Gi=7,I=42;OK\x1b\\"
+        ));
     }
 
     #[test]
