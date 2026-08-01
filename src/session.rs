@@ -14,12 +14,15 @@
 //! smallest/largest size arbitration to do: size is "the attached terminal, or the
 //! last one that was attached".
 //!
-//! Unix only (unix-domain sockets + termios). Frame fidelity matches the local
-//! mirror for text/colors/cursor; inline-image decoding is not wired into the
-//! headless owner (see [`crate::pty::ScreenState`]).
+//! Unix only (unix-domain sockets + termios). The last successfully attached
+//! terminal's graphics capabilities and geometry remain active after detach, and
+//! are replaced atomically only when a later attach finishes probing.
 
 use crate::model::Frame;
-use crate::pty::{RawMode, ScreenState};
+use crate::pty::{
+    Caps, DaRewriter, ImageReady, RawMode, ScreenState, TermGeom, TerminalProfile, image_worker,
+    probe_caps, term_geom, transcode_for,
+};
 use crate::source::{SinkStatus, SourceSession};
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -41,14 +44,20 @@ const DETACH_KEY: u8 = 0x1c;
 // Wire framing (both directions): [tag: u8][len: u32 BE][payload].
 // client -> owner:
 const C_INPUT: u8 = 0; //   raw input bytes
-const C_RESIZE: u8 = 1; //  {cols:u16 BE, rows:u16 BE}
+const C_RESIZE: u8 = 1; //  {cols,rows,pixel-width,pixel-height: u16 BE}
 const C_DETACH: u8 = 2; //  user detached (Ctrl-\)
-const C_HELLO: u8 = 3; //   first frame: {force:u8}
+const C_HELLO: u8 = 3; //   first frame: {force:u8, protocol-version:u8}
+const C_PROFILE: u8 = 4; // accepted client's terminal profile
 // owner -> client:
 const S_DATA: u8 = 0; //    screen bytes (write verbatim to stdout)
 const S_ACCEPTED: u8 = 1; //attach granted; streaming follows
 const S_REJECTED: u8 = 2; //attach refused; payload is the reason
 const S_KICKED: u8 = 3; //  you were force-detached by another client
+
+/// The attach socket is private/local, but the binaries are shipped separately:
+/// reject skew explicitly instead of failing halfway through the two-phase attach.
+const ATTACH_PROTOCOL_VERSION: u8 = 2;
+const PROFILE_LEN: usize = 17;
 
 fn write_frame<W: Write>(w: &mut W, tag: u8, payload: &[u8]) -> std::io::Result<()> {
     let len = payload.len() as u32;
@@ -78,6 +87,61 @@ fn read_frame<R: Read>(r: &mut R) -> std::io::Result<(u8, Vec<u8>)> {
     Ok((hdr[0], payload))
 }
 
+/// Fixed profile wire shape: flags; fg-present+RGB; bg-present+RGB; then
+/// cols/rows/pixel-width/pixel-height as big-endian u16s.
+fn encode_profile(profile: TerminalProfile) -> [u8; PROFILE_LEN] {
+    let mut out = [0u8; PROFILE_LEN];
+    out[0] = u8::from(profile.caps.kitty)
+        | (u8::from(profile.caps.iterm) << 1)
+        | (u8::from(profile.caps.sixel) << 2);
+    if let Some(rgb) = profile.caps.default_fg {
+        out[1] = 1;
+        out[2..5].copy_from_slice(&[rgb.0, rgb.1, rgb.2]);
+    }
+    if let Some(rgb) = profile.caps.default_bg {
+        out[5] = 1;
+        out[6..9].copy_from_slice(&[rgb.0, rgb.1, rgb.2]);
+    }
+    for (i, v) in [
+        profile.geom.cols,
+        profile.geom.rows,
+        profile.geom.px_w,
+        profile.geom.px_h,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        out[9 + i * 2..11 + i * 2].copy_from_slice(&v.to_be_bytes());
+    }
+    out
+}
+
+fn decode_profile(bytes: &[u8]) -> Option<TerminalProfile> {
+    if bytes.len() != PROFILE_LEN || bytes[0] & !0b111 != 0 || bytes[1] > 1 || bytes[5] > 1 {
+        return None;
+    }
+    let word = |i: usize| u16::from_be_bytes([bytes[i], bytes[i + 1]]);
+    let geom = TermGeom {
+        cols: word(9),
+        rows: word(11),
+        px_w: word(13),
+        px_h: word(15),
+    };
+    if geom.cols == 0 || geom.rows == 0 || geom.px_w == 0 || geom.px_h == 0 {
+        return None;
+    }
+    Some(TerminalProfile {
+        caps: Caps {
+            kitty: bytes[0] & 1 != 0,
+            iterm: bytes[0] & 2 != 0,
+            sixel: bytes[0] & 4 != 0,
+            default_fg: (bytes[1] == 1).then_some((bytes[2], bytes[3], bytes[4])),
+            default_bg: (bytes[5] == 1).then_some((bytes[6], bytes[7], bytes[8])),
+        },
+        geom,
+    })
+}
+
 /// A registered attach client's output side (owned by the core thread).
 struct ClientSink {
     stream: UnixStream,
@@ -88,7 +152,7 @@ impl ClientSink {
         write_frame(&mut self.stream, S_DATA, bytes)
     }
     fn send_accepted(&mut self) -> std::io::Result<()> {
-        write_frame(&mut self.stream, S_ACCEPTED, &[])
+        write_frame(&mut self.stream, S_ACCEPTED, &[ATTACH_PROTOCOL_VERSION])
     }
     fn send_rejected(&mut self, reason: &str) -> std::io::Result<()> {
         write_frame(&mut self.stream, S_REJECTED, reason.as_bytes())
@@ -101,16 +165,29 @@ impl ClientSink {
 /// Messages into the single core thread (owns the [`ScreenState`]).
 enum Core {
     Data(Vec<u8>),
-    Resize(u16, u16), // rows, cols (parser side)
+    ImageReady(ImageReady),
+    Input {
+        cid: u64,
+        bytes: Vec<u8>,
+    },
+    ClientResize {
+        cid: u64,
+        geom: TermGeom,
+    },
     /// A connection wants to attach. The core is the sole owner of the
     /// one-client-at-a-time policy: it accepts (optionally kicking the incumbent
     /// when `force`) or rejects, replying so the handler knows whether to pump.
     AttachRequest {
         cid: u64,
         force: bool,
-        cols: u16,
-        rows: u16,
         sink: ClientSink,
+        reply: mpsc::Sender<bool>,
+    },
+    /// Phase two of attach. Reserving a slot does not alter cached terminal
+    /// state; only a valid profile makes the client live and replaces it.
+    Profile {
+        cid: u64,
+        profile: TerminalProfile,
         reply: mpsc::Sender<bool>,
     },
     Detach {
@@ -122,9 +199,20 @@ enum Core {
 }
 
 /// Messages into the PTY-control thread (sole owner of the master + writer).
+#[derive(Debug)]
 enum PtyCmd {
     Input(Vec<u8>),
-    Resize(u16, u16), // rows, cols
+    Resize(TermGeom),
+    Profile {
+        geom: TermGeom,
+        advertise_sixel: bool,
+    },
+}
+
+struct AttachedClient {
+    cid: u64,
+    sink: ClientSink,
+    live: bool,
 }
 
 /// Default runtime directory for per-session files (socket, daemon log).
@@ -217,6 +305,17 @@ pub fn start_detached(
     socket: &Path,
     size: (u16, u16),
 ) -> Result<SourceSession> {
+    start_detached_with_compat(command, socket, size, false)
+}
+
+/// Internal entry point used by the CLI to preserve `--sixel-compat` in
+/// detachable mode without changing the public library API.
+pub(crate) fn start_detached_with_compat(
+    command: &[String],
+    socket: &Path,
+    size: (u16, u16),
+    sixel_compat: bool,
+) -> Result<SourceSession> {
     let (cols, rows) = size;
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -269,24 +368,42 @@ pub fn start_detached(
 
     // PTY control: sole owner of the master (resize) and writer (input).
     {
-        let core_tx = core_tx.clone();
         thread::spawn(move || {
             let mut writer = writer;
             let master = master;
+            let mut rewrite_da = false;
+            let mut da = DaRewriter::default();
             while let Ok(cmd) = pty_rx.recv() {
                 match cmd {
                     PtyCmd::Input(b) => {
-                        let _ = writer.write_all(&b);
+                        let bytes = if rewrite_da {
+                            da.advertise_sixel(&b)
+                        } else {
+                            b
+                        };
+                        let _ = writer.write_all(&bytes);
                         let _ = writer.flush();
                     }
-                    PtyCmd::Resize(r, c) => {
+                    PtyCmd::Resize(geom) => {
                         let _ = master.resize(PtySize {
-                            rows: r,
-                            cols: c,
-                            pixel_width: 0,
-                            pixel_height: 0,
+                            rows: geom.rows,
+                            cols: geom.cols,
+                            pixel_width: geom.px_w,
+                            pixel_height: geom.px_h,
                         });
-                        let _ = core_tx.send(Core::Resize(r, c));
+                    }
+                    PtyCmd::Profile {
+                        geom,
+                        advertise_sixel,
+                    } => {
+                        rewrite_da = advertise_sixel;
+                        da = DaRewriter::default();
+                        let _ = master.resize(PtySize {
+                            rows: geom.rows,
+                            cols: geom.cols,
+                            pixel_width: geom.px_w,
+                            pixel_height: geom.px_h,
+                        });
                     }
                 }
             }
@@ -324,7 +441,6 @@ pub fn start_detached(
     let _ = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600));
     {
         let core_tx = core_tx.clone();
-        let pty_tx = pty_tx.clone();
         thread::spawn(move || {
             let mut next_cid: u64 = 0;
             for conn in listener.incoming() {
@@ -335,8 +451,7 @@ pub fn start_detached(
                 next_cid += 1;
                 let cid = next_cid;
                 let core_tx = core_tx.clone();
-                let pty_tx = pty_tx.clone();
-                thread::spawn(move || handle_client(stream, cid, core_tx, pty_tx));
+                thread::spawn(move || handle_client(stream, cid, core_tx));
             }
         });
     }
@@ -345,13 +460,16 @@ pub fn start_detached(
     {
         let socket = socket.to_path_buf();
         let pty_tx = pty_tx.clone();
+        let ready_tx = core_tx.clone();
+        let image_jobs = image_worker(move |ready| ready_tx.send(Core::ImageReady(ready)).is_ok());
         thread::spawn(move || {
             core_thread(
                 core_rx,
                 pty_tx,
                 frame_tx,
-                ScreenState::new(rows, cols),
+                ScreenState::new(rows, cols, image_jobs),
                 socket,
+                sixel_compat,
             );
         });
     }
@@ -374,15 +492,10 @@ impl SinkStatus for CoreStatus {
     }
 }
 
-/// Owner-side per-connection handler: read the client's hello + initial size, ask
-/// the core to attach it, and (if accepted) pump its input/resize/detach frames
-/// until it disconnects.
-fn handle_client(
-    stream: UnixStream,
-    cid: u64,
-    core_tx: mpsc::Sender<Core>,
-    pty_tx: mpsc::Sender<PtyCmd>,
-) {
+/// Owner-side per-connection handler. Attach is deliberately two phase: reserve
+/// the one client slot, then accept a successfully probed terminal profile. A
+/// disconnect between those phases leaves the previous cached profile untouched.
+fn handle_client(stream: UnixStream, cid: u64, core_tx: mpsc::Sender<Core>) {
     let sink_stream = match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
@@ -392,34 +505,28 @@ fn handle_client(
     // cost it at most this before the client is dropped — never a frozen mirror.
     let _ = sink_stream.set_write_timeout(Some(Duration::from_secs(1)));
     let mut read_half = stream;
+    let mut sink = ClientSink {
+        stream: sink_stream,
+    };
 
-    // First frame: hello (carries the --force flag). Tolerate its absence.
+    // Reject binary skew before touching the client's tty or reserving the slot.
     let force = match read_frame(&mut read_half) {
-        Ok((C_HELLO, p)) => p.first().copied().unwrap_or(0) != 0,
-        Ok(_) => false,
+        Ok((C_HELLO, p)) if p.len() == 2 && p[0] <= 1 && p[1] == ATTACH_PROTOCOL_VERSION => {
+            p[0] != 0
+        }
+        Ok(_) => {
+            let _ = sink.send_rejected("incompatible attach protocol version");
+            return;
+        }
         Err(_) => return,
     };
-    // Second frame: the initial terminal size.
-    let (mut cols, mut rows) = (80u16, 24u16);
-    match read_frame(&mut read_half) {
-        Ok((C_RESIZE, p)) if p.len() == 4 => {
-            cols = u16::from_be_bytes([p[0], p[1]]);
-            rows = u16::from_be_bytes([p[2], p[3]]);
-        }
-        Ok(_) => {}
-        Err(_) => return,
-    }
 
     let (reply_tx, reply_rx) = mpsc::channel::<bool>();
     if core_tx
         .send(Core::AttachRequest {
             cid,
             force,
-            cols,
-            rows,
-            sink: ClientSink {
-                stream: sink_stream,
-            },
+            sink,
             reply: reply_tx,
         })
         .is_err()
@@ -431,15 +538,47 @@ fn handle_client(
         return;
     }
 
+    // Phase two must be the fixed-shape profile. Any malformed/aborted attach
+    // simply releases the reservation and retains the previous cached profile.
+    let profile = match read_frame(&mut read_half) {
+        Ok((C_PROFILE, p)) => match decode_profile(&p) {
+            Some(profile) => profile,
+            None => {
+                let _ = core_tx.send(Core::Detach { cid });
+                return;
+            }
+        },
+        _ => {
+            let _ = core_tx.send(Core::Detach { cid });
+            return;
+        }
+    };
+    let (profile_tx, profile_rx) = mpsc::channel();
+    if core_tx
+        .send(Core::Profile {
+            cid,
+            profile,
+            reply: profile_tx,
+        })
+        .is_err()
+        || !matches!(profile_rx.recv(), Ok(true))
+    {
+        let _ = core_tx.send(Core::Detach { cid });
+        return;
+    }
+
     loop {
         match read_frame(&mut read_half) {
             Ok((C_INPUT, payload)) => {
-                let _ = pty_tx.send(PtyCmd::Input(payload));
+                let _ = core_tx.send(Core::Input {
+                    cid,
+                    bytes: payload,
+                });
             }
-            Ok((C_RESIZE, p)) if p.len() == 4 => {
-                let c = u16::from_be_bytes([p[0], p[1]]);
-                let r = u16::from_be_bytes([p[2], p[3]]);
-                let _ = pty_tx.send(PtyCmd::Resize(r, c));
+            Ok((C_RESIZE, p)) => {
+                if let Some(geom) = decode_geom(&p) {
+                    let _ = core_tx.send(Core::ClientResize { cid, geom });
+                }
             }
             Ok((C_DETACH, _)) => break,
             Ok(_) => {}
@@ -458,8 +597,9 @@ fn core_thread(
     frame_tx: watch::Sender<Arc<Frame>>,
     mut screen: ScreenState,
     socket: PathBuf,
+    sixel_compat: bool,
 ) {
-    let mut client: Option<(u64, ClientSink)> = None;
+    let mut client: Option<AttachedClient> = None;
 
     loop {
         let msg = match screen.wait() {
@@ -476,19 +616,39 @@ fn core_thread(
 
         match msg {
             Some(Core::Data(b)) => {
-                screen.process(&b);
-                if let Some((_, sink)) = client.as_mut()
-                    && sink.send_data(&b).is_err()
+                let routed = screen.feed_output(&b);
+                let mut terminal_answered = false;
+                if let Some(attached) = client.as_mut()
+                    && attached.live
                 {
-                    client = None;
+                    if attached.sink.send_data(&routed.terminal).is_ok() {
+                        terminal_answered = true;
+                    } else {
+                        client = None;
+                    }
+                }
+                if !routed.app.is_empty() {
+                    let _ = pty_tx.send(PtyCmd::Input(routed.app));
+                }
+                if !terminal_answered && !routed.queries.is_empty() {
+                    let _ = pty_tx.send(PtyCmd::Input(routed.queries));
                 }
             }
-            Some(Core::Resize(rows, cols)) => screen.set_size(rows, cols),
+            Some(Core::ImageReady(ready)) => screen.image_ready(ready),
+            Some(Core::Input { cid, bytes }) => {
+                if matches!(client.as_ref(), Some(c) if c.cid == cid && c.live) {
+                    let _ = pty_tx.send(PtyCmd::Input(bytes));
+                }
+            }
+            Some(Core::ClientResize { cid, geom }) => {
+                if matches!(client.as_ref(), Some(c) if c.cid == cid && c.live) {
+                    screen.set_geometry(geom);
+                    let _ = pty_tx.send(PtyCmd::Resize(geom));
+                }
+            }
             Some(Core::AttachRequest {
                 cid,
                 force,
-                cols,
-                rows,
                 mut sink,
                 reply,
             }) => {
@@ -498,23 +658,60 @@ fn core_thread(
                     );
                     let _ = reply.send(false); // sink dropped -> closes the refused connection
                 } else {
-                    if let Some((_, mut old)) = client.take() {
-                        let _ = old.send_kicked(); // force takeover: notify the incumbent
+                    if let Some(mut old) = client.take() {
+                        let _ = old.sink.send_kicked(); // force takeover: notify incumbent
                     }
-                    // The PTY tracks the client's terminal only once the attach is
-                    // GRANTED — a rejected attach must never resize the session.
-                    let _ = pty_tx.send(PtyCmd::Resize(rows, cols));
-                    screen.set_size(rows, cols);
-                    let _ = sink.send_accepted();
-                    let _ = sink.send_data(&screen.repaint());
-                    client = Some((cid, sink));
-                    let _ = reply.send(true);
-                    screen.touch();
+                    // Accepted means reserved, not live: no PTY output is sent and
+                    // no cached capability/geometry changes until Profile.
+                    let accepted = sink.send_accepted().is_ok();
+                    if accepted {
+                        client = Some(AttachedClient {
+                            cid,
+                            sink,
+                            live: false,
+                        });
+                    }
+                    let _ = reply.send(accepted);
                 }
             }
+            Some(Core::Profile {
+                cid,
+                profile,
+                reply,
+            }) => {
+                let pending = matches!(client.as_ref(), Some(c) if c.cid == cid && !c.live);
+                let transcode = transcode_for(profile.caps, sixel_compat);
+                let configured = pending
+                    && pty_tx
+                        .send(PtyCmd::Profile {
+                            geom: profile.geom,
+                            advertise_sixel: transcode.is_some(),
+                        })
+                        .is_ok();
+                let mut activated = false;
+                if configured {
+                    // A complete validated probe is the commit point. Size the
+                    // screen before producing the new terminal's repaint; if the
+                    // peer vanished immediately afterward, retain this successfully
+                    // probed profile but release the client slot.
+                    screen.set_profile(profile, transcode);
+                    screen.set_geometry(profile.geom);
+                    if let Some(attached) = client.as_mut() {
+                        if attached.sink.send_data(&screen.repaint()).is_ok() {
+                            attached.live = true;
+                            activated = true;
+                        } else {
+                            client = None;
+                        }
+                    }
+                } else if pending {
+                    client = None;
+                }
+                let _ = reply.send(activated);
+            }
             Some(Core::Detach { cid }) => {
-                if matches!(client.as_ref(), Some((c, _)) if *c == cid) {
-                    client = None; // keep the last attached size; don't resize back
+                if matches!(client.as_ref(), Some(c) if c.cid == cid) {
+                    client = None; // retain last successful profile and geometry
                 }
             }
             Some(Core::HubUp) => {
@@ -528,6 +725,9 @@ fn core_thread(
             }
             Some(Core::Shutdown) => {
                 let _ = std::fs::remove_file(&socket);
+                #[cfg(test)]
+                break;
+                #[cfg(not(test))]
                 std::process::exit(0);
             }
             None => {}
@@ -540,24 +740,33 @@ fn core_thread(
     let _ = std::fs::remove_file(&socket);
 }
 
-fn send_resize(w: &mut UnixStream, cols: u16, rows: u16) -> std::io::Result<()> {
-    let mut p = [0u8; 4];
-    p[..2].copy_from_slice(&cols.to_be_bytes());
-    p[2..].copy_from_slice(&rows.to_be_bytes());
-    write_frame(w, C_RESIZE, &p)
+fn encode_geom(geom: TermGeom) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    for (i, v) in [geom.cols, geom.rows, geom.px_w, geom.px_h]
+        .into_iter()
+        .enumerate()
+    {
+        out[i * 2..i * 2 + 2].copy_from_slice(&v.to_be_bytes());
+    }
+    out
 }
 
-/// The controlling terminal's size as (cols, rows), if stdin is a tty.
-fn term_size() -> Option<(u16, u16)> {
-    // SAFETY: ioctl into a zeroed winsize; only read on success.
-    unsafe {
-        let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
-            Some((ws.ws_col, ws.ws_row))
-        } else {
-            None
-        }
+fn decode_geom(bytes: &[u8]) -> Option<TermGeom> {
+    if bytes.len() != 8 {
+        return None;
     }
+    let word = |i: usize| u16::from_be_bytes([bytes[i], bytes[i + 1]]);
+    let geom = TermGeom {
+        cols: word(0),
+        rows: word(2),
+        px_w: word(4),
+        px_h: word(6),
+    };
+    (geom.cols > 0 && geom.rows > 0 && geom.px_w > 0 && geom.px_h > 0).then_some(geom)
+}
+
+fn send_resize(w: &mut UnixStream, geom: TermGeom) -> std::io::Result<()> {
+    write_frame(w, C_RESIZE, &encode_geom(geom))
 }
 
 /// Attach the current terminal to a detached session's socket. Returns when the
@@ -569,13 +778,16 @@ pub fn attach(socket: &Path, force: bool) -> Result<()> {
     let mut writer = stream.try_clone().context("cloning socket")?;
 
     // Handshake BEFORE touching the terminal, so a rejection prints cleanly.
-    write_frame(&mut writer, C_HELLO, &[force as u8]).context("sending hello")?;
-    let (cols, rows) = term_size().unwrap_or((80, 24));
-    send_resize(&mut writer, cols, rows).context("sending initial size")?;
+    write_frame(
+        &mut writer,
+        C_HELLO,
+        &[force as u8, ATTACH_PROTOCOL_VERSION],
+    )
+    .context("sending hello")?;
 
     let mut reader = stream;
     match read_frame(&mut reader) {
-        Ok((S_ACCEPTED, _)) => {}
+        Ok((S_ACCEPTED, p)) if p == [ATTACH_PROTOCOL_VERSION] => {}
         Ok((S_REJECTED, msg)) => {
             eprintln!("shellglass: {}", String::from_utf8_lossy(&msg));
             std::process::exit(1);
@@ -584,6 +796,19 @@ pub fn attach(socket: &Path, force: bool) -> Result<()> {
     }
 
     let raw = Arc::new(RawMode::acquire());
+    let profile = TerminalProfile {
+        caps: probe_caps(),
+        geom: term_geom().unwrap_or(TermGeom {
+            cols: 80,
+            rows: 24,
+            px_w: 640,
+            px_h: 384,
+        }),
+    };
+    if let Err(error) = write_frame(&mut writer, C_PROFILE, &encode_profile(profile)) {
+        raw.leave();
+        return Err(error).context("sending terminal profile");
+    }
     // Set the instant we initiate a `Ctrl-\` detach, BEFORE the owner can react
     // and close the socket — so the reader thread's EOF is recognized as our own
     // detach (main prints the notice) and not misreported as the session ending.
@@ -634,13 +859,13 @@ pub fn attach(socket: &Path, force: bool) -> Result<()> {
             else {
                 return;
             };
-            let mut last = (cols, rows);
+            let mut last = profile.geom;
             for _ in &mut signals {
-                if let Some(sz) = term_size()
-                    && sz != last
+                if let Some(geom) = term_geom()
+                    && geom != last
                 {
-                    last = sz;
-                    let _ = send_resize(&mut writer, sz.0, sz.1);
+                    last = geom;
+                    let _ = send_resize(&mut writer, geom);
                 }
             }
         });
@@ -693,6 +918,37 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
+    fn profile(kitty: bool, sixel: bool, cols: u16) -> TerminalProfile {
+        TerminalProfile {
+            caps: Caps {
+                kitty,
+                iterm: false,
+                sixel,
+                default_fg: Some((1, 2, 3)),
+                default_bg: Some((4, 5, 6)),
+            },
+            geom: TermGeom {
+                cols,
+                rows: 30,
+                px_w: cols * 8,
+                px_h: 480,
+            },
+        }
+    }
+
+    #[test]
+    fn profile_wire_shape_round_trips_and_rejects_invalid_geometry() {
+        let expected = profile(true, true, 100);
+        assert_eq!(decode_profile(&encode_profile(expected)), Some(expected));
+        let mut invalid = encode_profile(expected);
+        invalid[9..11].copy_from_slice(&0u16.to_be_bytes());
+        assert_eq!(decode_profile(&invalid), None);
+        assert_eq!(
+            decode_geom(&encode_geom(expected.geom)),
+            Some(expected.geom)
+        );
+    }
+
     /// Send one AttachRequest to a running core, returning our end of the
     /// client socket and the core's accept/reject verdict.
     fn attach_request(core_tx: &mpsc::Sender<Core>, cid: u64, force: bool) -> (UnixStream, bool) {
@@ -702,8 +958,6 @@ mod tests {
             .send(Core::AttachRequest {
                 cid,
                 force,
-                cols: 100,
-                rows: 30,
                 sink: ClientSink { stream: theirs },
                 reply: reply_tx,
             })
@@ -711,26 +965,62 @@ mod tests {
         (ours, reply_rx.recv().unwrap())
     }
 
-    #[test]
-    fn one_client_at_a_time_policy() {
+    fn install_profile(core_tx: &mpsc::Sender<Core>, cid: u64, profile: TerminalProfile) -> bool {
+        let (reply, result) = mpsc::channel();
+        core_tx
+            .send(Core::Profile {
+                cid,
+                profile,
+                reply,
+            })
+            .unwrap();
+        result.recv().unwrap()
+    }
+
+    fn test_core() -> (
+        mpsc::Sender<Core>,
+        mpsc::Receiver<PtyCmd>,
+        watch::Receiver<Arc<Frame>>,
+    ) {
         let (core_tx, core_rx) = mpsc::channel();
         let (pty_tx, pty_rx) = mpsc::channel();
-        let (frame_tx, _frame_rx) = watch::channel(ScreenState::blank_frame(24, 80));
-        let sock =
-            std::env::temp_dir().join(format!("shellglass-test-{}.sock", std::process::id()));
+        let (frame_tx, frame_rx) = watch::channel(ScreenState::blank_frame(24, 80));
+        let (jobs, _job_rx) = mpsc::channel();
+        let sock = std::env::temp_dir().join(format!(
+            "shellglass-test-{}-{:?}.sock",
+            std::process::id(),
+            thread::current().id()
+        ));
         thread::spawn(move || {
-            core_thread(core_rx, pty_tx, frame_tx, ScreenState::new(24, 80), sock);
+            core_thread(
+                core_rx,
+                pty_tx,
+                frame_tx,
+                ScreenState::new(24, 80, jobs),
+                sock,
+                false,
+            );
         });
+        (core_tx, pty_rx, frame_rx)
+    }
 
-        // First client: accepted, and only now does the PTY track its terminal.
+    #[test]
+    fn attach_is_two_phase_and_force_still_enforces_one_client() {
+        let (core_tx, pty_rx, _frames) = test_core();
+
+        // Reservation neither resizes nor activates terminal output.
         let (mut first, ok) = attach_request(&core_tx, 1, false);
         assert!(ok);
-        assert!(matches!(pty_rx.recv().unwrap(), PtyCmd::Resize(30, 100)));
-        let (tag, _) = read_frame(&mut first).unwrap();
+        let (tag, version) = read_frame(&mut first).unwrap();
         assert_eq!(tag, S_ACCEPTED);
+        assert_eq!(version, [ATTACH_PROTOCOL_VERSION]);
+        let unexpected = pty_rx.try_recv();
+        assert!(
+            unexpected.is_err(),
+            "unexpected PTY command: {unexpected:?}"
+        );
 
-        // Second client without force: rejected with a reason, and the live
-        // session was NOT resized.
+        // A reserved client owns the slot just like a live one.
         let (mut second, ok) = attach_request(&core_tx, 2, false);
         assert!(!ok);
         let (tag, reason) = read_frame(&mut second).unwrap();
@@ -741,15 +1031,174 @@ mod tests {
             "rejected attach must not resize"
         );
 
-        // Third client with force: the incumbent is kicked, the newcomer wins.
+        // Completing the profile is the first point at which geometry/caps apply.
+        assert!(install_profile(&core_tx, 1, profile(true, false, 100)));
+        assert!(matches!(
+            pty_rx.recv().unwrap(),
+            PtyCmd::Profile {
+                geom: TermGeom { cols: 100, .. },
+                advertise_sixel: false
+            }
+        ));
+        let (tag, _) = read_frame(&mut first).unwrap();
+        assert_eq!(tag, S_DATA); // cells-only repaint
+
+        // A force takeover kicks the incumbent, but the newcomer is pending and
+        // still cannot mutate the PTY until it submits a profile.
         let (mut third, ok) = attach_request(&core_tx, 3, true);
         assert!(ok);
-        assert!(matches!(pty_rx.recv().unwrap(), PtyCmd::Resize(30, 100)));
         let (tag, _) = read_frame(&mut third).unwrap();
         assert_eq!(tag, S_ACCEPTED);
-        let (tag, _) = read_frame(&mut first).unwrap(); // the accept-time repaint
-        assert_eq!(tag, S_DATA);
         let (tag, _) = read_frame(&mut first).unwrap();
         assert_eq!(tag, S_KICKED);
+        assert!(pty_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn cached_graphics_profile_survives_detach_and_aborted_attach() {
+        let (core_tx, pty_rx, _frames) = test_core();
+        let (mut first, ok) = attach_request(&core_tx, 10, false);
+        assert!(ok);
+        let _ = read_frame(&mut first).unwrap();
+        assert!(install_profile(&core_tx, 10, profile(true, false, 100)));
+        let _ = pty_rx.recv().unwrap();
+        let _ = read_frame(&mut first).unwrap();
+        core_tx.send(Core::Detach { cid: 10 }).unwrap();
+
+        let query = b"\x1b_Gi=9,a=q,t=d,s=1,v=1;AAAA\x1b\\";
+        let expected = b"\x1b_Gi=9;OK\x1b\\";
+        core_tx.send(Core::Data(query.to_vec())).unwrap();
+        assert!(matches!(
+            pty_rx.recv().unwrap(),
+            PtyCmd::Input(ref b) if b == expected
+        ));
+        core_tx.send(Core::Data(b"\x1b[".to_vec())).unwrap();
+        assert!(pty_rx.try_recv().is_err());
+        core_tx.send(Core::Data(b"c".to_vec())).unwrap();
+        assert!(matches!(
+            pty_rx.recv().unwrap(),
+            PtyCmd::Input(ref b) if b == b"\x1b[?1;2c"
+        ));
+
+        // Reserving and then abandoning a terminal with different capabilities
+        // must not replace the last successful terminal's cached answer.
+        let (mut pending, ok) = attach_request(&core_tx, 11, false);
+        assert!(ok);
+        let _ = read_frame(&mut pending).unwrap();
+        core_tx.send(Core::Data(query.to_vec())).unwrap();
+        assert!(matches!(
+            pty_rx.recv().unwrap(),
+            PtyCmd::Input(ref b) if b == expected
+        ));
+        core_tx.send(Core::Detach { cid: 11 }).unwrap();
+
+        // A later successful no-kitty profile really does replace it.
+        let (mut replacement, ok) = attach_request(&core_tx, 12, false);
+        assert!(ok);
+        let _ = read_frame(&mut replacement).unwrap();
+        assert!(install_profile(&core_tx, 12, profile(false, true, 120)));
+        let _ = pty_rx.recv().unwrap();
+        let _ = read_frame(&mut replacement).unwrap();
+        core_tx.send(Core::Detach { cid: 12 }).unwrap();
+        core_tx.send(Core::Data(query.to_vec())).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let unexpected = pty_rx.try_recv();
+        assert!(
+            unexpected.is_err(),
+            "unexpected PTY command: {unexpected:?}"
+        );
+        core_tx.send(Core::Data(b"\x1b[0c".to_vec())).unwrap();
+        assert!(matches!(
+            pty_rx.recv().unwrap(),
+            PtyCmd::Input(ref b) if b == b"\x1b[?1;2;4c"
+        ));
+    }
+
+    fn wait_for_frame(
+        source: &SourceSession,
+        predicate: impl Fn(&crate::model::Grid) -> bool,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            let current = source.frames.borrow();
+            let Frame::Screen(grid) = &**current;
+            if predicate(grid) {
+                return true;
+            }
+            drop(current);
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// Empirical regression: drive the actual detachable owner, Unix socket and
+    /// child PTY. The child emits one image before any attach (must be ignored),
+    /// then after detach asks kitty whether graphics work. It emits the image a
+    /// second time only if the owner answers from the retained terminal profile.
+    #[test]
+    fn real_pty_images_activate_on_attach_and_keep_working_after_detach() {
+        const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==";
+        let image = format!("\\033_Ga=T,f=100,t=d,c=1,r=1;{PNG}\\033\\\\");
+        let script = format!(
+            "printf '{image}'; printf 'READY\\r\\n'; IFS= read -r line; \
+             sleep 0.1; stty raw -echo; \
+             printf '\\033_Gi=9,a=q,t=d,s=1,v=1;AAAA\\033\\\\'; \
+             reply=$(dd bs=1 count=11 2>/dev/null); \
+             case \"$reply\" in *OK*) printf '{image}';; esac; sleep 0.1"
+        );
+        let command = vec!["/bin/sh".to_string(), "-c".to_string(), script];
+        let socket = std::env::temp_dir().join(format!(
+            "shellglass-image-e2e-{}-{:?}.sock",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let source = start_detached(&command, &socket, (80, 24)).unwrap();
+
+        assert!(wait_for_frame(&source, |grid| {
+            grid.rows
+                .iter()
+                .flatten()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>()
+                .contains("READY")
+        }));
+        {
+            let current = source.frames.borrow();
+            let Frame::Screen(grid) = &**current;
+            assert!(
+                grid.images.is_empty() && grid.image_data.is_empty(),
+                "graphics must remain disabled before the first successful attach"
+            );
+        }
+
+        let mut client = UnixStream::connect(&socket).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write_frame(&mut client, C_HELLO, &[0, ATTACH_PROTOCOL_VERSION]).unwrap();
+        let (tag, version) = read_frame(&mut client).unwrap();
+        assert_eq!((tag, version), (S_ACCEPTED, vec![ATTACH_PROTOCOL_VERSION]));
+        write_frame(
+            &mut client,
+            C_PROFILE,
+            &encode_profile(profile(true, false, 80)),
+        )
+        .unwrap();
+        let (tag, _) = read_frame(&mut client).unwrap();
+        assert_eq!(tag, S_DATA);
+
+        // Input wakes the child; Detach is ordered behind it in the same owner
+        // queue. The child waits briefly, then its query can only be answered by
+        // the now-detached owner's cached kitty capability.
+        write_frame(&mut client, C_INPUT, b"go\n").unwrap();
+        write_frame(&mut client, C_DETACH, &[]).unwrap();
+        drop(client);
+
+        assert!(
+            wait_for_frame(&source, |grid| {
+                !grid.images.is_empty() && !grid.image_data.is_empty()
+            }),
+            "child received no cached kitty reply, or its image was not mirrored"
+        );
     }
 }

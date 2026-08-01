@@ -64,17 +64,28 @@ const INPUT_MODES_OFF: &[u8] =
 enum Msg {
     Data(Vec<u8>),
     Resize(u16, u16), // rows, cols
-    /// A deferred image's payload, decoded/encoded by the worker thread —
-    /// fills the pending [`Placed`] with the same `id` (dropped if the
-    /// placement was already overwritten/evicted).
-    ImageReady {
-        id: std::num::NonZeroU32,
-        hash: String,
-        blob: crate::model::ImageBlob,
-    },
+    ImageReady(ImageReady),
     HubDown(String),
     HubUp,
     Shutdown,
+}
+
+/// A deferred image completed by the shared decode worker.
+pub(crate) struct ImageReady {
+    id: std::num::NonZeroU32,
+    hash: String,
+    blob: crate::model::ImageBlob,
+}
+
+/// Bytes produced while routing one PTY output read through the terminal-image
+/// side channel. `terminal` keeps byte order for the current attached/local
+/// terminal; `app` is unconditional (notably safe file/shm rejection), while
+/// `queries` is injected only when a detached owner has no live terminal.
+#[derive(Default)]
+pub(crate) struct RoutedOutput {
+    pub(crate) terminal: Vec<u8>,
+    pub(crate) app: Vec<u8>,
+    pub(crate) queries: Vec<u8>,
 }
 
 /// Lets the push client report hub connection changes to the terminal owner so it
@@ -153,23 +164,12 @@ pub fn start(command: &[String], sixel_compat: bool) -> Result<SourceSession> {
     // real defaults matters for unstyled/faint-looking text such as Claude Code's
     // tab-completion suggestion.
     let caps = probe_caps();
-    let iterm = iterm_supported();
     // EXPERIMENTAL (opt-in via --sixel-compat): terminal renders kitty/iTerm2
     // graphics but NOT sixel → transcode sixel into that protocol so sixel-emitting
     // tools (esp. through tmux, which carries sixel in its grid model) show up
     // locally and mirror to the web. When sixel is native, or the flag is off,
     // `transcode` is None and the fast raw path is kept untouched.
-    let transcode = if !sixel_compat || caps.sixel {
-        None
-    } else if caps.kitty {
-        Some(crate::images::GfxProto::Kitty)
-    } else if iterm {
-        Some(crate::images::GfxProto::Iterm)
-    } else {
-        None
-    };
-    // Intercept sixel if the terminal renders it natively OR we're transcoding it.
-    let intercept = (caps.kitty, iterm, caps.sixel || transcode.is_some());
+    let transcode = transcode_for(caps, sixel_compat);
     // Clear the local terminal so the mirrored session starts from a blank screen,
     // matching the fresh (blank) parser that viewers see (also wipes any handshake
     // reply artifacts).
@@ -301,10 +301,7 @@ pub fn start(command: &[String], sixel_compat: bool) -> Result<SourceSession> {
     // handles hub notices with a clean pause/restore.
     // Pixel size of one cell, to size natural (no cell-hint) images. Roughly
     // constant across resizes, so the initial value is kept for the session.
-    let cell = (
-        (geom.px_w / geom.cols.max(1)).max(1),
-        (geom.px_h / geom.rows.max(1)).max(1),
-    );
+    let cell = geom.cell();
     // The decode worker answers back through the screen thread's own channel.
     let ready_tx = msg_tx.clone();
     let inject = writer.clone();
@@ -314,8 +311,7 @@ pub fn start(command: &[String], sixel_compat: bool) -> Result<SourceSession> {
         let (seqlog, seq_seen) = SeqLog::new();
         let parser = vt100::Parser::new_with_callbacks(rows, cols, 0, seqlog);
         screen_thread(
-            msg_rx, ready_tx, frame_tx, raw, parser, seq_seen, cell, intercept, transcode, caps,
-            inject,
+            msg_rx, ready_tx, frame_tx, raw, parser, seq_seen, cell, transcode, caps, inject,
         );
     });
 
@@ -331,31 +327,11 @@ pub fn start(command: &[String], sixel_compat: bool) -> Result<SourceSession> {
     Ok(SourceSession::new(frame_rx, Arc::new(Notifier(msg_tx))))
 }
 
-#[allow(clippy::too_many_arguments)] // ponytail: one call site, private
-fn screen_thread(
-    msg_rx: mpsc::Receiver<Msg>,
-    ready_tx: mpsc::Sender<Msg>,
-    frame_tx: watch::Sender<Arc<Frame>>,
-    raw: RawMode,
-    parser: SgParser,
-    seq_seen: SeqSeen,
-    cell: (u16, u16),
-    intercept: (bool, bool, bool),
-    transcode: Option<crate::images::GfxProto>,
-    caps: Caps,
-    inject: Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
-) {
-    let mut out = std::io::stdout();
-    let mut connected = true; // teeing shell output to the terminal
-    let mut screen = ScreenState::with_parser(parser, caps);
-    // Deferred-image decode worker: sixel/kitty-raw payloads decode + PNG-
-    // encode OFF this thread, so the tee to the local terminal never stalls
-    // behind a deflate (a sixel video would otherwise slow the terminal
-    // itself, 4–12× measured). Newest wins: jobs superseded while one was
-    // being processed are drained and dropped — their placements stay
-    // pending until cell overwrite evicts them — and having skipped ANY job
-    // is the backpressure signal that switches PNG encoding to the fast
-    // compression level until the worker catches up.
+/// Start the shared newest-wins deferred image worker. Owners provide only the
+/// wake-up callback that routes the ready payload into their own event loop.
+pub(crate) fn image_worker(
+    notify: impl Fn(ImageReady) -> bool + Send + 'static,
+) -> mpsc::Sender<(std::num::NonZeroU32, crate::images::DeferredPayload)> {
     let (job_tx, job_rx) =
         mpsc::channel::<(std::num::NonZeroU32, crate::images::DeferredPayload)>();
     std::thread::spawn(move || {
@@ -366,33 +342,42 @@ fn screen_thread(
                 superseded = true;
             }
             let Some((png, _px)) = crate::images::finish_deferred(&job.1, superseded) else {
-                continue; // undecodable payload: the placement stays pending → evicted
+                continue;
             };
             let mime = "image/png".to_string();
             let hash = crate::proto::content_key(&mime, &png);
-            let blob = crate::model::ImageBlob {
-                mime,
-                bytes: png.into(),
-            };
-            if ready_tx
-                .send(Msg::ImageReady {
-                    id: job.0,
-                    hash,
-                    blob,
-                })
-                .is_err()
-            {
-                break; // screen thread gone
+            if !notify(ImageReady {
+                id: job.0,
+                hash,
+                blob: crate::model::ImageBlob {
+                    mime,
+                    bytes: png.into(),
+                },
+            }) {
+                break;
             }
         }
     });
-    // Inline images live outside vt100's byte stream (it drops the sequences).
-    // The interceptor pulls them out; each is placed at the cursor by stamping
-    // per-cell image tags into the parser grid (`place_data`), which then ride
-    // vt100's own scrolling/eviction/reflow — each frame we just read the
-    // surviving tags back (see `resolve_images`), no scroll heuristics.
-    let mut interceptor = Interceptor::with(intercept.0, intercept.1, intercept.2, transcode, cell);
-    let mut image_seq = std::num::NonZeroU32::MIN;
+    job_tx
+}
+
+#[allow(clippy::too_many_arguments)] // ponytail: one call site, private
+fn screen_thread(
+    msg_rx: mpsc::Receiver<Msg>,
+    ready_tx: mpsc::Sender<Msg>,
+    frame_tx: watch::Sender<Arc<Frame>>,
+    raw: RawMode,
+    parser: SgParser,
+    seq_seen: SeqSeen,
+    cell: (u16, u16),
+    transcode: Option<crate::images::GfxProto>,
+    caps: Caps,
+    inject: Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
+) {
+    let mut out = std::io::stdout();
+    let mut connected = true; // teeing shell output to the terminal
+    let job_tx = image_worker(move |ready| ready_tx.send(Msg::ImageReady(ready)).is_ok());
+    let mut screen = ScreenState::with_parser(parser, caps, cell, transcode, job_tx, true);
     loop {
         let msg = match screen.wait() {
             Some(d) => match msg_rx.recv_timeout(d) {
@@ -407,56 +392,19 @@ fn screen_thread(
         };
         match msg {
             Some(Msg::Data(b)) => {
-                // The interceptor splits the read into routed steps. Every step
-                // except a rejection tees its bytes to the local terminal (which
-                // renders sixel/kitty/iTerm2 natively); the match then handles the
-                // mirror/app effect. `Step::tee` is the one place the tee lives.
-                for step in interceptor.feed(&b) {
-                    if let Some(bytes) = step.tee().filter(|_| connected) {
-                        let _ = out.write_all(bytes); // immediate, not rate-limited
-                        let _ = out.flush();
-                    }
-                    match step {
-                        Step::Passthrough(x) => screen.process(&x), // → vt100 too
-                        Step::TerminalOnly(_) => {}                 // already teed
-                        Step::Image(_, img) => {
-                            // Ready payload (iTerm2 native / kitty PNG): stamp
-                            // and record in one step.
-                            let hash = crate::proto::content_key(&img.mime, &img.bytes);
-                            let ready = Some((
-                                hash,
-                                crate::model::ImageBlob {
-                                    mime: img.mime,
-                                    bytes: img.bytes.into(),
-                                },
-                            ));
-                            screen.stamp_image(&mut image_seq, cell, img.cells, img.px, ready);
-                        }
-                        Step::Deferred(_, d) => {
-                            // Heavy decode (sixel / kitty raw): stamp NOW —
-                            // cursor semantics can't wait — and let the worker
-                            // owe the bytes. Newest-wins on the worker side:
-                            // video frames superseded before decoding are
-                            // never decoded (their pending placements die by
-                            // cell overwrite like any other image).
-                            let id =
-                                screen.stamp_image(&mut image_seq, cell, d.cells, Some(d.px), None);
-                            let _ = job_tx.send((id, d.payload));
-                        }
-                        Step::Reject(resp) => {
-                            // Suppressed from the terminal (tee() was None), so it
-                            // never services the refused transmission; answer the app
-                            // ourselves to provoke a fallback to direct.
-                            if let Ok(mut w) = inject.lock() {
-                                let _ = w.write_all(&resp);
-                                let _ = w.flush();
-                            }
-                        }
-                    }
+                let routed = screen.feed_output(&b);
+                if connected {
+                    let _ = out.write_all(&routed.terminal);
+                    let _ = out.flush();
                 }
-                screen.touch();
+                if !routed.app.is_empty()
+                    && let Ok(mut w) = inject.lock()
+                {
+                    let _ = w.write_all(&routed.app);
+                    let _ = w.flush();
+                }
             }
-            Some(Msg::ImageReady { id, hash, blob }) => screen.image_ready(id, hash, blob),
+            Some(Msg::ImageReady(ready)) => screen.image_ready(ready),
             Some(Msg::Resize(rows, cols)) => screen.set_size(rows, cols),
             Some(Msg::HubDown(msg)) if connected => {
                 connected = false;
@@ -874,6 +822,47 @@ fn frame_from_with_defaults(
     Arc::new(Frame::Screen(grid))
 }
 
+/// Split-read detector for the two valid Primary DA requests (`CSI c`, `CSI 0 c`).
+/// It observes only parser-bound passthrough bytes, so an ESC-like byte inside an
+/// intercepted graphics payload cannot become a phantom terminal query.
+#[derive(Default)]
+struct PrimaryDaQueries {
+    carry: Vec<u8>,
+}
+
+impl PrimaryDaQueries {
+    fn count(&mut self, input: &[u8]) -> usize {
+        const A: &[u8] = b"\x1b[c";
+        const B: &[u8] = b"\x1b[0c";
+        let mut data = std::mem::take(&mut self.carry);
+        data.extend_from_slice(input);
+        let mut count = 0;
+        let mut i = 0;
+        while i < data.len() {
+            if data[i..].starts_with(A) {
+                count += 1;
+                i += A.len();
+            } else if data[i..].starts_with(B) {
+                count += 1;
+                i += B.len();
+            } else {
+                i += 1;
+            }
+        }
+        let keep = (1..=B.len().saturating_sub(1).min(data.len()))
+            .rev()
+            .find(|&n| {
+                let suffix = &data[data.len() - n..];
+                (n < A.len() && A.starts_with(suffix)) || (n < B.len() && B.starts_with(suffix))
+            })
+            .unwrap_or(0);
+        if keep > 0 {
+            self.carry.extend_from_slice(&data[data.len() - keep..]);
+        }
+        count
+    }
+}
+
 /// The mirrored screen plus its frame clock — everything that decides *what* a
 /// viewer sees and *when*. Both owners share it: the local-terminal one
 /// ([`screen_thread`]) and the terminal-less detachable one
@@ -882,12 +871,19 @@ fn frame_from_with_defaults(
 /// must not drift between the two, and they did while this logic was duplicated.
 ///
 /// The owner drives it: feed it bytes/resizes, ask [`Self::wait`] how long to
-/// block for the next event, then ask [`Self::due_frame`] for a frame. Inline
-/// images are stamped by the terminal owner only — a detached owner has no
-/// terminal to probe for image capabilities, so it leaves the vectors empty and
-/// images mirror as their covered cells.
+/// block for the next event, then ask [`Self::due_frame`] for a frame. The image
+/// interceptor lives here too, so local and detachable owners cannot drift.
 pub(crate) struct ScreenState {
     parser: SgParser,
+    interceptor: Interceptor,
+    cell: (u16, u16),
+    image_seq: std::num::NonZeroU32,
+    image_jobs: mpsc::Sender<(std::num::NonZeroU32, crate::images::DeferredPayload)>,
+    primary_da: PrimaryDaQueries,
+    profile_known: bool,
+    effective_sixel: bool,
+    #[cfg(all(feature = "push", unix))]
+    transcode: Option<crate::images::GfxProto>,
     images: Vec<Placed>,
     /// Ready-but-overwritten placements held for the double-buffer swap (see
     /// `resolve_images`): shown until their pending successor's bytes land.
@@ -901,9 +897,31 @@ pub(crate) struct ScreenState {
 
 impl ScreenState {
     /// Wrap a parser the caller already sized, with the terminal's probed caps.
-    fn with_parser(parser: SgParser, caps: Caps) -> ScreenState {
+    fn with_parser(
+        parser: SgParser,
+        caps: Caps,
+        cell: (u16, u16),
+        transcode: Option<crate::images::GfxProto>,
+        image_jobs: mpsc::Sender<(std::num::NonZeroU32, crate::images::DeferredPayload)>,
+        profile_known: bool,
+    ) -> ScreenState {
         ScreenState {
             parser,
+            interceptor: Interceptor::with(
+                caps.kitty,
+                caps.iterm,
+                caps.sixel || transcode.is_some(),
+                transcode,
+                cell,
+            ),
+            cell,
+            image_seq: std::num::NonZeroU32::MIN,
+            image_jobs,
+            primary_da: PrimaryDaQueries::default(),
+            profile_known,
+            effective_sixel: caps.sixel || transcode.is_some(),
+            #[cfg(all(feature = "push", unix))]
+            transcode,
             images: Vec::new(),
             zombies: Vec::new(),
             bridge: CursorBridge::default(),
@@ -917,8 +935,19 @@ impl ScreenState {
     /// A fresh screen at `rows`×`cols` with default caps — the detachable owner,
     /// which probes no terminal.
     #[cfg(all(feature = "push", unix))]
-    pub(crate) fn new(rows: u16, cols: u16) -> ScreenState {
-        Self::with_parser(new_parser(rows, cols), Caps::default())
+    pub(crate) fn new(
+        rows: u16,
+        cols: u16,
+        image_jobs: mpsc::Sender<(std::num::NonZeroU32, crate::images::DeferredPayload)>,
+    ) -> ScreenState {
+        Self::with_parser(
+            new_parser(rows, cols),
+            Caps::default(),
+            FALLBACK_CELL,
+            None,
+            image_jobs,
+            false,
+        )
     }
 
     /// The blank starting frame, to seed the watch channel before any output.
@@ -933,14 +962,96 @@ impl ScreenState {
         )
     }
 
-    pub(crate) fn process(&mut self, bytes: &[u8]) {
-        self.parser.process(bytes);
-        self.dirty = true;
+    /// Route one PTY read through the shared graphics interceptor and apply every
+    /// mirror-side effect in order. Query responses are returned separately so a
+    /// detachable owner can decide after attempting its terminal write whether a
+    /// real terminal still exists to answer them.
+    pub(crate) fn feed_output(&mut self, bytes: &[u8]) -> RoutedOutput {
+        let mut out = RoutedOutput::default();
+        for step in self.interceptor.feed(bytes) {
+            if let Some(tee) = step.tee() {
+                out.terminal.extend_from_slice(tee);
+            }
+            match step {
+                Step::Passthrough(x) => {
+                    if self.profile_known {
+                        let n = self.primary_da.count(&x);
+                        let reply: &[u8] = if self.effective_sixel {
+                            b"\x1b[?1;2;4c"
+                        } else {
+                            b"\x1b[?1;2c"
+                        };
+                        for _ in 0..n {
+                            out.queries.extend_from_slice(reply);
+                        }
+                    }
+                    self.parser.process(&x);
+                    self.dirty = true;
+                }
+                Step::TerminalOnly(_) => {}
+                Step::Image(_, img) => {
+                    let hash = crate::proto::content_key(&img.mime, &img.bytes);
+                    let ready = Some((
+                        hash,
+                        crate::model::ImageBlob {
+                            mime: img.mime,
+                            bytes: img.bytes.into(),
+                        },
+                    ));
+                    let mut seq = self.image_seq;
+                    let id = stamp_image(
+                        &mut self.parser,
+                        &mut self.images,
+                        &mut seq,
+                        self.cell,
+                        img.cells,
+                        img.px,
+                        ready,
+                    );
+                    self.image_seq = seq;
+                    let _ = id;
+                    self.dirty = true;
+                }
+                Step::Deferred(_, d) => {
+                    let mut seq = self.image_seq;
+                    let id = stamp_image(
+                        &mut self.parser,
+                        &mut self.images,
+                        &mut seq,
+                        self.cell,
+                        d.cells,
+                        Some(d.px),
+                        None,
+                    );
+                    self.image_seq = seq;
+                    let _ = self.image_jobs.send((id, d.payload));
+                    self.dirty = true;
+                }
+                Step::Query(_, response) => out.queries.extend_from_slice(&response),
+                Step::Reject(response) => out.app.extend_from_slice(&response),
+            }
+        }
+        out
     }
 
     pub(crate) fn set_size(&mut self, rows: u16, cols: u16) {
         self.parser.screen_mut().set_size(rows, cols);
         self.dirty = true;
+    }
+
+    /// Keep natural image sizing in sync with live resizes. This geometry, like
+    /// the capability profile, remains active when the terminal detaches.
+    #[cfg(all(feature = "push", unix))]
+    pub(crate) fn set_geometry(&mut self, geom: TermGeom) {
+        self.set_size(geom.rows, geom.cols);
+        self.cell = geom.cell();
+        self.interceptor.configure(
+            self.caps.kitty,
+            self.caps.iterm,
+            self.caps.sixel || self.transcode.is_some(),
+            self.transcode,
+            self.cell,
+        );
     }
 
     /// Mark the screen changed by something other than parsed bytes (an image
@@ -949,38 +1060,35 @@ impl ScreenState {
         self.dirty = true;
     }
 
-    /// Stamp an inline image at the cursor, returning its placement id.
-    /// Terminal-owner only — takes both the parser and the placement list, which
-    /// is why it lives here rather than at the call site.
-    fn stamp_image(
+    /// Install the newest successfully attached terminal profile. Existing image
+    /// placements remain part of the web screen; only future interception and
+    /// cached probe replies change.
+    #[cfg(all(feature = "push", unix))]
+    pub(crate) fn set_profile(
         &mut self,
-        seq: &mut std::num::NonZeroU32,
-        cell: (u16, u16),
-        cells: Option<(u16, u16)>,
-        px: Option<(u32, u32)>,
-        ready: Option<(String, crate::model::ImageBlob)>,
-    ) -> std::num::NonZeroU32 {
-        stamp_image(
-            &mut self.parser,
-            &mut self.images,
-            seq,
-            cell,
-            cells,
-            px,
-            ready,
-        )
+        profile: TerminalProfile,
+        transcode: Option<crate::images::GfxProto>,
+    ) {
+        self.caps = profile.caps;
+        self.cell = profile.geom.cell();
+        self.profile_known = true;
+        self.effective_sixel = self.caps.sixel || transcode.is_some();
+        self.transcode = transcode;
+        self.interceptor.configure(
+            self.caps.kitty,
+            self.caps.iterm,
+            self.caps.sixel || transcode.is_some(),
+            transcode,
+            self.cell,
+        );
+        self.dirty = true;
     }
 
     /// Fill a pending placement with its decoded bytes. A miss means the
     /// placement was already evicted (overwritten/scrolled off) — drop them.
-    fn image_ready(
-        &mut self,
-        id: std::num::NonZeroU32,
-        hash: String,
-        blob: crate::model::ImageBlob,
-    ) {
-        if let Some(p) = self.images.iter_mut().find(|p| p.id == id) {
-            p.ready = Some((hash, blob));
+    pub(crate) fn image_ready(&mut self, ready: ImageReady) {
+        if let Some(p) = self.images.iter_mut().find(|p| p.id == ready.id) {
+            p.ready = Some((ready.hash, ready.blob));
             self.dirty = true;
         }
     }
@@ -1159,11 +1267,21 @@ fn resolve_images(
 /// Pixel-aware apps (kitty/sixel image tools) refuse to draw unless the terminal
 /// reports a non-zero pixel size, so we pass through the outer terminal's reported
 /// pixels and, when it reports none, synthesize them from an assumed cell size.
-struct TermGeom {
-    cols: u16,
-    rows: u16,
-    px_w: u16,
-    px_h: u16,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TermGeom {
+    pub(crate) cols: u16,
+    pub(crate) rows: u16,
+    pub(crate) px_w: u16,
+    pub(crate) px_h: u16,
+}
+
+impl TermGeom {
+    pub(crate) fn cell(self) -> (u16, u16) {
+        (
+            (self.px_w / self.cols.max(1)).max(1),
+            (self.px_h / self.rows.max(1)).max(1),
+        )
+    }
 }
 
 /// Assumed cell size when the outer terminal reports no pixel dimensions. The
@@ -1174,7 +1292,7 @@ const FALLBACK_CELL: (u16, u16) = (8, 16);
 
 /// Our controlling terminal's geometry, if stdin is a tty.
 #[cfg(unix)]
-fn term_geom() -> Option<TermGeom> {
+pub(crate) fn term_geom() -> Option<TermGeom> {
     let ws = rustix::termios::tcgetwinsize(std::io::stdin()).ok()?;
     if ws.ws_col == 0 {
         return None;
@@ -1240,15 +1358,26 @@ fn term_geom() -> Option<TermGeom> {
 
 /// Graphics-protocol support the controlling terminal advertises, learned from a
 /// capability handshake rather than a `TERM` signature.
-#[derive(Clone, Copy, Default)]
-struct Caps {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Caps {
     /// Kitty graphics — the `a=q` query drew an `OK` response.
-    kitty: bool,
+    pub(crate) kitty: bool,
+    /// iTerm2 inline images — detected by the attach process's TERM_PROGRAM.
+    pub(crate) iterm: bool,
     /// Sixel — Primary DA listed feature `4`.
-    sixel: bool,
+    pub(crate) sixel: bool,
     /// The outer terminal's active default foreground/background (OSC 10/11).
-    default_fg: Option<(u8, u8, u8)>,
-    default_bg: Option<(u8, u8, u8)>,
+    pub(crate) default_fg: Option<(u8, u8, u8)>,
+    pub(crate) default_bg: Option<(u8, u8, u8)>,
+}
+
+/// Everything learned from one successfully attached terminal. `None` in the
+/// detachable owner means no terminal has ever completed the profile handshake.
+#[cfg(all(feature = "push", unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalProfile {
+    pub(crate) caps: Caps,
+    pub(crate) geom: TermGeom,
 }
 
 /// Capability/default-color query. DA comes last as the ordering fence: once its
@@ -1262,7 +1391,7 @@ const CAP_QUERY: &[u8] =
 /// tty or the terminal stays silent. Must run before the stdin→PTY bridge starts,
 /// so the replies are consumed here and not forwarded to the child.
 #[cfg(unix)]
-fn probe_caps() -> Caps {
+pub(crate) fn probe_caps() -> Caps {
     use rustix::termios::{OptionalActions, SpecialCodeIndex, tcgetattr, tcsetattr};
     use std::os::fd::AsFd;
     let stdin = std::io::stdin();
@@ -1309,7 +1438,7 @@ fn probe_caps() -> Caps {
 /// handle gives us a bounded read without a second thread that could steal future
 /// keystrokes from the real stdin bridge.
 #[cfg(windows)]
-fn probe_caps() -> Caps {
+pub(crate) fn probe_caps() -> Caps {
     use std::io::Write;
     use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows_sys::Win32::Storage::FileSystem::ReadFile;
@@ -1383,6 +1512,20 @@ fn iterm_supported() -> bool {
     )
 }
 
+/// Select the existing opt-in sixel compatibility target for one terminal
+/// profile. Shared with detachable sessions when their cached profile changes.
+pub(crate) fn transcode_for(caps: Caps, sixel_compat: bool) -> Option<crate::images::GfxProto> {
+    if !sixel_compat || caps.sixel {
+        None
+    } else if caps.kitty {
+        Some(crate::images::GfxProto::Kitty)
+    } else if caps.iterm {
+        Some(crate::images::GfxProto::Iterm)
+    } else {
+        None
+    }
+}
+
 /// A Primary DA reply (`ESC [ ? … c`) has arrived — the handshake fence.
 fn da_seen(buf: &[u8]) -> bool {
     find(buf, b"\x1b[?").is_some_and(|p| find(&buf[p + 3..], b"c").is_some())
@@ -1398,6 +1541,7 @@ fn parse_caps(buf: &[u8]) -> Caps {
     colors.process(buf);
     Caps {
         kitty: kitty_ok(buf),
+        iterm: iterm_supported(),
         sixel: da_sixel(buf),
         default_fg: colors.screen().default_fg(),
         default_bg: colors.screen().default_bg(),
@@ -1443,7 +1587,7 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// else (keystrokes, other reports) passes verbatim. A DA reply split across reads
 /// is carried; the carry is bounded so a stray `ESC [ ?` can't wedge input.
 #[derive(Default)]
-struct DaRewriter {
+pub(crate) struct DaRewriter {
     carry: Vec<u8>,
 }
 
@@ -1451,7 +1595,7 @@ impl DaRewriter {
     /// Longest DA reply we'll wait to complete before giving up and flushing.
     const MAX_CARRY: usize = 64;
 
-    fn advertise_sixel(&mut self, input: &[u8]) -> Vec<u8> {
+    pub(crate) fn advertise_sixel(&mut self, input: &[u8]) -> Vec<u8> {
         let mut data = std::mem::take(&mut self.carry);
         data.extend_from_slice(input);
         let mut out = Vec::with_capacity(data.len() + 2);
