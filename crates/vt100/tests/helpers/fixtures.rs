@@ -209,6 +209,8 @@ where
         "default" => Ok(vt100::MouseProtocolEncoding::Default),
         "utf8" => Ok(vt100::MouseProtocolEncoding::Utf8),
         "sgr" => Ok(vt100::MouseProtocolEncoding::Sgr),
+        "urxvt" => Ok(vt100::MouseProtocolEncoding::Urxvt),
+        "sgr_pixels" => Ok(vt100::MouseProtocolEncoding::SgrPixels),
         _ => unimplemented!(),
     }
 }
@@ -224,6 +226,8 @@ where
         vt100::MouseProtocolEncoding::Default => "default",
         vt100::MouseProtocolEncoding::Utf8 => "utf8",
         vt100::MouseProtocolEncoding::Sgr => "sgr",
+        vt100::MouseProtocolEncoding::Urxvt => "urxvt",
+        vt100::MouseProtocolEncoding::SgrPixels => "sgr_pixels",
     };
     serializer.serialize_str(s)
 }

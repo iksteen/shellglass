@@ -625,12 +625,24 @@ impl BufWrite for MouseProtocolEncoding {
                 crate::MouseProtocolEncoding::Sgr => {
                     buf.extend_from_slice(b"\x1b[?1006l");
                 }
+                crate::MouseProtocolEncoding::Urxvt => {
+                    buf.extend_from_slice(b"\x1b[?1015l");
+                }
+                crate::MouseProtocolEncoding::SgrPixels => {
+                    buf.extend_from_slice(b"\x1b[?1016l");
+                }
             },
             crate::MouseProtocolEncoding::Utf8 => {
                 buf.extend_from_slice(b"\x1b[?1005h");
             }
             crate::MouseProtocolEncoding::Sgr => {
                 buf.extend_from_slice(b"\x1b[?1006h");
+            }
+            crate::MouseProtocolEncoding::Urxvt => {
+                buf.extend_from_slice(b"\x1b[?1015h");
+            }
+            crate::MouseProtocolEncoding::SgrPixels => {
+                buf.extend_from_slice(b"\x1b[?1016h");
             }
         }
     }
