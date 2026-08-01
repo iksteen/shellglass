@@ -403,6 +403,13 @@ fn screen_thread(
                     let _ = w.write_all(&routed.app);
                     let _ = w.flush();
                 }
+                // Windows Terminal treats Quick Edit as ownership of ordinary
+                // mouse gestures: keep it while the shell is not asking for mouse
+                // reports (scrollback/right-click paste stay native), and release
+                // it only for a TUI that enables an xterm mouse protocol.
+                raw.sync_mouse_capture(
+                    screen.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None,
+                );
             }
             Some(Msg::ImageReady(ready)) => screen.image_ready(ready),
             Some(Msg::Resize(rows, cols)) => screen.set_size(rows, cols),
@@ -1708,6 +1715,30 @@ impl RawMode {
     fn restore(&self) {
         self.leave();
     }
+
+    fn sync_mouse_capture(&self, _capture: bool) {}
+}
+
+/// Derive the two Windows raw-input modes. Ordinary shell use preserves the
+/// caller's Quick Edit bit so Windows Terminal owns wheel scrollback/right-click
+/// paste; a child that requests xterm mouse reporting uses the capture variant.
+#[cfg(windows)]
+fn windows_raw_input_modes(mode: u32) -> (u32, u32) {
+    use windows_sys::Win32::System::Console::{
+        ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_INSERT_MODE, ENABLE_LINE_INPUT,
+        ENABLE_PROCESSED_INPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
+        ENABLE_WINDOW_INPUT,
+    };
+
+    let raw = (mode
+        & !(ENABLE_ECHO_INPUT
+            | ENABLE_LINE_INPUT
+            | ENABLE_PROCESSED_INPUT
+            | ENABLE_INSERT_MODE
+            | ENABLE_WINDOW_INPUT))
+        | ENABLE_EXTENDED_FLAGS
+        | ENABLE_VIRTUAL_TERMINAL_INPUT;
+    (raw, raw & !ENABLE_QUICK_EDIT_MODE)
 }
 
 /// Windows console-mode counterpart to termios. ConPTY itself is supplied by
@@ -1717,19 +1748,22 @@ impl RawMode {
 struct RawMode {
     input_orig: Option<u32>,
     output_orig: Option<u32>,
+    /// Raw keyboard input while Windows Terminal retains ordinary mouse gestures.
     input_raw: Option<u32>,
+    /// Same mode with Quick Edit disabled for a child TUI's mouse protocol.
+    input_mouse: Option<u32>,
     output_raw: Option<u32>,
+    mouse_captured: std::cell::Cell<bool>,
+    raw_active: std::cell::Cell<bool>,
 }
 
 #[cfg(windows)]
 impl RawMode {
     fn acquire() -> RawMode {
         use windows_sys::Win32::System::Console::{
-            DISABLE_NEWLINE_AUTO_RETURN, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS,
-            ENABLE_INSERT_MODE, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT,
-            ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
-            ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT, GetConsoleMode, GetStdHandle,
-            STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
+            DISABLE_NEWLINE_AUTO_RETURN, ENABLE_PROCESSED_OUTPUT,
+            ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE,
+            STD_OUTPUT_HANDLE, SetConsoleMode,
         };
 
         // SAFETY: standard handles are process-owned and remain valid here.
@@ -1746,17 +1780,13 @@ impl RawMode {
         let output_orig =
             (unsafe { GetConsoleMode(output, &mut output_mode) } != 0).then_some(output_mode);
 
-        let input_raw = input_orig.map(|mode| {
-            (mode
-                & !(ENABLE_ECHO_INPUT
-                    | ENABLE_LINE_INPUT
-                    | ENABLE_PROCESSED_INPUT
-                    | ENABLE_QUICK_EDIT_MODE
-                    | ENABLE_INSERT_MODE
-                    | ENABLE_WINDOW_INPUT))
-                | ENABLE_EXTENDED_FLAGS
-                | ENABLE_VIRTUAL_TERMINAL_INPUT
-        });
+        // Keep the caller's Quick Edit bit for an ordinary shell: Windows
+        // Terminal uses it to retain host-side wheel scrollback and right-click
+        // paste. `sync_mouse_capture` clears it only while the child has explicitly
+        // enabled an xterm mouse-reporting protocol.
+        let input_modes = input_orig.map(windows_raw_input_modes);
+        let input_raw = input_modes.map(|modes| modes.0);
+        let input_mouse = input_modes.map(|modes| modes.1);
         let output_raw = output_orig.map(|mode| {
             mode | ENABLE_PROCESSED_OUTPUT
                 | ENABLE_VIRTUAL_TERMINAL_PROCESSING
@@ -1774,7 +1804,10 @@ impl RawMode {
             input_orig,
             output_orig,
             input_raw,
+            input_mouse,
             output_raw,
+            mouse_captured: std::cell::Cell::new(false),
+            raw_active: std::cell::Cell::new(true),
         }
     }
 
@@ -1787,19 +1820,42 @@ impl RawMode {
             // SAFETY: the process-owned standard handle remains valid.
             let _ = unsafe { SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), mode) };
         }
+        self.raw_active.set(false);
     }
 
     fn enter(&self) {
         use windows_sys::Win32::System::Console::{
             GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
         };
-        if let Some(mode) = self.input_raw {
+        self.raw_active.set(true);
+        let input_mode = if self.mouse_captured.get() {
+            self.input_mouse
+        } else {
+            self.input_raw
+        };
+        if let Some(mode) = input_mode {
             // SAFETY: the process-owned standard handle remains valid.
             let _ = unsafe { SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), mode) };
         }
         if let Some(mode) = self.output_raw {
             // SAFETY: as above, for stdout.
             let _ = unsafe { SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), mode) };
+        }
+    }
+
+    fn sync_mouse_capture(&self, capture: bool) {
+        if self.mouse_captured.replace(capture) == capture || !self.raw_active.get() {
+            return;
+        }
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode};
+        let mode = if capture {
+            self.input_mouse
+        } else {
+            self.input_raw
+        };
+        if let Some(mode) = mode {
+            // SAFETY: the process-owned standard handle remains valid.
+            let _ = unsafe { SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), mode) };
         }
     }
 
@@ -1815,6 +1871,7 @@ impl RawMode {
             // SAFETY: as above, for stdout.
             let _ = unsafe { SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), mode) };
         }
+        self.raw_active.set(false);
     }
 }
 
@@ -1835,6 +1892,27 @@ mod tests {
             images: Vec::new(),
             image_data: Default::default(),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_raw_mode_keeps_quick_edit_until_mouse_reporting() {
+        use windows_sys::Win32::System::Console::{
+            ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+            ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
+        };
+
+        let original =
+            ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_QUICK_EDIT_MODE;
+        let (shell, mouse) = windows_raw_input_modes(original);
+        assert_ne!(shell & ENABLE_QUICK_EDIT_MODE, 0);
+        assert_eq!(mouse & ENABLE_QUICK_EDIT_MODE, 0);
+        assert_ne!(shell & ENABLE_EXTENDED_FLAGS, 0);
+        assert_ne!(shell & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
+        assert_eq!(
+            shell & (ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT),
+            0
+        );
     }
 
     #[test]
