@@ -853,8 +853,7 @@ impl PrimaryDaQueries {
             .rev()
             .find(|&n| {
                 let suffix = &data[data.len() - n..];
-                (n < A.len() && A.starts_with(suffix))
-                    || (n < B.len() && B.starts_with(suffix))
+                (n < A.len() && A.starts_with(suffix)) || (n < B.len() && B.starts_with(suffix))
             })
             .unwrap_or(0);
         if keep > 0 {

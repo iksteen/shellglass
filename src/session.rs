@@ -1015,7 +1015,10 @@ mod tests {
         assert_eq!(tag, S_ACCEPTED);
         assert_eq!(version, [ATTACH_PROTOCOL_VERSION]);
         let unexpected = pty_rx.try_recv();
-        assert!(unexpected.is_err(), "unexpected PTY command: {unexpected:?}");
+        assert!(
+            unexpected.is_err(),
+            "unexpected PTY command: {unexpected:?}"
+        );
 
         // A reserved client owns the slot just like a live one.
         let (mut second, ok) = attach_request(&core_tx, 2, false);
@@ -1100,7 +1103,10 @@ mod tests {
         core_tx.send(Core::Data(query.to_vec())).unwrap();
         std::thread::sleep(Duration::from_millis(20));
         let unexpected = pty_rx.try_recv();
-        assert!(unexpected.is_err(), "unexpected PTY command: {unexpected:?}");
+        assert!(
+            unexpected.is_err(),
+            "unexpected PTY command: {unexpected:?}"
+        );
         core_tx.send(Core::Data(b"\x1b[0c".to_vec())).unwrap();
         assert!(matches!(
             pty_rx.recv().unwrap(),
