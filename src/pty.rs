@@ -708,15 +708,29 @@ struct Placed {
 /// cursor at col 0 of the image's last row, where a sixel-scrolling terminal
 /// leaves it. `ready` is the payload when already decoded, `None` while the
 /// worker owes it.
+/// What the producer says about one placement: the display hints, and whether
+/// the emitter keeps the cursor where it is (see [`crate::images::Image::hold`]).
+struct Place {
+    cells: Option<(u16, u16)>,
+    px: Option<(u32, u32)>,
+    hold: bool,
+    /// The payload when already decoded, `None` while the worker owes it.
+    ready: Option<(String, crate::model::ImageBlob)>,
+}
+
 fn stamp_image(
     parser: &mut SgParser,
     images: &mut Vec<Placed>,
     image_seq: &mut std::num::NonZeroU32,
     cell: (u16, u16),
-    cells: Option<(u16, u16)>,
-    px: Option<(u32, u32)>,
-    ready: Option<(String, crate::model::ImageBlob)>,
+    place: Place,
 ) -> std::num::NonZeroU32 {
+    let Place {
+        cells,
+        px,
+        hold,
+        ready,
+    } = place;
     let (row, col) = parser.screen().cursor_position();
     // Display size in cells. An app-specified footprint is exact; a derived one
     // is the TRUE fractional extent (pixels ÷ cell size, NOT rounded up) so the
@@ -744,13 +758,16 @@ fn stamp_image(
     *image_seq = image_seq
         .checked_add(1)
         .unwrap_or(std::num::NonZeroU32::MIN);
-    parser
-        .screen_mut()
-        .place_data(fw, fh, |row_off, col_off| ImgCell {
-            id,
-            row_off,
-            col_off,
-        });
+    let tag = |row_off, col_off| ImgCell {
+        id,
+        row_off,
+        col_off,
+    };
+    if hold {
+        parser.screen_mut().place_data_held(fw, fh, tag);
+    } else {
+        parser.screen_mut().place_data(fw, fh, tag);
+    }
     images.push(Placed {
         id,
         row: i16::try_from(row).unwrap_or(0),
@@ -1027,9 +1044,12 @@ impl ScreenState {
                         &mut self.images,
                         &mut seq,
                         self.cell,
-                        img.cells,
-                        img.px,
-                        ready,
+                        Place {
+                            cells: img.cells,
+                            px: img.px,
+                            hold: img.hold,
+                            ready,
+                        },
                     );
                     self.image_seq = seq;
                     let _ = id;
@@ -1042,9 +1062,12 @@ impl ScreenState {
                         &mut self.images,
                         &mut seq,
                         self.cell,
-                        d.cells,
-                        Some(d.px),
-                        None,
+                        Place {
+                            cells: d.cells,
+                            px: Some(d.px),
+                            hold: d.hold,
+                            ready: None,
+                        },
                     );
                     self.image_seq = seq;
                     let _ = self.image_jobs.send((d.lineage, id, d.payload));
@@ -2243,10 +2266,13 @@ mod tests {
             &mut parser,
             &mut images,
             &mut seq,
-            (9, 21),          // cell px
-            None,             // no app-specified cells → derive from px
-            Some((400, 402)), // image px
-            None,
+            (9, 21), // cell px
+            Place {
+                cells: None,          // no app-specified cells → derive from px
+                px: Some((400, 402)), // image px
+                hold: false,
+                ready: None,
+            },
         );
         let p = &images[0];
         assert!(

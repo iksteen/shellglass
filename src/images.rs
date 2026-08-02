@@ -55,6 +55,13 @@ pub struct Image {
     /// Source pixel dimensions (width, height). Used to derive a cell count when
     /// the app gave none, so the cursor advances below a natural-size image.
     pub px: Option<(u32, u32)>,
+    /// The placement declared "don't move the cursor" (kitty `a=p,C=1`): stamp
+    /// from the cursor cell downwards without advancing it or scrolling.
+    pub hold: bool,
+    /// The kitty `(image id, placement id)` this came from, when the emitter
+    /// names them — the handle an `a=d` deletes the placement by. `None` for
+    /// every protocol that just draws at the cursor and never revokes.
+    pub key: Option<(u32, u32)>,
 }
 
 /// Pixel dimensions from an encoded image's header (any format the browser takes).
@@ -158,6 +165,10 @@ pub struct DeferredImage {
     /// `pty::image_worker`). `0` = the cursor stream — an animation replacing
     /// itself in place, where only the newest frame is worth decoding.
     pub lineage: u64,
+    /// See [`Image::hold`].
+    pub hold: bool,
+    /// See [`Image::key`].
+    pub key: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,6 +251,8 @@ pub struct Interceptor {
     kitty: Option<KittyAccum>,
     /// In-flight iTerm2 multipart transfer (`MultipartFile`→`FilePart`*→`FileEnd`).
     iterm: Option<ItermAccum>,
+    /// Transmitted-but-not-yet-placed kitty images, keyed by their `i=`.
+    kitty_store: KittyStore,
     /// Intercept kitty / iTerm2 / sixel sequences. A protocol the local terminal
     /// doesn't render is left in the stream (vt100 sees it, matching the terminal)
     /// rather than consumed into a web image the local terminal wouldn't show — see
@@ -321,12 +334,13 @@ struct KittyAccum {
     /// `t` transmit-only, `d` delete, `f`/`a` animation, `c` compose) draws
     /// nothing at the cursor, so emitting an image for one would show the web
     /// viewer content the local kitty never displayed. The sequence is still
-    /// consumed (accumulated and flushed) so `m=1` chains stay coherent.
-    // ponytail: `a=p` (place a previously-transmitted id) would need an id→image
-    // store keyed on `i=`; until then a t-then-p emitter shows no web image.
-    // `a=d` could evict placements, but per-cell tag erase already covers the
-    // common clears.
+    /// consumed (accumulated and flushed) so `m=1` chains stay coherent. A
+    /// transmit-only image isn't lost: it lands in [`KittyStore`] for the `a=p`
+    /// that places it later.
     display: bool,
+    /// The image id (`i=`) this transfer claims, from the FIRST chunk (only that
+    /// one carries the control keys). It is the key a later `a=p` places by.
+    id: Option<u32>,
     /// Payload outgrew [`MAX_B64_BYTES`] — condemned, same as `ItermAccum::over`.
     over: bool,
     cells: Option<(u16, u16)>,
@@ -342,7 +356,57 @@ struct KittyAccum {
     offset: usize,
 }
 
+/// Images transmitted with an id (`a=t`/`a=T` + `i=`) waiting to be placed by an
+/// `a=p`. Byte-capped, oldest-first eviction: an evicted id simply stops
+/// mirroring (its later placements show nothing — less than the terminal, which
+/// the fidelity rule allows; more would not be).
+#[derive(Default)]
+struct KittyStore {
+    map: std::collections::HashMap<u32, StoredImage>,
+    order: std::collections::VecDeque<u32>,
+    total: usize,
+}
+
+/// A transmitted image, decoded to its post-transmission bytes: a raw
+/// framebuffer for `f=24/32` (croppable by memcpy — what zellij sends) or the
+/// encoded file for `f=100`.
+struct StoredImage {
+    data: Vec<u8>,
+    fmt: KittyFmt,
+    px: (u32, u32),
+}
+
+impl KittyStore {
+    const CAP: usize = 32 << 20;
+
+    fn get(&self, id: u32) -> Option<&StoredImage> {
+        self.map.get(&id)
+    }
+
+    /// Store (or REPLACE — an emitter re-transmits the same id, e.g. one scaled
+    /// variant per destination size) and evict oldest-first back under the cap.
+    fn insert(&mut self, id: u32, image: StoredImage) {
+        self.remove(id);
+        self.total += image.data.len();
+        self.map.insert(id, image);
+        self.order.push_back(id);
+        while self.total > Self::CAP && self.order.len() > 1 {
+            if let Some(old) = self.order.pop_front() {
+                self.remove(old);
+            }
+        }
+    }
+
+    fn remove(&mut self, id: u32) {
+        if let Some(old) = self.map.remove(&id) {
+            self.total -= old.data.len();
+            self.order.retain(|&queued| queued != id);
+        }
+    }
+}
+
 /// The kitty pixel formats we can turn into something the browser renders.
+#[derive(Clone, Copy)]
 enum KittyFmt {
     /// `f=100`: already an encoded image file — forward as-is.
     Png,
@@ -668,6 +732,8 @@ impl Interceptor {
                 bytes: png,
                 cells: None,
                 px: Some(px),
+                hold: false,
+                key: None,
             },
         })
     }
@@ -743,6 +809,11 @@ impl Interceptor {
             };
         }
 
+        // `a=p` places an image transmitted earlier — no payload, no accumulator.
+        if ctrl.get("a").map(String::as_str) == Some("p") {
+            return self.kitty_place(&ctrl);
+        }
+
         // Start an accumulator on the first chunk of a transfer — the one that
         // carries the format/medium/size control keys (continuation chunks only
         // repeat `m`).
@@ -763,6 +834,7 @@ impl Interceptor {
                 payload: String::new(),
                 // kitty's default action is `t` (transmit-only) — absent ⇒ no display.
                 display: ctrl.get("a").map(String::as_str) == Some("T"),
+                id: ctrl.get("i").and_then(|v| v.parse().ok()),
                 over: false,
                 cells: cells_from(ctrl.get("c"), ctrl.get("r")),
                 fmt,
@@ -804,18 +876,134 @@ impl Interceptor {
         if matches!(acc.medium, KittyMedium::File | KittyMedium::Shm) {
             return Segment::Reject(kitty_reject(&ctrl));
         }
-        // A non-display action, an over-cap image, or an unsupported/non-direct
-        // medium is rendered (or ignored) by the local terminal but not mirrored.
-        if !acc.display || acc.over || !matches!(acc.medium, KittyMedium::Direct) {
+        // An over-cap image or an unsupported/non-direct medium is rendered (or
+        // ignored) by the local terminal but not mirrored.
+        if acc.over || !matches!(acc.medium, KittyMedium::Direct) {
             return Segment::Drop;
         }
-        kitty_direct_image(acc).unwrap_or(Segment::Drop)
+        let Some(bytes) = kitty_payload(&acc) else {
+            return Segment::Drop;
+        };
+        // Keep the image for a later `a=p`; `s`/`v` carry the dims of a raw
+        // framebuffer, an encoded file carries its own.
+        let stored = acc.id.zip(acc.px.or_else(|| dims(&bytes)));
+        if !acc.display {
+            // Transmit-only: nothing is drawn now, so nothing is mirrored now.
+            if let Some((id, px)) = stored {
+                self.kitty_store.insert(
+                    id,
+                    StoredImage {
+                        data: bytes,
+                        fmt: acc.fmt,
+                        px,
+                    },
+                );
+            }
+            return Segment::Drop;
+        }
+        if let Some((id, px)) = stored {
+            self.kitty_store.insert(
+                id,
+                StoredImage {
+                    data: bytes.clone(),
+                    fmt: acc.fmt,
+                    px,
+                },
+            );
+        }
+        kitty_segment(bytes, acc.fmt, acc.cells, acc.px, 0, false, None).unwrap_or(Segment::Drop)
+    }
+
+    /// Place an image transmitted earlier (`a=p`). The emitter positions the
+    /// cursor itself and hands us a SOURCE-PIXEL crop rectangle (`x,y,w,h`) —
+    /// pre-scaled to the destination, so the crop's pixel size IS the display
+    /// size and the usual `px / cell` derivation gives the cell footprint.
+    fn kitty_place(&self, ctrl: &std::collections::HashMap<String, String>) -> Segment {
+        let num = |k: &str| ctrl.get(k).and_then(|v| v.parse::<u32>().ok());
+        // An id we never saw (evicted, or transmitted before we started
+        // watching) simply isn't mirrored — the tee still draws it locally.
+        let Some(id) = num("i") else {
+            return Segment::Drop;
+        };
+        let Some(img) = self.kitty_store.get(id) else {
+            return Segment::Drop;
+        };
+        let (iw, ih) = img.px;
+        let (x, y) = (num("x").unwrap_or(0).min(iw), num("y").unwrap_or(0).min(ih));
+        let (w, h) = (
+            num("w").unwrap_or(iw - x).min(iw - x),
+            num("h").unwrap_or(ih - y).min(ih - y),
+        );
+        if w == 0 || h == 0 {
+            return Segment::Drop;
+        }
+        let whole = (x, y, w, h) == (0, 0, iw, ih);
+        // ponytail: `X`/`Y` (sub-cell pixel offsets) and `z` (stacking order)
+        // are ignored — placements are cell-anchored here, so the ceiling is up
+        // to a cell of alignment error; honoring them needs sub-cell placement
+        // coordinates on the wire.
+        let key = Some((id, num("p").unwrap_or(0)));
+        let hold = ctrl.get("C").map(String::as_str) == Some("1");
+        let lineage = hash_bytes(&[id.to_le_bytes(), num("p").unwrap_or(0).to_le_bytes()].concat());
+        let cells = cells_from(ctrl.get("c"), ctrl.get("r"));
+        match img.fmt {
+            KittyFmt::Rgba | KittyFmt::Rgb => {
+                let channels = if matches!(img.fmt, KittyFmt::Rgba) {
+                    4
+                } else {
+                    3
+                };
+                let bytes = crop(&img.data, (iw, ih), (x, y, w, h), channels);
+                kitty_segment(bytes, img.fmt, cells, Some((w, h)), lineage, hold, key)
+            }
+            // ponytail: cropping an encoded image would need a decoder we don't
+            // carry; mirroring it UNCROPPED would paint over what the terminal
+            // clipped away — showing more than the local screen, which the
+            // mirror never does. So a partial crop of an encoded image isn't
+            // mirrored. Upgrade path: the `png` crate's decoder.
+            KittyFmt::Png if whole => kitty_segment(
+                img.data.clone(),
+                img.fmt,
+                cells,
+                Some((w, h)),
+                lineage,
+                hold,
+                key,
+            ),
+            KittyFmt::Png | KittyFmt::Unsupported => None,
+        }
+        .unwrap_or(Segment::Drop)
     }
 }
 
-/// Decode a completed kitty DIRECT transmission into an image segment, or `None`
-/// on any malformed/over-cap payload (the caller renders it as [`Segment::Drop`]).
-fn kitty_direct_image(acc: KittyAccum) -> Option<Segment> {
+/// Cut a `(x, y, w, h)` pixel rectangle out of a raw `channels`-byte-per-pixel
+/// framebuffer. A row-by-row copy; the whole-image case just clones.
+fn crop(
+    data: &[u8],
+    (iw, _ih): (u32, u32),
+    (x, y, w, h): (u32, u32, u32, u32),
+    channels: u8,
+) -> Vec<u8> {
+    let px = usize::from(channels);
+    let stride = iw as usize * px;
+    let row = w as usize * px;
+    let mut out = Vec::with_capacity(row * h as usize);
+    for line in 0..h as usize {
+        let start = (y as usize + line) * stride + x as usize * px;
+        match data.get(start..start + row) {
+            Some(slice) => out.extend_from_slice(slice),
+            // A short/truncated framebuffer: pad so the PNG encode still matches
+            // the declared dims instead of failing the whole placement.
+            None => out.resize(row * (line + 1), 0),
+        }
+    }
+    out
+}
+
+/// The bytes a completed kitty DIRECT transmission carries, after base64, the
+/// `S`/`O` window and `o=z` inflation — `None` on any malformed or over-cap
+/// payload (the caller renders that as [`Segment::Drop`]).
+fn kitty_payload(acc: &KittyAccum) -> Option<Vec<u8>> {
     if matches!(acc.fmt, KittyFmt::Unsupported) {
         return None;
     }
@@ -833,23 +1021,37 @@ fn kitty_direct_image(acc: KittyAccum) -> Option<Segment> {
     if bytes.len() as u64 > MAX_IMAGE_BYTES {
         return None;
     }
-    match acc.fmt {
+    Some(bytes)
+}
+
+/// Turn transmitted bytes into the segment that places them. `px` is required
+/// for a raw framebuffer (it has no header); `lineage`/`hold`/`key` are the
+/// placement's identity and cursor behaviour (see [`DeferredImage::lineage`],
+/// [`Image::hold`], [`Image::key`]).
+fn kitty_segment(
+    bytes: Vec<u8>,
+    fmt: KittyFmt,
+    cells: Option<(u16, u16)>,
+    px: Option<(u32, u32)>,
+    lineage: u64,
+    hold: bool,
+    key: Option<(u32, u32)>,
+) -> Option<Segment> {
+    match fmt {
         // PNG passes through undecoded — cheap, stays inline.
         KittyFmt::Png => Some(Segment::Image(Image {
             mime: sniff_mime(&bytes)?.to_string(),
             px: dims(&bytes),
             bytes,
-            cells: acc.cells,
+            cells,
+            hold,
+            key,
         })),
         // Raw framebuffers need a PNG encode — deferred to the worker (dims come
         // from the transmission params, so the placement can be stamped immediately).
         KittyFmt::Rgba | KittyFmt::Rgb => {
-            let (w, h) = acc.px?;
-            let channels = if matches!(acc.fmt, KittyFmt::Rgba) {
-                4
-            } else {
-                3
-            };
+            let (w, h) = px?;
+            let channels = if matches!(fmt, KittyFmt::Rgba) { 4 } else { 3 };
             Some(Segment::Deferred(DeferredImage {
                 payload: DeferredPayload::Raw {
                     pixels: bytes,
@@ -857,9 +1059,11 @@ fn kitty_direct_image(acc: KittyAccum) -> Option<Segment> {
                     w,
                     h,
                 },
-                cells: acc.cells,
+                cells,
                 px: (w, h),
-                lineage: 0,
+                lineage,
+                hold,
+                key,
             }))
         }
         KittyFmt::Unsupported => None,
@@ -1090,6 +1294,8 @@ fn sixel_image(seq: &[u8]) -> Option<Segment> {
             cells: None,
             px,
             lineage: 0,
+            hold: false,
+            key: None,
         }));
     }
     let img = icy_sixel::SixelImage::decode(seq).ok()?;
@@ -1103,6 +1309,8 @@ fn sixel_image(seq: &[u8]) -> Option<Segment> {
         bytes: png,
         cells: None,
         px: Some((w, h)),
+        hold: false,
+        key: None,
     }))
 }
 
@@ -1167,6 +1375,8 @@ fn image_from_b64(base64: String, cells: Option<(u16, u16)>) -> Option<Image> {
         px: dims(&bytes),
         bytes,
         cells,
+        hold: false,
+        key: None,
     })
 }
 
@@ -1301,6 +1511,8 @@ mod tests {
                         bytes,
                         cells: d.cells,
                         px: Some(px),
+                        hold: d.hold,
+                        key: d.key,
                     })
                 }
                 Step::Passthrough(_)
@@ -1764,6 +1976,135 @@ mod tests {
                 "non-display action rendered an image: {seq:?}"
             );
         }
+    }
+
+    /// A 4×4 RGBA framebuffer whose every pixel is `(x, y, 0, 255)`.
+    fn ramp_rgba() -> Vec<u8> {
+        (0..4u8)
+            .flat_map(|y| (0..4u8).flat_map(move |x| [x, y, 0, 255]))
+            .collect()
+    }
+
+    /// zellij's shape: transmit chunked with an id (nothing drawn yet), then
+    /// place it after positioning the cursor itself (`C=1`).
+    #[test]
+    fn kitty_transmit_then_place_mirrors_the_placement() {
+        let mut it = Interceptor::new();
+        let b64 = B64.encode(ramp_rgba());
+        let (head, tail) = b64.split_at(8);
+        let transmit = format!(
+            "\x1b_Ga=t,q=2,f=32,t=d,i=7,s=4,v=4,m=1;{head}\x1b\\\x1b_Gq=2,m=0;{tail}\x1b\\"
+        );
+        let steps = it.feed(transmit.as_bytes());
+        assert!(
+            only_images(steps.clone()).is_empty(),
+            "a transmit draws nothing"
+        );
+        assert_eq!(
+            tee_bytes(&steps),
+            transmit.as_bytes(),
+            "terminal sees it all"
+        );
+
+        let place = b"\x1b_Ga=p,q=2,i=7,p=1,x=0,y=0,w=4,h=4,X=0,Y=0,z=0,C=1\x1b\\";
+        let steps = it.feed(place);
+        assert_eq!(tee_bytes(&steps), place);
+        let images = only_images(steps);
+        assert_eq!(images.len(), 1, "the placement is mirrored");
+        assert_eq!(images[0].px, Some((4, 4)));
+        assert_eq!(images[0].cells, None, "footprint derives from the crop px");
+        assert!(images[0].hold, "C=1 keeps the cursor put");
+        assert_eq!(images[0].key, Some((7, 1)));
+    }
+
+    #[test]
+    fn kitty_place_cuts_out_the_source_rect() {
+        let mut it = Interceptor::new();
+        let transmit = format!(
+            "\x1b_Ga=t,f=32,t=d,i=7,s=4,v=4;{}\x1b\\",
+            B64.encode(ramp_rgba())
+        );
+        it.feed(transmit.as_bytes());
+        let steps = it.feed(b"\x1b_Ga=p,i=7,p=2,x=1,y=2,w=2,h=1,C=1\x1b\\");
+        let Some(Step::Deferred(_, d)) = steps.iter().find(|s| matches!(s, Step::Deferred(..)))
+        else {
+            panic!("expected a deferred crop, got {steps:?}");
+        };
+        assert_eq!(d.px, (2, 1));
+        assert_eq!(
+            d.payload,
+            DeferredPayload::Raw {
+                // row y=2, columns x=1..3
+                pixels: vec![1, 2, 0, 255, 2, 2, 0, 255],
+                channels: 4,
+                w: 2,
+                h: 1,
+            }
+        );
+    }
+
+    /// Distinct placements must not collapse into one decode lineage (the pty
+    /// worker supersedes within a lineage), while re-placing the same one does.
+    #[test]
+    fn kitty_placements_carry_distinct_lineages() {
+        let mut it = Interceptor::new();
+        it.feed(
+            format!(
+                "\x1b_Ga=t,f=32,t=d,i=7,s=4,v=4;{}\x1b\\",
+                B64.encode(ramp_rgba())
+            )
+            .as_bytes(),
+        );
+        let lineage = |it: &mut Interceptor, seq: &str| match it.feed(seq.as_bytes()).pop() {
+            Some(Step::Deferred(_, d)) => d.lineage,
+            other => panic!("expected a deferred placement, got {other:?}"),
+        };
+        let a = lineage(&mut it, "\x1b_Ga=p,i=7,p=1,C=1\x1b\\");
+        let b = lineage(&mut it, "\x1b_Ga=p,i=7,p=2,C=1\x1b\\");
+        let a_again = lineage(&mut it, "\x1b_Ga=p,i=7,p=1,C=1\x1b\\");
+        assert_ne!(a, b, "two placements are two images");
+        assert_eq!(a, a_again, "re-placing the same one supersedes it");
+    }
+
+    #[test]
+    fn kitty_place_of_an_unknown_id_shows_nothing() {
+        let mut it = Interceptor::new();
+        let place = b"\x1b_Ga=p,i=99,p=1,C=1\x1b\\";
+        let steps = it.feed(place);
+        assert!(only_images(steps.clone()).is_empty());
+        assert_eq!(tee_bytes(&steps), place, "the terminal still draws it");
+    }
+
+    /// An encoded image can be placed whole, but a partial crop would need a
+    /// decoder — and mirroring it uncropped would paint over what the terminal
+    /// clipped away. So it isn't mirrored at all.
+    #[test]
+    fn kitty_place_of_an_encoded_image_only_mirrors_the_whole_rect() {
+        let mut it = Interceptor::new();
+        it.feed(format!("\x1b_Ga=t,f=100,t=d,i=8;{}\x1b\\", png_b64()).as_bytes());
+        assert_eq!(
+            only_images(it.feed(b"\x1b_Ga=p,i=8,p=1,C=1\x1b\\")).len(),
+            1,
+            "whole image places"
+        );
+        assert!(
+            only_images(it.feed(b"\x1b_Ga=p,i=8,p=2,x=0,y=0,w=1,h=0,C=1\x1b\\")).is_empty(),
+            "a degenerate/partial rect is not mirrored"
+        );
+    }
+
+    /// The refactor that added the store must not have opened the file/shm hole:
+    /// a transmit-only over an indirect medium is still refused.
+    #[test]
+    fn kitty_transmit_over_file_medium_is_still_rejected() {
+        let mut it = Interceptor::new();
+        let steps = it.feed(b"\x1b_Ga=t,f=100,t=f,i=5;L3RtcC94\x1b\\");
+        assert!(matches!(steps.as_slice(), [Step::Reject(_)]));
+        assert!(tee_bytes(&steps).is_empty(), "suppressed from the terminal");
+        assert!(
+            only_images(it.feed(b"\x1b_Ga=p,i=5,p=1,C=1\x1b\\")).is_empty(),
+            "nothing was stored to place"
+        );
     }
 
     #[test]
