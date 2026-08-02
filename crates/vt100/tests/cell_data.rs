@@ -88,6 +88,23 @@ fn taller_than_screen_scrolls_while_placing() {
     assert_eq!(tag(&vt, 2, 0), Some((7, 4, 0)));
 }
 
+// shellglass: the held form (kitty `a=p,C=1`) stamps downwards from the cursor
+// without moving it and without scrolling — a region running past the last row
+// is clipped there, so a placement on the bottom rows can't shift the screen.
+#[test]
+fn held_placement_neither_moves_the_cursor_nor_scrolls() {
+    let mut vt = parser(3, 10);
+    vt.process(b"top\x1b[3;2H"); // last row, column 1
+    vt.screen_mut().place_data_held(2, 4, |dr, dc| (7, dr, dc));
+    assert_eq!(vt.screen().cursor_position(), (2, 1));
+    assert_eq!(vt.screen().contents(), "top", "nothing scrolled off");
+    assert_eq!(tag(&vt, 2, 1), Some((7, 0, 0)));
+    assert_eq!(tag(&vt, 2, 2), Some((7, 0, 1)));
+    // Rows 1-3 of the region fell off the bottom edge; nothing wrapped.
+    assert_eq!(tag(&vt, 0, 1), None);
+    assert_eq!(tag(&vt, 1, 1), None);
+}
+
 #[test]
 fn too_wide_region_clips_at_the_right_edge() {
     let mut vt = parser(4, 10);

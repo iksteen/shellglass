@@ -635,16 +635,49 @@ impl<T> Screen<T> {
         &mut self,
         width: u16,
         height: u16,
+        data: impl FnMut(u16, u16) -> T,
+    ) {
+        self.place_data_impl(width, height, false, data);
+    }
+
+    /// shellglass: [`place_data`](Self::place_data) without the cursor
+    /// semantics — the region is stamped downwards from the cursor row, the
+    /// cursor does not move and the grid never scrolls (a region running past
+    /// the last row is clipped there). This is what a placement that declares
+    /// "do not move the cursor" needs — kitty's `C=1` on `a=p`, which zellij
+    /// emits after positioning the cursor itself.
+    pub fn place_data_held(
+        &mut self,
+        width: u16,
+        height: u16,
+        data: impl FnMut(u16, u16) -> T,
+    ) {
+        self.place_data_impl(width, height, true, data);
+    }
+
+    fn place_data_impl(
+        &mut self,
+        width: u16,
+        height: u16,
+        hold: bool,
         mut data: impl FnMut(u16, u16) -> T,
     ) {
-        let cols = self.grid().size().cols;
-        let left = self.grid().pos().col.min(cols - 1);
-        let width = width.clamp(1, cols - left);
+        let size = self.grid().size();
+        let left = self.grid().pos().col.min(size.cols - 1);
+        let width = width.clamp(1, size.cols - left);
+        let top = self.grid().pos().row;
         for row_off in 0..height.max(1) {
-            if row_off > 0 {
-                self.grid_mut().row_inc_scroll(1);
-            }
-            let row = self.grid().pos().row;
+            let row = if hold {
+                match top.checked_add(row_off) {
+                    Some(row) if row < size.rows => row,
+                    _ => break, // clipped at the bottom, never scrolled
+                }
+            } else {
+                if row_off > 0 {
+                    self.grid_mut().row_inc_scroll(1);
+                }
+                self.grid().pos().row
+            };
             for col_off in 0..width {
                 let pos = crate::grid::Pos {
                     row,
@@ -655,7 +688,9 @@ impl<T> Screen<T> {
                 }
             }
         }
-        self.grid_mut().col_set(0);
+        if !hold {
+            self.grid_mut().col_set(0);
+        }
     }
 
     /// Returns whether the text in row `row` should wrap to the next line.

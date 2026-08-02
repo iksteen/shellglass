@@ -30,7 +30,10 @@
 #     region by Screen::place_data; Parser/Screen/Callbacks gain the T param
 #     with defaults so the upstream-shaped API is unchanged. Consumer-agnostic
 #     (shellglass stores its inline-image overlay tag in T; any region
-#     metadata works). Tests in tests/cell_data.rs.
+#     metadata works). place_data_held is the same stamp without the cursor
+#     semantics — no cursor move, no scroll, clipped at the bottom row — for a
+#     placement that declares "don't move the cursor" (kitty `a=p,C=1`).
+#     Tests in tests/cell_data.rs.
 #   - attrs.rs/term.rs/screen.rs/cell.rs: modern SGR — underline styles
 #     (4:n subparam, 21 double, kitty numbering 0-5), strikethrough (9/29),
 #     underline color (58/59 incl. the colon/colorspace form). Upstream's
