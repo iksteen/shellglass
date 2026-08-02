@@ -94,6 +94,10 @@ pub enum Step {
     /// terminal; `.1` is a candidate app response used only by a detached owner
     /// that has cached this protocol from its last attached terminal.
     Query(Vec<u8>, Vec<u8>),
+    /// Placements the emitter revoked (kitty `a=d`): `.0` → the local terminal,
+    /// which drops them itself; the mirror drops the ones `.1` selects, so a
+    /// blanked image never lingers on the web.
+    Delete(Vec<u8>, DeleteSel),
     /// A kitty file/shm transmission we refuse (its payload is a filesystem path /
     /// shm name and the stream is untrusted — the exfiltration vector). SUPPRESSED
     /// from the local terminal (nothing teed); `.0` is a kitty error echoing the
@@ -114,7 +118,8 @@ impl Step {
             | Step::TerminalOnly(b)
             | Step::Image(b, _)
             | Step::Deferred(b, _)
-            | Step::Query(b, _) => Some(b),
+            | Step::Query(b, _)
+            | Step::Delete(b, _) => Some(b),
             Step::Reject(_) => None,
         }
     }
@@ -149,6 +154,29 @@ enum Segment {
     /// A query that draws nothing, with the response a detached virtual terminal
     /// may return from its cached capabilities.
     Query(Vec<u8>),
+    /// The emitter revoked placements it made earlier (kitty `a=d`).
+    Delete(DeleteSel),
+}
+
+/// Which placements an `a=d` revokes: by kitty image id, optionally narrowed to
+/// one placement id. `None` on both = every placement this emitter made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeleteSel {
+    pub image: Option<u32>,
+    pub placement: Option<u32>,
+}
+
+impl DeleteSel {
+    /// Does this selector revoke the placement stamped from `key` (the
+    /// `(image id, placement id)` an [`Image::key`] carries)?
+    #[must_use]
+    pub fn hits(&self, key: Option<(u32, u32)>) -> bool {
+        let Some((image, placement)) = key else {
+            return false; // not a keyed placement — no emitter can revoke it
+        };
+        self.image.is_none_or(|want| want == image)
+            && self.placement.is_none_or(|want| want == placement)
+    }
 }
 
 /// The stamp-now, decode-later form of an image (see [`Segment::Deferred`]).
@@ -813,6 +841,9 @@ impl Interceptor {
         if ctrl.get("a").map(String::as_str) == Some("p") {
             return self.kitty_place(&ctrl);
         }
+        if ctrl.get("a").map(String::as_str) == Some("d") {
+            return self.kitty_delete(&ctrl);
+        }
 
         // Start an accumulator on the first chunk of a transfer — the one that
         // carries the format/medium/size control keys (continuation chunks only
@@ -912,6 +943,35 @@ impl Interceptor {
             );
         }
         kitty_segment(bytes, acc.fmt, acc.cells, acc.px, 0, false, None).unwrap_or(Segment::Drop)
+    }
+
+    /// Revoke placements (`a=d`). Only the selectors an emitter of keyed
+    /// placements uses are honored: `d=i`/`d=I` (by image id, narrowed by `p=`)
+    /// and `d=a`/`d=A` (all of them); the uppercase forms also free the
+    /// transmitted data. A cursor/cell/z-based selector (`d=c`, `d=p`, `d=z`, …)
+    /// would need the placement geometry to resolve.
+    // ponytail: an unhandled selector leaves the mirror showing a placement the
+    // terminal dropped, until the cells are repainted — resolve them here if an
+    // emitter starts using them.
+    fn kitty_delete(&mut self, ctrl: &std::collections::HashMap<String, String>) -> Segment {
+        let what = ctrl.get("d").map_or("a", String::as_str);
+        let image = ctrl.get("i").and_then(|v| v.parse::<u32>().ok());
+        if matches!(what, "I" | "A")
+            && let Some(id) = image
+        {
+            self.kitty_store.remove(id);
+        }
+        match what {
+            "i" | "I" => Segment::Delete(DeleteSel {
+                image,
+                placement: ctrl.get("p").and_then(|v| v.parse().ok()),
+            }),
+            "a" | "A" => Segment::Delete(DeleteSel {
+                image: None,
+                placement: None,
+            }),
+            _ => Segment::Drop,
+        }
     }
 
     /// Place an image transmitted earlier (`a=p`). The emitter positions the
@@ -1474,6 +1534,7 @@ fn push_tee(out: &mut Vec<Step>, bytes: &[u8], seg: Segment) {
         Segment::Image(i) => Step::Image(bytes.to_vec(), i),
         Segment::Deferred(d) => Step::Deferred(bytes.to_vec(), d),
         Segment::Query(r) => Step::Query(bytes.to_vec(), r),
+        Segment::Delete(sel) => Step::Delete(bytes.to_vec(), sel),
         Segment::Drop => Step::TerminalOnly(bytes.to_vec()),
         Segment::Reject(r) => Step::Reject(r),
         // Transcode: the tee is the re-encoded bytes, NOT the original sixel.
@@ -1518,6 +1579,7 @@ mod tests {
                 Step::Passthrough(_)
                 | Step::TerminalOnly(_)
                 | Step::Query(_, _)
+                | Step::Delete(_, _)
                 | Step::Reject(_) => None,
             })
             .collect()
@@ -2064,6 +2126,41 @@ mod tests {
         let a_again = lineage(&mut it, "\x1b_Ga=p,i=7,p=1,C=1\x1b\\");
         assert_ne!(a, b, "two placements are two images");
         assert_eq!(a, a_again, "re-placing the same one supersedes it");
+    }
+
+    #[test]
+    fn kitty_delete_selects_placements_and_frees_the_store() {
+        let mut it = Interceptor::new();
+        it.feed(
+            format!(
+                "\x1b_Ga=t,f=32,t=d,i=7,s=4,v=4;{}\x1b\\",
+                B64.encode(ramp_rgba())
+            )
+            .as_bytes(),
+        );
+        let sel = |it: &mut Interceptor, seq: &str| match it.feed(seq.as_bytes()).pop() {
+            Some(Step::Delete(_, sel)) => Some(sel),
+            _ => None,
+        };
+        // By placement, by image, and everything.
+        let one = sel(&mut it, "\x1b_Ga=d,d=i,i=7,p=3\x1b\\").unwrap();
+        assert!(one.hits(Some((7, 3))));
+        assert!(!one.hits(Some((7, 4))));
+        assert!(!one.hits(None), "unkeyed placements are never revoked");
+        let image = sel(&mut it, "\x1b_Ga=d,d=i,i=7\x1b\\").unwrap();
+        assert!(image.hits(Some((7, 4))) && !image.hits(Some((8, 4))));
+        let all = sel(&mut it, "\x1b_Ga=d,d=a\x1b\\").unwrap();
+        assert!(all.hits(Some((8, 4))));
+        // A selector we can't resolve is not a delete at all.
+        assert!(sel(&mut it, "\x1b_Ga=d,d=z,z=1\x1b\\").is_none());
+
+        // The lowercase forms keep the data placeable; `d=I` frees it.
+        assert_eq!(
+            only_images(it.feed(b"\x1b_Ga=p,i=7,p=9,C=1\x1b\\")).len(),
+            1
+        );
+        it.feed(b"\x1b_Ga=d,d=I,i=7\x1b\\");
+        assert!(only_images(it.feed(b"\x1b_Ga=p,i=7,p=9,C=1\x1b\\")).is_empty());
     }
 
     #[test]

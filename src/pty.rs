@@ -695,6 +695,23 @@ struct Placed {
     /// pending until vt100's cell lifetime evicts it — the "skip stale
     /// frames" half of the worker's newest-wins queue.
     ready: Option<(String, crate::model::ImageBlob)>,
+    /// The emitter's `(image id, placement id)`, when it names its placements
+    /// (kitty `a=p`) — the handle its `a=d` revokes this by. Cell tags cover
+    /// the erase-by-repaint half of an image's life; this covers the half where
+    /// the emitter drops an image without touching the cells.
+    key: Option<(u32, u32)>,
+}
+
+/// What the producer says about one placement: the display hints, whether the
+/// emitter keeps the cursor where it is (see [`crate::images::Image::hold`]),
+/// and the handle it may revoke the placement by ([`crate::images::Image::key`]).
+struct Place {
+    cells: Option<(u16, u16)>,
+    px: Option<(u32, u32)>,
+    hold: bool,
+    key: Option<(u32, u32)>,
+    /// The payload when already decoded, `None` while the worker owes it.
+    ready: Option<(String, crate::model::ImageBlob)>,
 }
 
 /// Stamp an image at the cursor and start tracking it. Per-cell tags go into
@@ -706,18 +723,7 @@ struct Placed {
 /// The cell size comes from the app's hint, else from pixel size ÷ cell size
 /// (so a natural-size image still advances the cursor); placement leaves the
 /// cursor at col 0 of the image's last row, where a sixel-scrolling terminal
-/// leaves it. `ready` is the payload when already decoded, `None` while the
-/// worker owes it.
-/// What the producer says about one placement: the display hints, and whether
-/// the emitter keeps the cursor where it is (see [`crate::images::Image::hold`]).
-struct Place {
-    cells: Option<(u16, u16)>,
-    px: Option<(u32, u32)>,
-    hold: bool,
-    /// The payload when already decoded, `None` while the worker owes it.
-    ready: Option<(String, crate::model::ImageBlob)>,
-}
-
+/// leaves it (unless the placement holds it, see [`Place::hold`]).
 fn stamp_image(
     parser: &mut SgParser,
     images: &mut Vec<Placed>,
@@ -729,6 +735,7 @@ fn stamp_image(
         cells,
         px,
         hold,
+        key,
         ready,
     } = place;
     let (row, col) = parser.screen().cursor_position();
@@ -775,6 +782,7 @@ fn stamp_image(
         cols,
         rows,
         ready,
+        key,
     });
     id
 }
@@ -1048,6 +1056,7 @@ impl ScreenState {
                             cells: img.cells,
                             px: img.px,
                             hold: img.hold,
+                            key: img.key,
                             ready,
                         },
                     );
@@ -1066,12 +1075,20 @@ impl ScreenState {
                             cells: d.cells,
                             px: Some(d.px),
                             hold: d.hold,
+                            key: d.key,
                             ready: None,
                         },
                     );
                     self.image_seq = seq;
                     let _ = self.image_jobs.send((d.lineage, id, d.payload));
                     self.dirty = true;
+                }
+                // The emitter dropped these itself; the mirror must not keep
+                // showing what the local screen no longer does.
+                Step::Delete(_, sel) => {
+                    let before = self.images.len();
+                    self.images.retain(|p| !sel.hits(p.key));
+                    self.dirty |= self.images.len() != before;
                 }
                 Step::Query(_, response) => out.queries.extend_from_slice(&response),
                 Step::Reject(response) => out.app.extend_from_slice(&response),
@@ -1265,6 +1282,7 @@ fn resolve_images(
                         cols: None,
                         rows: None,
                         ready: None,
+                        key: None,
                     },
                 ));
                 return false; // every covered cell gone → evict
@@ -1933,6 +1951,45 @@ mod tests {
         }
     }
 
+    /// The transfer-then-place round trip through the screen state: a placement
+    /// holds the cursor where the emitter put it, and the emitter's `a=d`
+    /// revokes exactly the placement it names — the mirror must not keep showing
+    /// an image the local terminal has dropped.
+    #[test]
+    fn kitty_placements_hold_the_cursor_and_a_delete_revokes_one() {
+        let (job_tx, _job_rx) = mpsc::channel();
+        let caps = Caps {
+            kitty: true,
+            ..Caps::default()
+        };
+        let mut screen =
+            ScreenState::with_parser(new_parser(24, 80), caps, (10, 20), None, job_tx, true);
+        // 2x2 RGBA transmitted as image 7, then placed twice at chosen cells.
+        let payload =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0u8; 2 * 2 * 4]);
+        screen.feed_output(format!("\x1b_Ga=t,f=32,t=d,i=7,s=2,v=2;{payload}\x1b\\").as_bytes());
+        assert!(screen.images.is_empty(), "a transmit places nothing");
+
+        screen.feed_output(b"\x1b[3;5H\x1b_Ga=p,i=7,p=1,C=1\x1b\\");
+        assert_eq!(
+            screen.parser.screen().cursor_position(),
+            (2, 4),
+            "C=1 holds"
+        );
+        screen.feed_output(b"\x1b[6;1H\x1b_Ga=p,i=7,p=2,C=1\x1b\\");
+        assert_eq!(screen.images.len(), 2);
+        assert_eq!(screen.images[0].key, Some((7, 1)));
+
+        screen.feed_output(b"\x1b_Ga=d,d=i,i=7,p=1\x1b\\");
+        assert_eq!(
+            screen.images.iter().map(|p| p.key).collect::<Vec<_>>(),
+            vec![Some((7, 2))],
+            "only the named placement is revoked"
+        );
+        screen.feed_output(b"\x1b_Ga=d,d=A,i=7\x1b\\");
+        assert!(screen.images.is_empty(), "delete-all revokes the rest");
+    }
+
     /// A burst of placements of DIFFERENT images must all be decoded — dropping
     /// the older ones would leave those placements pending, and a pending
     /// placement never reaches a frame. Same-lineage jobs may collapse (that is
@@ -2271,6 +2328,7 @@ mod tests {
                 cells: None,          // no app-specified cells → derive from px
                 px: Some((400, 402)), // image px
                 hold: false,
+                key: None,
                 ready: None,
             },
         );
@@ -2327,6 +2385,7 @@ mod tests {
                     bytes: bytes::Bytes::new(),
                 },
             )),
+            key: None,
         }]
     }
 
@@ -2404,6 +2463,7 @@ mod tests {
             cols: Some(4.0),
             rows: Some(2.0),
             ready: None,
+            key: None,
         });
 
         // N's cells are gone, but N keeps showing (zombie) while N+1 pends.
