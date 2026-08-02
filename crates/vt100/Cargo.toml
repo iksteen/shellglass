@@ -88,7 +88,11 @@
 #     effect. Round 5 added sixel display/scroll modes 80 (DECSDM) and 8452
 #     (cursor right of graphic) to the ignored set — sixel is mirrored by
 #     shellglass's own interceptor with a fixed default-matching placement, so
-#     the parser has no way to act on them and needn't log them. Tests in
+#     the parser has no way to act on them and needn't log them. Round 6 added
+#     DECRQM mode queries (`CSI ? … $ p` and `CSI … $ p`) and OSC 4 palette
+#     *queries* (`4 ; idx ; ?`, repeatable) — answers come from the local
+#     terminal; the OSC 4 SET form and OSC 104 reset do change rendering and
+#     deliberately keep reporting. Tests in
 #     tests/csi.rs (incl. noop_arms_round4), tests/escape.rs, tests/osc.rs.
 #   - screen.rs/grid.rs: hardening against hostile/degenerate input (release
 #     has no overflow-checks, so a bare u16 subtraction wraps instead of

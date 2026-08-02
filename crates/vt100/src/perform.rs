@@ -255,8 +255,11 @@ impl<CB: crate::callbacks::Callbacks<T>, T> vte::Perform
                 // position, printer/UDK/locator status) and kitty keyboard
                 // protocol query (`CSI ? u`): the embedding terminal answers
                 // via the tee; zero render effect. Deliberately ignored, not
-                // unhandled.
+                // unhandled. DECRQM (`CSI ? Ps $ p`, mode query — tmux and
+                // neovim probe 2026/2027 with it) is the same class: a
+                // question, not a state change.
                 'n' | 'u' => {}
+                'p' if intermediates.get(1) == Some(&b'$') => {}
                 _ => {
                     self.callbacks.unhandled_csi(
                         &mut self.screen,
@@ -305,6 +308,9 @@ impl<CB: crate::callbacks::Callbacks<T>, T> vte::Perform
                     );
                 }
             },
+            // shellglass: ANSI-mode DECRQM (`CSI Ps $ p`) — the non-private
+            // half of the query above; likewise answered by the terminal.
+            Some(b'$') if c == 'p' => {}
             // shellglass: intermediate `!`
             Some(b'!') => match c {
                 // DECSTR, soft terminal reset
@@ -353,6 +359,15 @@ impl<CB: crate::callbacks::Callbacks<T>, T> vte::Perform
             // Neither has pixels of its own; the local terminal sees both via
             // the tee.
             [b"10" | b"11", b"?"] | [b"133", ..] => {}
+            // shellglass: OSC 4 palette *queries* (`4 ; idx ; ?`, repeatable
+            // in pairs) — same class: the local terminal answers, nothing
+            // renders. The SET form (`4 ; idx ; spec`) and OSC 104 reset do
+            // change rendering, so they stay unhandled and keep reporting
+            // until the palette is modelled.
+            [b"4", pairs @ ..]
+                if !pairs.is_empty()
+                    && pairs.len() % 2 == 0
+                    && pairs.chunks(2).all(|pair| pair[1] == b"?") => {}
             // shellglass: OSC 10/11 set form — override the default fg/bg
             // (theme switchers, OSC 11-emitting TUIs); OSC 110/111 reset.
             // A value we can't parse (named colors, rgbi:) stays unhandled

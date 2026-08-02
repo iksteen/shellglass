@@ -129,6 +129,27 @@ fn default_colors_track_set_and_reset() {
     assert_eq!(vt.screen().default_bg(), None);
 }
 
+// shellglass: OSC 4 palette queries are answered by the local terminal and
+// render nothing — silent no-ops. The set form and OSC 104 reset DO change
+// rendering, so they must keep reporting (telemetry, not silence).
+#[test]
+fn osc4_queries_are_ignored_but_sets_report() {
+    #[derive(Default)]
+    struct Rec(usize);
+    impl vt100::Callbacks for Rec {
+        fn unhandled_osc(&mut self, _: &mut vt100::Screen, _: &[&[u8]]) {
+            self.0 += 1;
+        }
+    }
+    let mut vt = vt100::Parser::new_with_callbacks(24, 80, 0, Rec::default());
+    vt.process(b"\x1b]4;1;?\x07\x1b]4;0;?;15;?\x1b\\");
+    assert_eq!(vt.callbacks().0, 0, "queries must not report");
+    vt.process(b"\x1b]4;1;rgb:ff/00/00\x07"); // set
+    vt.process(b"\x1b]104\x07"); // reset all
+    vt.process(b"\x1b]4;1\x07"); // malformed (odd)
+    assert_eq!(vt.callbacks().0, 3);
+}
+
 // shellglass: the window title is screen state — OSC 0/2 set it (OSC 1, icon
 // name only, doesn't), XTWINOPS 22/23 save/restore it, RIS wipes it.
 #[test]

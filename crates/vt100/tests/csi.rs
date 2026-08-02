@@ -393,6 +393,8 @@ fn noop_arms_round4() {
                                                // matching placement, so the parser deliberately ignores these (both forms).
     vt.process(b"\x1b[?80h\x1b[?80l");
     vt.process(b"\x1b[?8452h\x1b[?8452l");
+    // DECRQM mode queries, private and ANSI form (tmux/neovim probe 2026).
+    vt.process(b"\x1b[?2026$p\x1b[?1049$p\x1b[4$p");
     vt.process(b"b");
     // nothing rendered, nothing moved beyond the two printed glyphs
     assert_eq!(vt.screen().contents(), "ab");
