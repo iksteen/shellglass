@@ -153,6 +153,11 @@ pub struct DeferredImage {
     /// Pixel dimensions, from cheap metadata (sixel raster attributes, kitty
     /// transmission params) — NOT from decoding.
     pub px: (u32, u32),
+    /// Which stream of images this one belongs to; a queued decode is dropped
+    /// only when a LATER decode with the same lineage arrives (see
+    /// `pty::image_worker`). `0` = the cursor stream — an animation replacing
+    /// itself in place, where only the newest frame is worth decoding.
+    pub lineage: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -854,6 +859,7 @@ fn kitty_direct_image(acc: KittyAccum) -> Option<Segment> {
                 },
                 cells: acc.cells,
                 px: (w, h),
+                lineage: 0,
             }))
         }
         KittyFmt::Unsupported => None,
@@ -1083,6 +1089,7 @@ fn sixel_image(seq: &[u8]) -> Option<Segment> {
             payload: DeferredPayload::Sixel(seq.to_vec()),
             cells: None,
             px,
+            lineage: 0,
         }));
     }
     let img = icy_sixel::SixelImage::decode(seq).ok()?;

@@ -327,34 +327,54 @@ pub fn start(command: &[String], sixel_compat: bool) -> Result<SourceSession> {
     Ok(SourceSession::new(frame_rx, Arc::new(Notifier(msg_tx))))
 }
 
-/// Start the shared newest-wins deferred image worker. Owners provide only the
-/// wake-up callback that routes the ready payload into their own event loop.
+/// One deferred decode: the image's *lineage* (see [`image_worker`]), the
+/// placement to fill, and the payload to decode.
+pub(crate) type ImageJob = (u64, std::num::NonZeroU32, crate::images::DeferredPayload);
+
+/// Start the shared deferred image worker. Owners provide only the wake-up
+/// callback that routes the ready payload into their own event loop.
+///
+/// Newest-wins is per LINEAGE, not global: a queued job is superseded only by a
+/// later job with the same lineage (a video's successive frames at the cursor,
+/// lineage 0), so a burst of placements of *different* images all get decoded.
+/// A globally-newest-wins drain would silently drop all but the last, leaving
+/// those placements pending — and a pending placement never reaches a frame.
 pub(crate) fn image_worker(
     notify: impl Fn(ImageReady) -> bool + Send + 'static,
-) -> mpsc::Sender<(std::num::NonZeroU32, crate::images::DeferredPayload)> {
-    let (job_tx, job_rx) =
-        mpsc::channel::<(std::num::NonZeroU32, crate::images::DeferredPayload)>();
+) -> mpsc::Sender<ImageJob> {
+    let (job_tx, job_rx) = mpsc::channel::<ImageJob>();
     std::thread::spawn(move || {
-        while let Ok(mut job) = job_rx.recv() {
+        while let Ok(job) = job_rx.recv() {
+            let mut jobs = vec![job];
             let mut superseded = false;
-            while let Ok(newer) = job_rx.try_recv() {
-                job = newer;
-                superseded = true;
+            while let Ok(next) = job_rx.try_recv() {
+                match jobs.iter_mut().find(|queued| queued.0 == next.0) {
+                    Some(queued) => {
+                        *queued = next;
+                        superseded = true;
+                    }
+                    None => jobs.push(next),
+                }
             }
-            let Some((png, _px)) = crate::images::finish_deferred(&job.1, superseded) else {
-                continue;
-            };
-            let mime = "image/png".to_string();
-            let hash = crate::proto::content_key(&mime, &png);
-            if !notify(ImageReady {
-                id: job.0,
-                hash,
-                blob: crate::model::ImageBlob {
-                    mime,
-                    bytes: png.into(),
-                },
-            }) {
-                break;
+            // Backpressure: a backlog (superseded frames, or several images
+            // waiting) buys size with the cheap deflate level.
+            let fast = superseded || jobs.len() > 1;
+            for (_, id, payload) in jobs {
+                let Some((png, _px)) = crate::images::finish_deferred(&payload, fast) else {
+                    continue;
+                };
+                let mime = "image/png".to_string();
+                let hash = crate::proto::content_key(&mime, &png);
+                if !notify(ImageReady {
+                    id,
+                    hash,
+                    blob: crate::model::ImageBlob {
+                        mime,
+                        bytes: png.into(),
+                    },
+                }) {
+                    return;
+                }
             }
         }
     });
@@ -885,7 +905,7 @@ pub(crate) struct ScreenState {
     interceptor: Interceptor,
     cell: (u16, u16),
     image_seq: std::num::NonZeroU32,
-    image_jobs: mpsc::Sender<(std::num::NonZeroU32, crate::images::DeferredPayload)>,
+    image_jobs: mpsc::Sender<ImageJob>,
     primary_da: PrimaryDaQueries,
     profile_known: bool,
     effective_sixel: bool,
@@ -909,7 +929,7 @@ impl ScreenState {
         caps: Caps,
         cell: (u16, u16),
         transcode: Option<crate::images::GfxProto>,
-        image_jobs: mpsc::Sender<(std::num::NonZeroU32, crate::images::DeferredPayload)>,
+        image_jobs: mpsc::Sender<ImageJob>,
         profile_known: bool,
     ) -> ScreenState {
         ScreenState {
@@ -942,11 +962,7 @@ impl ScreenState {
     /// A fresh screen at `rows`×`cols` with default caps — the detachable owner,
     /// which probes no terminal.
     #[cfg(all(feature = "push", unix))]
-    pub(crate) fn new(
-        rows: u16,
-        cols: u16,
-        image_jobs: mpsc::Sender<(std::num::NonZeroU32, crate::images::DeferredPayload)>,
-    ) -> ScreenState {
+    pub(crate) fn new(rows: u16, cols: u16, image_jobs: mpsc::Sender<ImageJob>) -> ScreenState {
         Self::with_parser(
             new_parser(rows, cols),
             Caps::default(),
@@ -1031,7 +1047,7 @@ impl ScreenState {
                         None,
                     );
                     self.image_seq = seq;
-                    let _ = self.image_jobs.send((id, d.payload));
+                    let _ = self.image_jobs.send((d.lineage, id, d.payload));
                     self.dirty = true;
                 }
                 Step::Query(_, response) => out.queries.extend_from_slice(&response),
@@ -1892,6 +1908,41 @@ mod tests {
             images: Vec::new(),
             image_data: Default::default(),
         }
+    }
+
+    /// A burst of placements of DIFFERENT images must all be decoded — dropping
+    /// the older ones would leave those placements pending, and a pending
+    /// placement never reaches a frame. Same-lineage jobs may collapse (that is
+    /// the point), so this only asserts every lineage is answered.
+    #[test]
+    fn deferred_jobs_of_distinct_lineages_all_complete() {
+        let (done_tx, done_rx) = mpsc::channel();
+        let jobs = image_worker(move |ready| done_tx.send(ready.id).is_ok());
+        let raw = |lineage: u64, id: u32| {
+            (
+                lineage,
+                std::num::NonZeroU32::new(id).unwrap(),
+                crate::images::DeferredPayload::Raw {
+                    pixels: vec![0u8; 4],
+                    channels: 4,
+                    w: 1,
+                    h: 1,
+                },
+            )
+        };
+        for id in 1..=4u32 {
+            jobs.send(raw(u64::from(id), id)).unwrap();
+        }
+        let mut seen: Vec<u32> = (0..4)
+            .map(|_| {
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("every lineage answered")
+            })
+            .map(std::num::NonZeroU32::get)
+            .collect();
+        seen.sort_unstable();
+        assert_eq!(seen, vec![1, 2, 3, 4]);
     }
 
     #[cfg(windows)]
