@@ -104,11 +104,24 @@ impl<T> Cell<T> {
     }
 
     pub(crate) fn clear(&mut self, attrs: crate::attrs::Attrs) {
-        self.len = 0;
+        // shellglass: a sticky slot outlives an erase of the cell's text, the
+        // way kitty keeps a graphics placement through EL and a partial ED
+        // (only a whole-display erase drops its images — see `drop_data`).
+        let sticky = self.len & STICKY_DATA;
+        self.len = sticky;
         self.attrs = attrs;
         // shellglass: an erased cell keeps drawing attrs (bg) but must never
-        // be a clickable link, and erasing drops the data slot.
+        // be a clickable link, and erasing drops a non-sticky data slot.
         self.attrs.link = None;
+        if sticky == 0 {
+            self.data = None;
+        }
+    }
+
+    // shellglass: drop the data slot no matter how sticky it is — the wipe a
+    // whole-display erase performs (kitty's `grman_clear`).
+    pub(crate) fn drop_data(&mut self) {
+        self.len &= !STICKY_DATA;
         self.data = None;
     }
 

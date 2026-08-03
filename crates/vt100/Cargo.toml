@@ -34,9 +34,12 @@
 #     the cursor semantics (no cursor move, no scroll, clipped at the bottom
 #     row) for a placement that declares "don't move the cursor" (kitty
 #     `a=p,C=1`), and `sticky` (a spare bit of Cell::len, masked out of cell
-#     equality) keeps the slot through text written into the cell, dying only
-#     on erase — kitty's placement lifetime, as opposed to a sixel, which a
-#     print erases. Tests in tests/cell_data.rs.
+#     equality) keeps the slot through text written into the cell AND through
+#     an erase of that text, dying only with a whole-display erase (`CSI 2 J`,
+#     where kitty calls grman_clear — its erase paths touch images nowhere
+#     else) or a scroll out of the grid. That is kitty's placement lifetime, as
+#     opposed to a sixel, which any print or erase wipes.
+#     Tests in tests/cell_data.rs.
 #   - attrs.rs/term.rs/screen.rs/cell.rs: modern SGR — underline styles
 #     (4:n subparam, 21 double, kitty numbering 0-5), strikethrough (9/29),
 #     underline color (58/59 incl. the colon/colorspace form). Upstream's

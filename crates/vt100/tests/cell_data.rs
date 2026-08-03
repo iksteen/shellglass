@@ -60,11 +60,12 @@ fn overwrite_and_erase_kill_the_data() {
     assert_eq!(tag(&vt, 0, 2), None);
 }
 
-// shellglass: a STICKY slot outlives text written into its cell — kitty's
-// placement lifetime, where printing over an image leaves the image alone —
-// but an erase still drops it, and it still rides scrolling.
+// shellglass: a STICKY slot outlives both text written into its cell and an
+// erase of that text — kitty's placement lifetime, where only a WHOLE-display
+// erase (`CSI 2 J`, its `grman_clear`) takes the images with it. It still
+// rides scrolling.
 #[test]
-fn sticky_data_survives_overwrite_but_not_erase() {
+fn sticky_data_survives_overwrite_and_line_erase() {
     let sticky = vt100::PlaceOpts {
         sticky: true,
         ..Default::default()
@@ -75,10 +76,13 @@ fn sticky_data_survives_overwrite_but_not_erase() {
     vt.process(b"\x1b[1;1Hxy");
     assert_eq!(tag(&vt, 0, 0), Some((7, 0, 0)), "overwrite keeps it");
     assert_eq!(tag(&vt, 0, 1), Some((7, 0, 1)));
-    // Erasing does drop it (EL from column 2, then ED for the survivors).
+    // An EL — what an emitter repainting a line under an image sends — keeps it.
     vt.process(b"\x1b[1;3H\x1b[K");
-    assert_eq!(tag(&vt, 0, 2), None, "erase drops it");
-    assert_eq!(tag(&vt, 0, 0), Some((7, 0, 0)));
+    assert_eq!(tag(&vt, 0, 2), Some((7, 0, 2)), "line erase keeps it");
+    // So does a PARTIAL display erase (ED 0/1).
+    vt.process(b"\x1b[1;1H\x1b[J\x1b[1J");
+    assert_eq!(tag(&vt, 0, 0), Some((7, 0, 0)), "partial ED keeps it");
+    // The whole-display erase is the one that takes images with it.
     vt.process(b"\x1b[2J");
     assert_eq!(tag(&vt, 0, 0), None);
 
