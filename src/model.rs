@@ -138,6 +138,13 @@ pub struct ImagePlacement {
     pub cols: Option<f32>,
     #[serde(rename = "h", default, skip_serializing_if = "Option::is_none")]
     pub rows: Option<f32>,
+    /// Sub-cell offset from `(row, col)`, in CELLS (kitty's `X`/`Y` pixel
+    /// offsets divided by the producer's cell size — the viewer's cells are its
+    /// own size, so like `cols`/`rows` this travels as a fraction). Absent = 0.
+    #[serde(rename = "x", default, skip_serializing_if = "Option::is_none")]
+    pub x_off: Option<f32>,
+    #[serde(rename = "y", default, skip_serializing_if = "Option::is_none")]
+    pub y_off: Option<f32>,
     /// Stacking order, when the emitter states one (kitty's `z=`): `z < 0`
     /// paints under the text, `z >= 0` over it, and higher wins among images.
     /// `None` — every protocol that just draws at the cursor — keeps the

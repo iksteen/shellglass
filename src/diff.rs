@@ -2559,6 +2559,8 @@ mod tests {
             col: 2,
             cols: Some(3.0),
             rows: Some(1.0),
+            x_off: Some(0.25),
+            y_off: None,
             z: Some(-1),
             hash: "ab".repeat(32),
         });

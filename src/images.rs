@@ -77,6 +77,10 @@ pub struct Placement {
     /// Stacking order, when the emitter states one (see
     /// [`crate::model::ImagePlacement::z`]).
     pub z: Option<i32>,
+    /// Sub-cell offset in PIXELS (kitty's `X`/`Y`), which the mirror divides by
+    /// its cell size like every other pixel dimension — see
+    /// [`crate::model::ImagePlacement::x_off`].
+    pub off_px: (u16, u16),
 }
 
 /// Pixel dimensions from an encoded image's header (any format the browser takes).
@@ -1020,9 +1024,6 @@ impl Interceptor {
             return Segment::Drop;
         }
         let whole = (x, y, w, h) == (0, 0, iw, ih);
-        // ponytail: `X`/`Y` (sub-cell pixel offsets) are ignored — placements are
-        // cell-anchored here, so the ceiling is up to a cell of alignment error;
-        // honoring them needs sub-cell coordinates on the wire.
         let placement = num("p").unwrap_or(0);
         let place = Placement {
             cells: cells_from(ctrl.get("c"), ctrl.get("r")),
@@ -1036,6 +1037,12 @@ impl Interceptor {
             // (z=0, over the text) would bury the shell prompt our cursor model
             // deliberately leaves on an image's last row.
             z: ctrl.get("z").and_then(|v| v.parse().ok()),
+            // `X`/`Y` position the image inside its cell — how an emitter tiles
+            // one image across several placements without seams.
+            off_px: (
+                u16::try_from(num("X").unwrap_or(0)).unwrap_or(0),
+                u16::try_from(num("Y").unwrap_or(0)).unwrap_or(0),
+            ),
         };
         let lineage = hash_bytes(&[id.to_le_bytes(), placement.to_le_bytes()].concat());
         match img.fmt {

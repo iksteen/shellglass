@@ -90,6 +90,8 @@ export interface ImageRef {
   c: number; // left col
   w?: number; // width in cells
   h?: number; // height in cells (rows)
+  x?: number; // sub-cell offset from (c, r), in cells; absent = 0
+  y?: number;
   z?: number; // stacking order: < 0 under the text, >= 0 over it; absent = under
   k: string; // content address of the image bytes
 }
@@ -1279,8 +1281,8 @@ function drawRowImages(p: RowPaint, over: boolean): void {
       ref.w && ref.h
         ? Math.min((ref.w * cellW * dpr) / natW, (ref.h * cellH * dpr) / natH)
         : dpr; // no cell box: natural CSS-pixel size
-    const ix = ref.c * cellW * dpr;
-    const iy = ref.r * cellH * dpr;
+    const ix = (ref.c + (ref.x ?? 0)) * cellW * dpr;
+    const iy = (ref.r + (ref.y ?? 0)) * cellH * dpr;
     const top = Math.max(p.y0, iy);
     const bot = Math.min(p.y1, iy + natH * sc);
     if (bot <= top) continue;
@@ -2154,8 +2156,11 @@ export function attrEscape(s: string): string {
 
 function renderImage(im: ImageRef): string {
   const sized = im.w && im.h;
+  // The sub-cell offset folds into the cell coordinates (both are multiplied by
+  // the cell box in the layout rule), so a copied fragment lands where the
+  // canvas painted it.
   const vars =
-    `--sg-c:${im.c};--sg-r:${im.r}` +
+    `--sg-c:${im.c + (im.x ?? 0)};--sg-r:${im.r + (im.y ?? 0)}` +
     (sized ? `;--sg-w:${im.w};--sg-h:${im.h}` : "");
   // Relative content-addressed URL: resolves under the page directory
   // (subpath-safe) and is immutable, so the browser cache absorbs re-renders

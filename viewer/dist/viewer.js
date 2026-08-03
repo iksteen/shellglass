@@ -828,8 +828,8 @@ function drawRowImages(p, over) {
         const sc = ref.w && ref.h
             ? Math.min((ref.w * cellW * dpr) / natW, (ref.h * cellH * dpr) / natH)
             : dpr;
-        const ix = ref.c * cellW * dpr;
-        const iy = ref.r * cellH * dpr;
+        const ix = (ref.c + (ref.x ?? 0)) * cellW * dpr;
+        const iy = (ref.r + (ref.y ?? 0)) * cellH * dpr;
         const top = Math.max(p.y0, iy);
         const bot = Math.min(p.y1, iy + natH * sc);
         if (bot <= top)
@@ -1407,7 +1407,7 @@ export function attrEscape(s) {
 }
 function renderImage(im) {
     const sized = im.w && im.h;
-    const vars = `--sg-c:${im.c};--sg-r:${im.r}` +
+    const vars = `--sg-c:${im.c + (im.x ?? 0)};--sg-r:${im.r + (im.y ?? 0)}` +
         (sized ? `;--sg-w:${im.w};--sg-h:${im.h}` : "");
     const co = crossOriginImages ? ` crossorigin="anonymous"` : "";
     return `<img class="inline-img${sized ? " sized" : ""}" style="${vars}" alt=""${co} src="${mountBase}images/${attrEscape(im.k)}">`;

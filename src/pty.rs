@@ -703,6 +703,8 @@ struct Placed {
     /// Stacking order the emitter stated, straight onto the wire (see
     /// [`crate::model::ImagePlacement::z`]).
     z: Option<i32>,
+    /// Sub-cell offset in cells (see [`crate::model::ImagePlacement::x_off`]).
+    off: (f32, f32),
 }
 
 /// What the producer says about one placement (see
@@ -739,6 +741,7 @@ fn stamp_image(
         sticky,
         key,
         z,
+        off_px,
     } = place;
     let (row, col) = parser.screen().cursor_position();
     // Display size in cells. An app-specified footprint is exact; a derived one
@@ -784,6 +787,12 @@ fn stamp_image(
         ready,
         key,
         z,
+        // Sub-cell offsets travel as cell fractions, same reason the display
+        // size does: the viewer's cell is its own size, not the terminal's.
+        off: (
+            f32::from(off_px.0) / f32::from(cell.0),
+            f32::from(off_px.1) / f32::from(cell.1),
+        ),
     });
     id
 }
@@ -1281,6 +1290,7 @@ fn resolve_images(
                         ready: None,
                         key: None,
                         z: None,
+                        off: (0.0, 0.0),
                     },
                 ));
                 return false; // every covered cell gone → evict
@@ -1319,6 +1329,8 @@ fn resolve_images(
                 col: p.col,
                 cols: p.cols,
                 rows: p.rows,
+                x_off: (p.off.0 != 0.0).then_some(p.off.0),
+                y_off: (p.off.1 != 0.0).then_some(p.off.1),
                 z: p.z,
                 hash: hash.clone(),
             })
@@ -1989,6 +2001,33 @@ mod tests {
         assert!(screen.images.is_empty(), "delete-all revokes the rest");
     }
 
+    /// kitty's `X`/`Y` place the image inside its cell (how an emitter tiles one
+    /// image across several placements without seams) and `z` stacks it. Both
+    /// reach the frame — the offsets as cell fractions, like every other pixel
+    /// dimension, because the viewer's cell is its own size.
+    #[test]
+    fn kitty_placement_carries_its_offsets_and_z() {
+        let (job_tx, _job_rx) = mpsc::channel();
+        let caps = Caps {
+            kitty: true,
+            ..Caps::default()
+        };
+        let mut screen =
+            ScreenState::with_parser(new_parser(24, 80), caps, (10, 20), None, job_tx, true);
+        let payload =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0u8; 2 * 2 * 4]);
+        screen.feed_output(format!("\x1b_Ga=t,f=32,t=d,i=7,s=2,v=2;{payload}\x1b\\").as_bytes());
+        screen.feed_output(b"\x1b[1;1H\x1b_Ga=p,i=7,p=1,X=5,Y=15,z=-3,C=1\x1b\\");
+        let p = &screen.images[0];
+        assert_eq!(p.z, Some(-3));
+        assert_eq!(p.off, (0.5, 0.75), "5/10 of a cell across, 15/20 down");
+
+        // No X/Y/z at all leaves the placement cell-aligned and unstacked.
+        screen.feed_output(b"\x1b[5;1H\x1b_Ga=p,i=7,p=2,C=1\x1b\\");
+        let p = &screen.images[1];
+        assert_eq!((p.z, p.off), (None, (0.0, 0.0)));
+    }
+
     /// kitty keeps a placement until it is deleted: text printed over the image
     /// leaves it alone (unlike a sixel, which the print erases). zellij repaints
     /// its pane text constantly, so without this the mirror lost images the
@@ -2423,6 +2462,7 @@ mod tests {
             )),
             key: None,
             z: None,
+            off: (0.0, 0.0),
         }]
     }
 
@@ -2502,6 +2542,7 @@ mod tests {
             ready: None,
             key: None,
             z: None,
+            off: (0.0, 0.0),
         });
 
         // N's cells are gone, but N keeps showing (zombie) while N+1 pends.
