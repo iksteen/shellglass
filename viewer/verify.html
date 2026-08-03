@@ -193,6 +193,45 @@ if (MODE === "imagez") {
   });
 }
 
+// ?mode=imagemove: a placement that MOVES (same content address, new cell)
+// must leave nothing behind on the cells it left — the smear a moving floating
+// pane would show. Green/red convention.
+if (MODE === "imagemove") {
+  const blank = [];
+  for (let i = 0; i < ROWS; i++) blank.push([[pad("")]]);
+  const K = "ab".repeat(32);
+  apply({ d: blank, w: COLS, h: ROWS, i: [{ r: 1, c: 2, w: 6, h: 3, k: K }] });
+  benchFlush();
+  const img = document.querySelector("img.inline-img");
+  // Wait for the data: swap too: only a fully decoded predecessor is eligible
+  // to be held, so moving before that would prove nothing.
+  const loaded = () => new Promise((res) => {
+    const check = () => {
+      if (img.complete && img.naturalWidth && img.src.startsWith("data:")) res(null);
+    };
+    img.addEventListener("load", check);
+    check();
+  });
+  loaded().then(() => {
+    // Same picture, nudged one row down — a drag step, so the old and new
+    // rectangles overlap, which is when the bridge would kick in.
+    apply({ d: blank, w: COLS, h: ROWS, i: [{ r: 2, c: 2, w: 6, h: 3, k: K }] });
+    benchFlush();
+    benchRedraw();
+    const scr = document.querySelector("#screen .screen");
+    const canvas = document.querySelector("#screen canvas");
+    const g = canvas.getContext("2d");
+    const cw = (scr.getBoundingClientRect().width / COLS) * devicePixelRatio;
+    const lh = 17 * devicePixelRatio;
+    const px = (x, y) => g.getImageData(Math.round(x), Math.round(y), 1, 1).data;
+    const old = px(3.5 * cw, 1.5 * lh); // the row it left: must be clear
+    const gone = old[3] < 40 || (old[0] < 60 && old[1] < 60);
+    document.getElementById("screen").style.display = "none";
+    document.body.style.background = gone ? "#00ff00" : "#ff0000";
+    document.title = "verified-ready";
+  });
+}
+
 // ?mode=cursor (with &cursor=smooth): smooth cursor travel self-check. After
 // a cursor move the static cursor is suppressed (the row repaint leaves no
 // block at the target); the traveling rect lands on the target within ~80ms

@@ -66,7 +66,8 @@ def main():
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         base = "/tmp/sg-verify-static.png"
         shot(port, "static", base)
-        selfchecks = ["links", "image", "imagez", "cursor&cursor=smooth", "bleed",
+        selfchecks = ["links", "image", "imagez", "imagemove",
+                      "cursor&cursor=smooth", "bleed",
                       "blink", "freeze", "hold", "holdfull", "weight", "liga", "pinch"]
         paths = {}
         for m in selfchecks:

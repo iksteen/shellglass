@@ -778,6 +778,15 @@ fn stamp_image(
     parser
         .screen_mut()
         .place_data_with(fw, fh, vt100::PlaceOpts { hold, sticky }, tag);
+    // A named placement is an IDENTITY, not an event: re-placing the same
+    // `(image id, placement id)` moves that one placement, it doesn't add a
+    // second. An emitter moving an image re-places it with the same ids and no
+    // delete (zellij does this every time a floating pane moves), so keeping the
+    // predecessor would smear a copy across the old cells until something
+    // erased them. Sticky tags made that visible; they don't die on a repaint.
+    if key.is_some() {
+        images.retain(|p| p.key != key);
+    }
     images.push(Placed {
         id,
         row: i16::try_from(row).unwrap_or(0),
@@ -2120,6 +2129,38 @@ mod tests {
         screen.feed_output(b"\x1b[5;1H\x1b_Ga=p,i=7,p=2,C=1\x1b\\");
         let p = &screen.images[1];
         assert_eq!((p.z, p.off), (None, (0.0, 0.0)));
+    }
+
+    /// Re-placing the same `(image id, placement id)` MOVES that placement.
+    /// zellij re-places without deleting whenever a floating pane moves, so a
+    /// mirror that appended instead would leave a copy behind at every step.
+    #[test]
+    fn re_placing_the_same_ids_moves_the_placement() {
+        let (job_tx, _job_rx) = mpsc::channel();
+        let caps = Caps {
+            kitty: true,
+            ..Caps::default()
+        };
+        let mut screen =
+            ScreenState::with_parser(new_parser(24, 80), caps, (10, 20), None, job_tx, true);
+        let payload =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0u8; 2 * 2 * 4]);
+        screen.feed_output(format!("\x1b_Ga=t,f=32,t=d,i=7,s=2,v=2;{payload}\x1b\\").as_bytes());
+        screen.feed_output(b"\x1b[3;5H\x1b_Ga=p,i=7,p=1,C=1\x1b\\");
+        screen.feed_output(b"\x1b[9;9H\x1b_Ga=p,i=7,p=1,C=1\x1b\\");
+        assert_eq!(screen.images.len(), 1, "one placement, moved");
+        assert_eq!((screen.images[0].row, screen.images[0].col), (8, 8));
+
+        // A different placement id is a different placement, even of the same
+        // image — that is how an emitter tiles one image across a pane.
+        screen.feed_output(b"\x1b[1;1H\x1b_Ga=p,i=7,p=2,C=1\x1b\\");
+        assert_eq!(screen.images.len(), 2);
+
+        // And the moved-away cells hold nothing: resolving finds one rect.
+        let mut zombies = Vec::new();
+        resolve_images(screen.parser.screen(), &mut screen.images, &mut zombies);
+        let rows: Vec<i16> = screen.images.iter().map(|p| p.row).collect();
+        assert_eq!(rows, vec![8, 0]);
     }
 
     /// kitty keeps a placement until it is deleted: text printed over the image
