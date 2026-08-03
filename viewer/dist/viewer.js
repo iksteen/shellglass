@@ -825,18 +825,17 @@ function drawRowImages(p, over) {
         const natH = el.naturalHeight;
         if (!el.complete || !natW || !natH)
             continue;
-        const sc = ref.w && ref.h
-            ? Math.min((ref.w * cellW * dpr) / natW, (ref.h * cellH * dpr) / natH)
-            : dpr;
+        const sx = ref.w ? (ref.w * cellW * dpr) / natW : dpr;
+        const sy = ref.h ? (ref.h * cellH * dpr) / natH : dpr;
         const ix = (ref.c + (ref.x ?? 0)) * cellW * dpr;
         const iy = (ref.r + (ref.y ?? 0)) * cellH * dpr;
         const top = Math.max(p.y0, iy);
-        const bot = Math.min(p.y1, iy + natH * sc);
+        const bot = Math.min(p.y1, iy + natH * sy);
         if (bot <= top)
             continue;
-        p.g.drawImage(el, 0, (top - iy) / sc, natW, (bot - top) / sc, ix, top, natW * sc, bot - top);
+        p.g.drawImage(el, 0, (top - iy) / sy, natW, (bot - top) / sy, ix, top, natW * sx, bot - top);
         if (!over)
-            p.imgSpans.push([ix, ix + natW * sc]);
+            p.imgSpans.push([ix, ix + natW * sx]);
     }
 }
 function drawCellBg(p, cell, bg, x0, x1) {
@@ -1535,7 +1534,7 @@ function injectViewerCss() {
             "z-index:3;pointer-events:none;visibility:hidden}" +
             `${s}.screen img.inline-img.sized{width:calc(var(--sg-w)*1ch);` +
             "height:calc(var(--sg-h)*var(--lh));" +
-            "object-fit:contain;object-position:left top}";
+            "object-fit:fill;object-position:left top}";
     cssRoot.appendChild(css);
 }
 export function benchInit(el) {

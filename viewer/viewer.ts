@@ -1277,19 +1277,23 @@ function drawRowImages(p: RowPaint, over: boolean): void {
     const natW = el.naturalWidth;
     const natH = el.naturalHeight;
     if (!el.complete || !natW || !natH) continue;
-    const sc =
-      ref.w && ref.h
-        ? Math.min((ref.w * cellW * dpr) / natW, (ref.h * cellH * dpr) / natH)
-        : dpr; // no cell box: natural CSS-pixel size
+    // Fill the stated cell box on BOTH axes, independently. The box is what
+    // the terminal gave the image, so the mirror must occupy the same cells
+    // even though the browser's cell ratio differs; contain-fitting instead
+    // would letterbox, and an emitter that tiles one picture across adjacent
+    // placements (zellij, clipping an image against a floating pane) would
+    // show a growing gap between the tiles.
+    const sx = ref.w ? (ref.w * cellW * dpr) / natW : dpr;
+    const sy = ref.h ? (ref.h * cellH * dpr) / natH : dpr;
     const ix = (ref.c + (ref.x ?? 0)) * cellW * dpr;
     const iy = (ref.r + (ref.y ?? 0)) * cellH * dpr;
     const top = Math.max(p.y0, iy);
-    const bot = Math.min(p.y1, iy + natH * sc);
+    const bot = Math.min(p.y1, iy + natH * sy);
     if (bot <= top) continue;
-    p.g.drawImage(el, 0, (top - iy) / sc, natW, (bot - top) / sc, ix, top, natW * sc, bot - top);
+    p.g.drawImage(el, 0, (top - iy) / sy, natW, (bot - top) / sy, ix, top, natW * sx, bot - top);
     // Only an under-the-text image can be punched through by a written cell —
     // one painted over the text covers it, which is the point.
-    if (!over) p.imgSpans.push([ix, ix + natW * sc]);
+    if (!over) p.imgSpans.push([ix, ix + natW * sx]);
   }
 }
 
@@ -2355,17 +2359,19 @@ function injectViewerCss(): void {
     // Inline-image layout, sourced from the per-element custom properties —
     // deliberately NOT inline styles, so copied fragments paste at natural
     // size instead of dragging half-parseable ch/var() sizing along (see
-    // renderImage). The .sized box is contain-fitted, anchored top-left: the
-    // emitter sized the cell box for the LOCAL terminal's cell ratio, which
-    // needn't match the browser's, so stretching would distort. The canvas
-    // paints the pixels, so the element itself is hidden — by stylesheet
-    // rule, never inline, so copied fragments paste visible.
+    // renderImage). The .sized box is FILLED, anchored top-left: the cell box
+    // is the rectangle the terminal gave the image, so the mirror occupies the
+    // same cells even though the browser's cell ratio differs — the few
+    // percent of stretch that costs is invisible next to the gap a
+    // contain-fit letterbox leaves between two halves of one tiled picture.
+    // The canvas paints the pixels, so the element itself is hidden — by
+    // stylesheet rule, never inline, so copied fragments paste visible.
     `${s}.screen img.inline-img{position:absolute;` +
     "left:calc(var(--sg-c)*1ch);top:calc(var(--sg-r)*var(--lh));" +
     "z-index:3;pointer-events:none;visibility:hidden}" +
     `${s}.screen img.inline-img.sized{width:calc(var(--sg-w)*1ch);` +
     "height:calc(var(--sg-h)*var(--lh));" +
-    "object-fit:contain;object-position:left top}";
+    "object-fit:fill;object-position:left top}";
   cssRoot.appendChild(css);
 }
 

@@ -131,7 +131,7 @@ if (MODE === "image") {
     const noInline = [...img.style].every((p) => p.startsWith("--sg-"));
     // and the page must still lay it out (through the injected rules)
     const cs = getComputedStyle(img);
-    const laidOut = cs.position === "absolute" && cs.objectFit === "contain";
+    const laidOut = cs.position === "absolute" && cs.objectFit === "fill";
     // copy semantics: the image sits in document order between the rows it
     // spans (so a selection over them carries it), and the copied fragment's
     // src is the EMBEDDED bitmap, not the session-relative URL
@@ -189,6 +189,48 @@ if (MODE === "imagez") {
     document.getElementById("screen").style.display = "none";
     const bits = (over ? 1 : 0) + (under ? 2 : 0);
     document.body.style.background = over && under ? "#00ff00" : `rgb(255, 0, ${bits})`;
+    document.title = "verified-ready";
+  });
+}
+
+// ?mode=imagetile: one picture split across two adjacent placements — what an
+// emitter does when something (a floating pane) clips part of it. The tiles
+// must MEET: each placement fills the cell box it was given, so no seam of
+// background appears between them however tall the first one is. Green/red.
+if (MODE === "imagetile") {
+  const blank = [];
+  for (let i = 0; i < ROWS; i++) blank.push([[pad("")]]);
+  // Rows 1-6 and 7-9 of one column of cells, back to back.
+  apply({ d: blank, w: COLS, h: ROWS,
+          i: [{ r: 1, c: 2, w: 8, h: 6, k: "ab".repeat(32) },
+              { r: 7, c: 2, w: 8, h: 3, k: "ab".repeat(32) }] });
+  benchFlush();
+  const imgs = [...document.querySelectorAll("img.inline-img")];
+  const swapped = () => Promise.all(imgs.map((img) => new Promise((res) => {
+    const check = () => { if (img.complete && img.naturalWidth) res(null); };
+    img.addEventListener("load", check);
+    check();
+  })));
+  swapped().then(() => {
+    benchRedraw();
+    const scr = document.querySelector("#screen .screen");
+    const canvas = document.querySelector("#screen canvas");
+    const g = canvas.getContext("2d");
+    const cw = (scr.getBoundingClientRect().width / COLS) * devicePixelRatio;
+    const lh = 17 * devicePixelRatio;
+    const px = (x, y) => g.getImageData(Math.round(x), Math.round(y), 1, 1).data;
+    // Sample down the seam between the two tiles: every row band must be red.
+    let red = true;
+    for (const y of [5.5, 6.5, 6.95, 7.05, 7.5, 8.5]) {
+      const p = px(3.5 * cw, y * lh);
+      if (!(p[0] > 180 && p[1] < 60)) red = false;
+    }
+    // ...and the last row of the second tile is still covered (it fills its box).
+    const tail = px(3.5 * cw, 9.5 * lh);
+    const filled = tail[0] > 180 && tail[1] < 60;
+    document.getElementById("screen").style.display = "none";
+    const bits = (red ? 1 : 0) + (filled ? 2 : 0);
+    document.body.style.background = red && filled ? "#00ff00" : `rgb(255, 0, ${bits})`;
     document.title = "verified-ready";
   });
 }
