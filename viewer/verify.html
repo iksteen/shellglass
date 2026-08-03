@@ -200,10 +200,14 @@ if (MODE === "imagez") {
 if (MODE === "imagetile") {
   const blank = [];
   for (let i = 0; i < ROWS; i++) blank.push([[pad("")]]);
-  // Rows 1-6 and 7-9 of one column of cells, back to back.
+  // Rows 1-6 and 7-9, back to back. The second pair tiles HORIZONTALLY across
+  // a fractional boundary (a sub-cell offset), where cell columns are not whole
+  // device pixels — the case that antialiases into a hairline.
   apply({ d: blank, w: COLS, h: ROWS,
           i: [{ r: 1, c: 2, w: 8, h: 6, k: "ab".repeat(32) },
-              { r: 7, c: 2, w: 8, h: 3, k: "ab".repeat(32) }] });
+              { r: 7, c: 2, w: 8, h: 3, k: "ab".repeat(32) },
+              { r: 12, c: 2, w: 5.13, h: 3, k: "ab".repeat(32) },
+              { r: 12, c: 7, x: 0.13, w: 5.5, h: 3, k: "ab".repeat(32) }] });
   benchFlush();
   const imgs = [...document.querySelectorAll("img.inline-img")];
   const swapped = () => Promise.all(imgs.map((img) => new Promise((res) => {
@@ -219,18 +223,33 @@ if (MODE === "imagetile") {
     const cw = (scr.getBoundingClientRect().width / COLS) * devicePixelRatio;
     const lh = 17 * devicePixelRatio;
     const px = (x, y) => g.getImageData(Math.round(x), Math.round(y), 1, 1).data;
-    // Sample down the seam between the two tiles: every row band must be red.
+    // Scan EVERY device pixel row across the seam — a hairline crack is one
+    // row of background between the tiles, which a coarser sample walks past.
     let red = true;
-    for (const y of [5.5, 6.5, 6.95, 7.05, 7.5, 8.5]) {
-      const p = px(3.5 * cw, y * lh);
+    for (let y = Math.round(2 * lh); y < Math.round(9 * lh); y++) {
+      const p = px(3.5 * cw, y);
       if (!(p[0] > 180 && p[1] < 60)) red = false;
     }
     // ...and the last row of the second tile is still covered (it fills its box).
     const tail = px(3.5 * cw, 9.5 * lh);
     const filled = tail[0] > 180 && tail[1] < 60;
+    // The horizontal pair: every device column across their shared fractional
+    // edge must match the tiles' interior. A fractional edge leaves no
+    // background showing — both tiles blend half-coverage into the same
+    // column, which reads as a hairline of the WRONG SHADE — so compare
+    // against the interior colour rather than merely asking for "reddish".
+    // (Headless Firefox at dpr=1 has not been made to reproduce that blend
+    //  here; the assertion stands as the invariant the snapping guarantees.)
+    const ref = px(4 * cw, 13.5 * lh);
+    let seam = true;
+    for (let x = Math.round(3 * cw); x < Math.round(12 * cw); x++) {
+      const p = px(x, 13.5 * lh);
+      if (Math.abs(p[0] - ref[0]) > 12 || Math.abs(p[2] - ref[2]) > 12) seam = false;
+    }
     document.getElementById("screen").style.display = "none";
-    const bits = (red ? 1 : 0) + (filled ? 2 : 0);
-    document.body.style.background = red && filled ? "#00ff00" : `rgb(255, 0, ${bits})`;
+    const bits = (red ? 1 : 0) + (filled ? 2 : 0) + (seam ? 4 : 0);
+    document.body.style.background =
+      red && filled && seam ? "#00ff00" : `rgb(255, 0, ${bits})`;
     document.title = "verified-ready";
   });
 }

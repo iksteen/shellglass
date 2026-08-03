@@ -825,17 +825,23 @@ function drawRowImages(p, over) {
         const natH = el.naturalHeight;
         if (!el.complete || !natW || !natH)
             continue;
-        const sx = ref.w ? (ref.w * cellW * dpr) / natW : dpr;
-        const sy = ref.h ? (ref.h * cellH * dpr) / natH : dpr;
+        const w = ref.w ? ref.w * cellW * dpr : natW * dpr;
+        const h = ref.h ? ref.h * cellH * dpr : natH * dpr;
         const ix = (ref.c + (ref.x ?? 0)) * cellW * dpr;
         const iy = (ref.r + (ref.y ?? 0)) * cellH * dpr;
-        const top = Math.max(p.y0, iy);
-        const bot = Math.min(p.y1, iy + natH * sy);
-        if (bot <= top)
+        const x0 = Math.round(ix);
+        const x1 = Math.round(ix + w);
+        const yTop = Math.round(iy);
+        const yBot = Math.round(iy + h);
+        const top = Math.max(p.y0, yTop);
+        const bot = Math.min(p.y1, yBot);
+        if (bot <= top || x1 <= x0 || yBot <= yTop)
             continue;
-        p.g.drawImage(el, 0, (top - iy) / sy, natW, (bot - top) / sy, ix, top, natW * sx, bot - top);
+        const sy0 = ((top - yTop) / (yBot - yTop)) * natH;
+        const sh = ((bot - top) / (yBot - yTop)) * natH;
+        p.g.drawImage(el, 0, sy0, natW, sh, x0, top, x1 - x0, bot - top);
         if (!over)
-            p.imgSpans.push([ix, ix + natW * sx]);
+            p.imgSpans.push([x0, x1]);
     }
 }
 function drawCellBg(p, cell, bg, x0, x1) {

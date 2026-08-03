@@ -1283,17 +1283,29 @@ function drawRowImages(p: RowPaint, over: boolean): void {
     // would letterbox, and an emitter that tiles one picture across adjacent
     // placements (zellij, clipping an image against a floating pane) would
     // show a growing gap between the tiles.
-    const sx = ref.w ? (ref.w * cellW * dpr) / natW : dpr;
-    const sy = ref.h ? (ref.h * cellH * dpr) / natH : dpr;
+    const w = ref.w ? ref.w * cellW * dpr : natW * dpr;
+    const h = ref.h ? ref.h * cellH * dpr : natH * dpr;
     const ix = (ref.c + (ref.x ?? 0)) * cellW * dpr;
     const iy = (ref.r + (ref.y ?? 0)) * cellH * dpr;
-    const top = Math.max(p.y0, iy);
-    const bot = Math.min(p.y1, iy + natH * sy);
-    if (bot <= top) continue;
-    p.g.drawImage(el, 0, (top - iy) / sy, natW, (bot - top) / sy, ix, top, natW * sx, bot - top);
+    // Snap the whole box to device pixels BEFORE slicing it per row. Cell
+    // boxes are fractional, and a fractional edge antialiases against whatever
+    // is behind it — between two placements tiling one picture that reads as a
+    // hairline crack. Rounding both edges makes one tile's bottom land on the
+    // next one's top exactly, since they are the same number going in.
+    const x0 = Math.round(ix);
+    const x1 = Math.round(ix + w);
+    const yTop = Math.round(iy);
+    const yBot = Math.round(iy + h);
+    const top = Math.max(p.y0, yTop);
+    const bot = Math.min(p.y1, yBot);
+    if (bot <= top || x1 <= x0 || yBot <= yTop) continue;
+    // This band's slice of the source, mapped through the snapped box.
+    const sy0 = ((top - yTop) / (yBot - yTop)) * natH;
+    const sh = ((bot - top) / (yBot - yTop)) * natH;
+    p.g.drawImage(el, 0, sy0, natW, sh, x0, top, x1 - x0, bot - top);
     // Only an under-the-text image can be punched through by a written cell —
     // one painted over the text covers it, which is the point.
-    if (!over) p.imgSpans.push([ix, ix + natW * sx]);
+    if (!over) p.imgSpans.push([x0, x1]);
   }
 }
 
