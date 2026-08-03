@@ -60,6 +60,41 @@ fn overwrite_and_erase_kill_the_data() {
     assert_eq!(tag(&vt, 0, 2), None);
 }
 
+// shellglass: a STICKY slot outlives text written into its cell — kitty's
+// placement lifetime, where printing over an image leaves the image alone —
+// but an erase still drops it, and it still rides scrolling.
+#[test]
+fn sticky_data_survives_overwrite_but_not_erase() {
+    let sticky = vt100::PlaceOpts {
+        sticky: true,
+        ..Default::default()
+    };
+    let mut vt = parser(4, 10);
+    vt.screen_mut()
+        .place_data_with(4, 1, sticky, |dr, dc| (7, dr, dc));
+    vt.process(b"\x1b[1;1Hxy");
+    assert_eq!(tag(&vt, 0, 0), Some((7, 0, 0)), "overwrite keeps it");
+    assert_eq!(tag(&vt, 0, 1), Some((7, 0, 1)));
+    // Erasing does drop it (EL from column 2, then ED for the survivors).
+    vt.process(b"\x1b[1;3H\x1b[K");
+    assert_eq!(tag(&vt, 0, 2), None, "erase drops it");
+    assert_eq!(tag(&vt, 0, 0), Some((7, 0, 0)));
+    vt.process(b"\x1b[2J");
+    assert_eq!(tag(&vt, 0, 0), None);
+
+    // Re-stamped non-sticky, the slot goes back to dying on a write.
+    vt.screen_mut().place_data(2, 1, |dr, dc| (8, dr, dc));
+    vt.process(b"\x1b[1;1Hz");
+    assert_eq!(tag(&vt, 0, 0), None);
+
+    // A written-over sticky cell still rides a scroll.
+    vt.process(b"\x1b[2;1H");
+    vt.screen_mut()
+        .place_data_with(1, 1, sticky, |dr, dc| (9, dr, dc));
+    vt.process(b"\x1b[2;1Hq\x1b[4;1H\r\n"); // write over it, then scroll a line
+    assert_eq!(tag(&vt, 0, 0), Some((9, 0, 0)));
+}
+
 #[test]
 fn data_rides_scroll_and_line_edits() {
     let mut vt = parser(4, 10);
@@ -95,7 +130,12 @@ fn taller_than_screen_scrolls_while_placing() {
 fn held_placement_neither_moves_the_cursor_nor_scrolls() {
     let mut vt = parser(3, 10);
     vt.process(b"top\x1b[3;2H"); // last row, column 1
-    vt.screen_mut().place_data_held(2, 4, |dr, dc| (7, dr, dc));
+    let held = vt100::PlaceOpts {
+        hold: true,
+        ..Default::default()
+    };
+    vt.screen_mut()
+        .place_data_with(2, 4, held, |dr, dc| (7, dr, dc));
     assert_eq!(vt.screen().cursor_position(), (2, 1));
     assert_eq!(vt.screen().contents(), "top", "nothing scrolled off");
     assert_eq!(tag(&vt, 2, 1), Some((7, 0, 0)));

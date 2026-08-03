@@ -770,11 +770,15 @@ fn stamp_image(
         row_off,
         col_off,
     };
-    if hold {
-        parser.screen_mut().place_data_held(fw, fh, tag);
-    } else {
-        parser.screen_mut().place_data(fw, fh, tag);
-    }
+    parser.screen_mut().place_data_with(
+        fw,
+        fh,
+        vt100::PlaceOpts {
+            hold,
+            sticky: false,
+        },
+        tag,
+    );
     images.push(Placed {
         id,
         row: i16::try_from(row).unwrap_or(0),
