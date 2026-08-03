@@ -177,25 +177,28 @@ enum Segment {
     Delete(DeleteSel),
 }
 
-/// Which placements an `a=d` revokes: by kitty image id, optionally narrowed to
-/// one placement id. `None` on both = every placement this emitter made.
+/// Which placements an `a=d` revokes. The parser only names them; matching is
+/// the mirror's job (`pty::revokes`), because the geometry forms need the
+/// placement rects and the cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DeleteSel {
-    pub image: Option<u32>,
-    pub placement: Option<u32>,
-}
-
-impl DeleteSel {
-    /// Does this selector revoke the placement stamped from `key` (the
-    /// `(image id, placement id)` a [`Placement::key`] carries)?
-    #[must_use]
-    pub fn hits(&self, key: Option<(u32, u32)>) -> bool {
-        let Some((image, placement)) = key else {
-            return false; // not a keyed placement — no emitter can revoke it
-        };
-        self.image.is_none_or(|want| want == image)
-            && self.placement.is_none_or(|want| want == placement)
-    }
+pub enum DeleteSel {
+    /// `d=a` — every placement.
+    All,
+    /// `d=i` (one id, optionally one placement) or `d=r` (an id range).
+    Ids {
+        first: u32,
+        last: u32,
+        placement: Option<u32>,
+    },
+    /// `d=c` — placements covering the cursor's cell.
+    Cursor,
+    /// `d=p`/`q`/`x`/`y`/`z` — placements covering the stated column and/or row
+    /// (1-based on the wire, 0-based here), and/or having the stated z.
+    At {
+        col: Option<u16>,
+        row: Option<u16>,
+        z: Option<i32>,
+    },
 }
 
 /// The stamp-now, decode-later form of an image (see [`Segment::Deferred`]).
@@ -438,6 +441,11 @@ impl KittyStore {
                 self.remove(old);
             }
         }
+    }
+
+    /// Every stored id — what `a=d,d=A` frees.
+    fn ids(&self) -> Vec<u32> {
+        self.order.iter().copied().collect()
     }
 
     fn remove(&mut self, id: u32) {
@@ -971,30 +979,73 @@ impl Interceptor {
         .unwrap_or(Segment::Drop)
     }
 
-    /// Revoke placements (`a=d`). Only the selectors an emitter of keyed
-    /// placements uses are honored: `d=i`/`d=I` (by image id, narrowed by `p=`)
-    /// and `d=a`/`d=A` (all of them); the uppercase forms also free the
-    /// transmitted data. A cursor/cell/z-based selector (`d=c`, `d=p`, `d=z`, …)
-    /// would need the placement geometry to resolve.
-    // ponytail: an unhandled selector leaves the mirror showing a placement the
-    // terminal dropped, until the cells are repainted — resolve them here if an
-    // emitter starts using them.
+    /// Revoke placements (`a=d`). The uppercase form of a selector also frees
+    /// the transmitted image, which we can only do where the id is named
+    /// (`I`/`A`/`R`) — the geometry forms would need a placement→image map, and
+    /// the store is byte-capped anyway, so an unfreed image just ages out.
+    ///
+    /// Two kitty selectors are deliberately not honored:
+    /// - `d=f` deletes animation *frames*, which no placement depends on.
+    /// - `d=n` selects by image NUMBER (`I=`), which the terminal maps to an id
+    ///   in a reply we never see. We therefore never mirror a placement made by
+    ///   number either, so there is nothing stale for it to leave behind.
     fn kitty_delete(&mut self, ctrl: &std::collections::HashMap<String, String>) -> Segment {
         let what = ctrl.get("d").map_or("a", String::as_str);
-        let image = ctrl.get("i").and_then(|v| v.parse::<u32>().ok());
-        if matches!(what, "I" | "A")
-            && let Some(id) = image
-        {
-            self.kitty_store.remove(id);
+        let num = |k: &str| ctrl.get(k).and_then(|v| v.parse::<u32>().ok());
+        // Cell coordinates are 1-based on the wire, like CUP's.
+        let cell = |k: &str| num(k).and_then(|v| u16::try_from(v.saturating_sub(1)).ok());
+        let z = ctrl.get("z").and_then(|v| v.parse::<i32>().ok());
+        let ids = match what {
+            "i" | "I" => num("i").map(|id| (id, id)),
+            "r" | "R" => num("x").zip(num("y")),
+            _ => None,
+        };
+        if what.starts_with(['I', 'A', 'R']) {
+            let free: Vec<u32> = match ids {
+                Some((first, last)) => (first..=last).collect(),
+                // `d=A` frees every image this emitter transmitted.
+                None if what == "A" => self.kitty_store.ids(),
+                None => Vec::new(),
+            };
+            for id in free {
+                self.kitty_store.remove(id);
+            }
         }
         match what {
-            "i" | "I" => Segment::Delete(DeleteSel {
-                image,
-                placement: ctrl.get("p").and_then(|v| v.parse().ok()),
+            "i" | "I" | "r" | "R" => match ids {
+                Some((first, last)) => Segment::Delete(DeleteSel::Ids {
+                    first,
+                    last,
+                    placement: num("p"),
+                }),
+                None => Segment::Drop,
+            },
+            "a" | "A" => Segment::Delete(DeleteSel::All),
+            "c" | "C" => Segment::Delete(DeleteSel::Cursor),
+            "p" | "P" => Segment::Delete(DeleteSel::At {
+                col: cell("x"),
+                row: cell("y"),
+                z: None,
             }),
-            "a" | "A" => Segment::Delete(DeleteSel {
-                image: None,
-                placement: None,
+            "q" | "Q" => Segment::Delete(DeleteSel::At {
+                col: cell("x"),
+                row: cell("y"),
+                z,
+            }),
+            "x" | "X" => Segment::Delete(DeleteSel::At {
+                col: cell("x"),
+                row: None,
+                z: None,
+            }),
+            "y" | "Y" => Segment::Delete(DeleteSel::At {
+                col: None,
+                row: cell("y"),
+                z: None,
+            }),
+            "z" | "Z" => Segment::Delete(DeleteSel::At {
+                col: None,
+                row: None,
+                z,
             }),
             _ => Segment::Drop,
         }
@@ -2166,17 +2217,61 @@ mod tests {
             Some(Step::Delete(_, sel)) => Some(sel),
             _ => None,
         };
-        // By placement, by image, and everything.
-        let one = sel(&mut it, "\x1b_Ga=d,d=i,i=7,p=3\x1b\\").unwrap();
-        assert!(one.hits(Some((7, 3))));
-        assert!(!one.hits(Some((7, 4))));
-        assert!(!one.hits(None), "unkeyed placements are never revoked");
-        let image = sel(&mut it, "\x1b_Ga=d,d=i,i=7\x1b\\").unwrap();
-        assert!(image.hits(Some((7, 4))) && !image.hits(Some((8, 4))));
-        let all = sel(&mut it, "\x1b_Ga=d,d=a\x1b\\").unwrap();
-        assert!(all.hits(Some((8, 4))));
-        // A selector we can't resolve is not a delete at all.
-        assert!(sel(&mut it, "\x1b_Ga=d,d=z,z=1\x1b\\").is_none());
+        // Each selector kitty defines, in the shape `pty::revokes` matches on.
+        // (Cell coordinates are 1-based on the wire and 0-based here.)
+        assert_eq!(
+            sel(&mut it, "\x1b_Ga=d,d=i,i=7,p=3\x1b\\"),
+            Some(DeleteSel::Ids {
+                first: 7,
+                last: 7,
+                placement: Some(3)
+            })
+        );
+        assert_eq!(
+            sel(&mut it, "\x1b_Ga=d,d=i,i=7\x1b\\"),
+            Some(DeleteSel::Ids {
+                first: 7,
+                last: 7,
+                placement: None
+            })
+        );
+        assert_eq!(
+            sel(&mut it, "\x1b_Ga=d,d=r,x=3,y=9\x1b\\"),
+            Some(DeleteSel::Ids {
+                first: 3,
+                last: 9,
+                placement: None
+            })
+        );
+        assert_eq!(sel(&mut it, "\x1b_Ga=d,d=a\x1b\\"), Some(DeleteSel::All));
+        assert_eq!(sel(&mut it, "\x1b_Ga=d\x1b\\"), Some(DeleteSel::All));
+        assert_eq!(sel(&mut it, "\x1b_Ga=d,d=c\x1b\\"), Some(DeleteSel::Cursor));
+        assert_eq!(
+            sel(&mut it, "\x1b_Ga=d,d=q,x=4,y=2,z=-1\x1b\\"),
+            Some(DeleteSel::At {
+                col: Some(3),
+                row: Some(1),
+                z: Some(-1)
+            })
+        );
+        assert_eq!(
+            sel(&mut it, "\x1b_Ga=d,d=x,x=4\x1b\\"),
+            Some(DeleteSel::At {
+                col: Some(3),
+                row: None,
+                z: None
+            })
+        );
+        assert_eq!(
+            sel(&mut it, "\x1b_Ga=d,d=z,z=1\x1b\\"),
+            Some(DeleteSel::At {
+                col: None,
+                row: None,
+                z: Some(1)
+            })
+        );
+        // Animation frames revoke no placement, so they are not a delete here.
+        assert_eq!(sel(&mut it, "\x1b_Ga=d,d=f,i=7\x1b\\"), None);
 
         // The lowercase forms keep the data placeable; `d=I` frees it.
         assert_eq!(

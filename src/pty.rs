@@ -797,6 +797,44 @@ fn stamp_image(
     id
 }
 
+/// Does this `a=d` selector revoke `p`? Only a KEYED placement (one the emitter
+/// named, i.e. kitty) can be revoked — nothing else has an emitter that could.
+/// The geometry forms match against the placement's current rect, so they are
+/// resolved here rather than in the parser, which sees no grid.
+fn revokes(sel: &crate::images::DeleteSel, p: &Placed, cursor: (u16, u16)) -> bool {
+    use crate::images::DeleteSel;
+    let Some((image, placement)) = p.key else {
+        return false;
+    };
+    // The tagged footprint: the ceil of the fractional display extent, exactly
+    // what `stamp_image` handed the parser.
+    let extent = |v: Option<f32>| (v.map_or(1.0, f32::ceil) as i32).max(1);
+    let in_row = |r: u16| {
+        let (r, top) = (i32::from(r), i32::from(p.row));
+        r >= top && r < top + extent(p.rows)
+    };
+    let in_col = |c: u16| {
+        let (c, left) = (i32::from(c), i32::from(p.col));
+        c >= left && c < left + extent(p.cols)
+    };
+    match *sel {
+        DeleteSel::All => true,
+        DeleteSel::Ids {
+            first,
+            last,
+            placement: want,
+        } => (first..=last).contains(&image) && want.is_none_or(|want| want == placement),
+        DeleteSel::Cursor => in_row(cursor.0) && in_col(cursor.1),
+        DeleteSel::At { col, row, z } => {
+            z.is_none_or(|want| p.z == Some(want))
+                && col.is_none_or(in_col)
+                && row.is_none_or(in_row)
+                // `d=z` with no z at all selects nothing rather than everything.
+                && (col.is_some() || row.is_some() || z.is_some())
+        }
+    }
+}
+
 /// Snapshot the PTY screen as a [`Frame`], resolving each tracked image's tagged
 /// cells to its current position and dropping images with no covered cell left
 /// (scrolled off the top, cleared, or overwritten).
@@ -1092,8 +1130,9 @@ impl ScreenState {
                 // The emitter dropped these itself; the mirror must not keep
                 // showing what the local screen no longer does.
                 Step::Delete(_, sel) => {
+                    let cursor = self.parser.screen().cursor_position();
                     let before = self.images.len();
-                    self.images.retain(|p| !sel.hits(p.key));
+                    self.images.retain(|p| !revokes(&sel, p, cursor));
                     self.dirty |= self.images.len() != before;
                 }
                 Step::Query(_, response) => out.queries.extend_from_slice(&response),
@@ -1999,6 +2038,61 @@ mod tests {
         );
         screen.feed_output(b"\x1b_Ga=d,d=A,i=7\x1b\\");
         assert!(screen.images.is_empty(), "delete-all revokes the rest");
+    }
+
+    /// The geometry `a=d` selectors resolve against the placement's rect and the
+    /// cursor — kitty's `d=c`, `d=p`/`q`, `d=x`/`y` and `d=z`.
+    #[test]
+    fn geometry_deletes_match_the_placement_rect() {
+        use crate::images::DeleteSel;
+        // A 2x2-cell placement of image 7 at row 3, col 5, stacked at z = 2.
+        let p = Placed {
+            id: std::num::NonZeroU32::MIN,
+            row: 3,
+            col: 5,
+            cols: Some(1.5),
+            rows: Some(2.0),
+            ready: None,
+            key: Some((7, 1)),
+            z: Some(2),
+            off: (0.0, 0.0),
+        };
+        let at = |col, row, z| DeleteSel::At { col, row, z };
+        assert!(revokes(&DeleteSel::All, &p, (0, 0)));
+        assert!(revokes(&DeleteSel::Cursor, &p, (4, 6)), "inside the rect");
+        assert!(!revokes(&DeleteSel::Cursor, &p, (5, 6)), "row below");
+        assert!(!revokes(&DeleteSel::Cursor, &p, (3, 7)), "column right");
+        assert!(revokes(&at(Some(5), Some(3), None), &p, (0, 0)));
+        assert!(!revokes(&at(Some(5), Some(9), None), &p, (0, 0)));
+        assert!(revokes(&at(Some(6), None, None), &p, (0, 0)), "column only");
+        assert!(revokes(&at(None, Some(4), None), &p, (0, 0)), "row only");
+        assert!(revokes(&at(None, None, Some(2)), &p, (0, 0)), "z only");
+        assert!(!revokes(&at(None, None, Some(3)), &p, (0, 0)));
+        assert!(
+            !revokes(&at(Some(5), Some(3), Some(3)), &p, (0, 0)),
+            "z wins"
+        );
+        assert!(revokes(
+            &DeleteSel::Ids {
+                first: 5,
+                last: 9,
+                placement: None
+            },
+            &p,
+            (0, 0)
+        ));
+        assert!(!revokes(
+            &DeleteSel::Ids {
+                first: 7,
+                last: 7,
+                placement: Some(2)
+            },
+            &p,
+            (0, 0)
+        ));
+        // A placement the emitter never named can't be revoked by any of them.
+        let anon = Placed { key: None, ..p };
+        assert!(!revokes(&DeleteSel::All, &anon, (4, 6)));
     }
 
     /// kitty's `X`/`Y` place the image inside its cell (how an emitter tiles one
