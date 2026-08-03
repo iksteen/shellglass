@@ -49,15 +49,27 @@ pub struct Image {
     pub mime: String,
     /// The image file bytes.
     pub bytes: Vec<u8>,
-    /// Display size in terminal cells (cols, rows) if the app specified one;
-    /// otherwise the browser renders the image at its natural pixel size.
-    pub cells: Option<(u16, u16)>,
     /// Source pixel dimensions (width, height). Used to derive a cell count when
     /// the app gave none, so the cursor advances below a natural-size image.
     pub px: Option<(u32, u32)>,
+    /// How the image is placed on the grid.
+    pub place: Placement,
+}
+
+/// How an image goes onto the grid: everything the producer knows about the
+/// placement that isn't the pixels. The [`Default`] is the plain
+/// draw-at-the-cursor placement sixel and iTerm2 make.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Placement {
+    /// Display size in terminal cells (cols, rows) if the app specified one;
+    /// otherwise the browser renders the image at its natural pixel size.
+    pub cells: Option<(u16, u16)>,
     /// The placement declared "don't move the cursor" (kitty `a=p,C=1`): stamp
     /// from the cursor cell downwards without advancing it or scrolling.
     pub hold: bool,
+    /// The placement outlives text written over its cells, dying only when they
+    /// are erased or scrolled away (kitty's lifetime; see `vt100::PlaceOpts`).
+    pub sticky: bool,
     /// The kitty `(image id, placement id)` this came from, when the emitter
     /// names them — the handle an `a=d` deletes the placement by. `None` for
     /// every protocol that just draws at the cursor and never revokes.
@@ -168,7 +180,7 @@ pub struct DeleteSel {
 
 impl DeleteSel {
     /// Does this selector revoke the placement stamped from `key` (the
-    /// `(image id, placement id)` an [`Image::key`] carries)?
+    /// `(image id, placement id)` a [`Placement::key`] carries)?
     #[must_use]
     pub fn hits(&self, key: Option<(u32, u32)>) -> bool {
         let Some((image, placement)) = key else {
@@ -183,8 +195,6 @@ impl DeleteSel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeferredImage {
     pub payload: DeferredPayload,
-    /// App-given cell size, if any (else derive from `px`).
-    pub cells: Option<(u16, u16)>,
     /// Pixel dimensions, from cheap metadata (sixel raster attributes, kitty
     /// transmission params) — NOT from decoding.
     pub px: (u32, u32),
@@ -193,10 +203,8 @@ pub struct DeferredImage {
     /// `pty::image_worker`). `0` = the cursor stream — an animation replacing
     /// itself in place, where only the newest frame is worth decoding.
     pub lineage: u64,
-    /// See [`Image::hold`].
-    pub hold: bool,
-    /// See [`Image::key`].
-    pub key: Option<(u32, u32)>,
+    /// How the image is placed on the grid (see [`Image::place`]).
+    pub place: Placement,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -758,10 +766,8 @@ impl Interceptor {
             image: Image {
                 mime: "image/png".to_string(),
                 bytes: png,
-                cells: None,
                 px: Some(px),
-                hold: false,
-                key: None,
+                place: Placement::default(),
             },
         })
     }
@@ -942,7 +948,20 @@ impl Interceptor {
                 },
             );
         }
-        kitty_segment(bytes, acc.fmt, acc.cells, acc.px, 0, false, None).unwrap_or(Segment::Drop)
+        kitty_segment(
+            bytes,
+            acc.fmt,
+            acc.px,
+            0,
+            Placement {
+                cells: acc.cells,
+                // Same kitty lifetime as `a=p` (see `kitty_place`): a print into
+                // the image's cells doesn't erase it.
+                sticky: true,
+                ..Placement::default()
+            },
+        )
+        .unwrap_or(Segment::Drop)
     }
 
     /// Revoke placements (`a=d`). Only the selectors an emitter of keyed
@@ -1002,10 +1021,16 @@ impl Interceptor {
         // are ignored — placements are cell-anchored here, so the ceiling is up
         // to a cell of alignment error; honoring them needs sub-cell placement
         // coordinates on the wire.
-        let key = Some((id, num("p").unwrap_or(0)));
-        let hold = ctrl.get("C").map(String::as_str) == Some("1");
-        let lineage = hash_bytes(&[id.to_le_bytes(), num("p").unwrap_or(0).to_le_bytes()].concat());
-        let cells = cells_from(ctrl.get("c"), ctrl.get("r"));
+        let placement = num("p").unwrap_or(0);
+        let place = Placement {
+            cells: cells_from(ctrl.get("c"), ctrl.get("r")),
+            hold: ctrl.get("C").map(String::as_str) == Some("1"),
+            // kitty keeps a placement until it is deleted; text drawn over it
+            // doesn't erase it the way it erases a sixel.
+            sticky: true,
+            key: Some((id, placement)),
+        };
+        let lineage = hash_bytes(&[id.to_le_bytes(), placement.to_le_bytes()].concat());
         match img.fmt {
             KittyFmt::Rgba | KittyFmt::Rgb => {
                 let channels = if matches!(img.fmt, KittyFmt::Rgba) {
@@ -1014,22 +1039,16 @@ impl Interceptor {
                     3
                 };
                 let bytes = crop(&img.data, (iw, ih), (x, y, w, h), channels);
-                kitty_segment(bytes, img.fmt, cells, Some((w, h)), lineage, hold, key)
+                kitty_segment(bytes, img.fmt, Some((w, h)), lineage, place)
             }
             // ponytail: cropping an encoded image would need a decoder we don't
             // carry; mirroring it UNCROPPED would paint over what the terminal
             // clipped away — showing more than the local screen, which the
             // mirror never does. So a partial crop of an encoded image isn't
             // mirrored. Upgrade path: the `png` crate's decoder.
-            KittyFmt::Png if whole => kitty_segment(
-                img.data.clone(),
-                img.fmt,
-                cells,
-                Some((w, h)),
-                lineage,
-                hold,
-                key,
-            ),
+            KittyFmt::Png if whole => {
+                kitty_segment(img.data.clone(), img.fmt, Some((w, h)), lineage, place)
+            }
             KittyFmt::Png | KittyFmt::Unsupported => None,
         }
         .unwrap_or(Segment::Drop)
@@ -1085,17 +1104,14 @@ fn kitty_payload(acc: &KittyAccum) -> Option<Vec<u8>> {
 }
 
 /// Turn transmitted bytes into the segment that places them. `px` is required
-/// for a raw framebuffer (it has no header); `lineage`/`hold`/`key` are the
-/// placement's identity and cursor behaviour (see [`DeferredImage::lineage`],
-/// [`Image::hold`], [`Image::key`]).
+/// for a raw framebuffer (it has no header); `lineage` groups the decode with
+/// its predecessors (see [`DeferredImage::lineage`]).
 fn kitty_segment(
     bytes: Vec<u8>,
     fmt: KittyFmt,
-    cells: Option<(u16, u16)>,
     px: Option<(u32, u32)>,
     lineage: u64,
-    hold: bool,
-    key: Option<(u32, u32)>,
+    place: Placement,
 ) -> Option<Segment> {
     match fmt {
         // PNG passes through undecoded — cheap, stays inline.
@@ -1103,9 +1119,7 @@ fn kitty_segment(
             mime: sniff_mime(&bytes)?.to_string(),
             px: dims(&bytes),
             bytes,
-            cells,
-            hold,
-            key,
+            place,
         })),
         // Raw framebuffers need a PNG encode — deferred to the worker (dims come
         // from the transmission params, so the placement can be stamped immediately).
@@ -1119,11 +1133,9 @@ fn kitty_segment(
                     w,
                     h,
                 },
-                cells,
                 px: (w, h),
                 lineage,
-                hold,
-                key,
+                place,
             }))
         }
         KittyFmt::Unsupported => None,
@@ -1351,11 +1363,9 @@ fn sixel_image(seq: &[u8]) -> Option<Segment> {
     if let Some(px) = sixel_raster_dims(seq) {
         return Some(Segment::Deferred(DeferredImage {
             payload: DeferredPayload::Sixel(seq.to_vec()),
-            cells: None,
             px,
             lineage: 0,
-            hold: false,
-            key: None,
+            place: Placement::default(),
         }));
     }
     let img = icy_sixel::SixelImage::decode(seq).ok()?;
@@ -1367,10 +1377,8 @@ fn sixel_image(seq: &[u8]) -> Option<Segment> {
     Some(Segment::Image(Image {
         mime: "image/png".to_string(),
         bytes: png,
-        cells: None,
         px: Some((w, h)),
-        hold: false,
-        key: None,
+        place: Placement::default(),
     }))
 }
 
@@ -1434,9 +1442,10 @@ fn image_from_b64(base64: String, cells: Option<(u16, u16)>) -> Option<Image> {
         mime: mime.to_string(),
         px: dims(&bytes),
         bytes,
-        cells,
-        hold: false,
-        key: None,
+        place: Placement {
+            cells,
+            ..Placement::default()
+        },
     })
 }
 
@@ -1570,10 +1579,8 @@ mod tests {
                     Some(Image {
                         mime: "image/png".to_string(),
                         bytes,
-                        cells: d.cells,
                         px: Some(px),
-                        hold: d.hold,
-                        key: d.key,
+                        place: d.place,
                     })
                 }
                 Step::Passthrough(_)
@@ -1667,7 +1674,7 @@ mod tests {
         let imgs = only_images(segs);
         assert_eq!(imgs.len(), 1);
         assert_eq!(imgs[0].mime, "image/png");
-        assert_eq!(imgs[0].cells, Some((4, 2)));
+        assert_eq!(imgs[0].place.cells, Some((4, 2)));
         assert_eq!(imgs[0].bytes, B64.decode(&b64).unwrap());
     }
 
@@ -1686,7 +1693,7 @@ mod tests {
         let imgs = only_images(end);
         assert_eq!(imgs.len(), 1);
         assert_eq!(imgs[0].mime, "image/png");
-        assert_eq!(imgs[0].cells, Some((4, 2)));
+        assert_eq!(imgs[0].place.cells, Some((4, 2)));
         assert_eq!(imgs[0].bytes, B64.decode(&b64).unwrap());
     }
 
@@ -1734,7 +1741,7 @@ mod tests {
         let (w, h) = imgs[0].px.unwrap();
         assert_eq!(w, 2);
         assert!(h >= 2);
-        assert_eq!(imgs[0].cells, None);
+        assert_eq!(imgs[0].place.cells, None);
     }
 
     fn sample_sixel() -> Vec<u8> {
@@ -1866,7 +1873,7 @@ mod tests {
         let imgs = only_images(segs);
         assert_eq!(imgs.len(), 1);
         assert_eq!(imgs[0].mime, "image/png");
-        assert_eq!(imgs[0].cells, Some((3, 1)));
+        assert_eq!(imgs[0].place.cells, Some((3, 1)));
     }
 
     #[test]
@@ -2074,9 +2081,12 @@ mod tests {
         let images = only_images(steps);
         assert_eq!(images.len(), 1, "the placement is mirrored");
         assert_eq!(images[0].px, Some((4, 4)));
-        assert_eq!(images[0].cells, None, "footprint derives from the crop px");
-        assert!(images[0].hold, "C=1 keeps the cursor put");
-        assert_eq!(images[0].key, Some((7, 1)));
+        assert_eq!(
+            images[0].place.cells, None,
+            "footprint derives from the crop px"
+        );
+        assert!(images[0].place.hold, "C=1 keeps the cursor put");
+        assert_eq!(images[0].place.key, Some((7, 1)));
     }
 
     #[test]
@@ -2396,12 +2406,12 @@ mod tests {
         let s = format!("\x1b]1337;File=inline=1;width=0;height=0:{b64}\x07");
         let imgs = only_images(it.feed(s.as_bytes()));
         assert_eq!(imgs.len(), 1);
-        assert_eq!(imgs[0].cells, None, "zero hint ⇒ natural size");
+        assert_eq!(imgs[0].place.cells, None, "zero hint ⇒ natural size");
         let mut it = Interceptor::new();
         let s = format!("\x1b_Ga=T,f=100,t=d,c=0,r=0;{b64}\x1b\\");
         let imgs = only_images(it.feed(s.as_bytes()));
         assert_eq!(imgs.len(), 1);
-        assert_eq!(imgs[0].cells, None);
+        assert_eq!(imgs[0].place.cells, None);
     }
 
     #[test]

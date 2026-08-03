@@ -702,14 +702,12 @@ struct Placed {
     key: Option<(u32, u32)>,
 }
 
-/// What the producer says about one placement: the display hints, whether the
-/// emitter keeps the cursor where it is (see [`crate::images::Image::hold`]),
-/// and the handle it may revoke the placement by ([`crate::images::Image::key`]).
+/// What the producer says about one placement (see
+/// [`images::Placement`](crate::images::Placement)) plus what the mirror needs
+/// to serve it.
 struct Place {
-    cells: Option<(u16, u16)>,
+    place: crate::images::Placement,
     px: Option<(u32, u32)>,
-    hold: bool,
-    key: Option<(u32, u32)>,
     /// The payload when already decoded, `None` while the worker owes it.
     ready: Option<(String, crate::model::ImageBlob)>,
 }
@@ -731,12 +729,12 @@ fn stamp_image(
     cell: (u16, u16),
     place: Place,
 ) -> std::num::NonZeroU32 {
-    let Place {
+    let Place { place, px, ready } = place;
+    let crate::images::Placement {
         cells,
-        px,
         hold,
+        sticky,
         key,
-        ready,
     } = place;
     let (row, col) = parser.screen().cursor_position();
     // Display size in cells. An app-specified footprint is exact; a derived one
@@ -770,15 +768,9 @@ fn stamp_image(
         row_off,
         col_off,
     };
-    parser.screen_mut().place_data_with(
-        fw,
-        fh,
-        vt100::PlaceOpts {
-            hold,
-            sticky: false,
-        },
-        tag,
-    );
+    parser
+        .screen_mut()
+        .place_data_with(fw, fh, vt100::PlaceOpts { hold, sticky }, tag);
     images.push(Placed {
         id,
         row: i16::try_from(row).unwrap_or(0),
@@ -1057,10 +1049,8 @@ impl ScreenState {
                         &mut seq,
                         self.cell,
                         Place {
-                            cells: img.cells,
+                            place: img.place,
                             px: img.px,
-                            hold: img.hold,
-                            key: img.key,
                             ready,
                         },
                     );
@@ -1076,10 +1066,8 @@ impl ScreenState {
                         &mut seq,
                         self.cell,
                         Place {
-                            cells: d.cells,
+                            place: d.place,
                             px: Some(d.px),
-                            hold: d.hold,
-                            key: d.key,
                             ready: None,
                         },
                     );
@@ -1994,6 +1982,44 @@ mod tests {
         assert!(screen.images.is_empty(), "delete-all revokes the rest");
     }
 
+    /// kitty keeps a placement until it is deleted: text printed over the image
+    /// leaves it alone (unlike a sixel, which the print erases). zellij repaints
+    /// its pane text constantly, so without this the mirror lost images the
+    /// terminal still showed — wholly, or in the chunks that got repainted.
+    #[test]
+    fn kitty_placements_outlive_a_repaint_of_their_cells() {
+        let (job_tx, _job_rx) = mpsc::channel();
+        let caps = Caps {
+            kitty: true,
+            ..Caps::default()
+        };
+        let mut screen =
+            ScreenState::with_parser(new_parser(24, 80), caps, (10, 20), None, job_tx, true);
+        let payload =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0u8; 2 * 2 * 4]);
+        screen.feed_output(format!("\x1b_Ga=t,f=32,t=d,i=7,s=2,v=2;{payload}\x1b\\").as_bytes());
+        screen.feed_output(b"\x1b[3;5H\x1b_Ga=p,i=7,p=1,C=1\x1b\\");
+        assert_eq!(screen.images.len(), 1);
+
+        // The emitter repaints the very cells the image covers.
+        screen.feed_output(b"\x1b[3;5Hxx\x1b[4;5Hxx");
+        let mut zombies = Vec::new();
+        // (the decode is still owed, so the placement is tracked but not yet
+        // emitted — its survival is what this asserts)
+        resolve_images(screen.parser.screen(), &mut screen.images, &mut zombies);
+        assert_eq!(screen.images.len(), 1, "a repaint doesn't revoke it");
+        assert_eq!(
+            (screen.images[0].row, screen.images[0].col),
+            (2, 4),
+            "still resolves at its cell"
+        );
+
+        // Erasing those cells does drop it — kitty's other half.
+        screen.feed_output(b"\x1b[2J");
+        resolve_images(screen.parser.screen(), &mut screen.images, &mut zombies);
+        assert!(screen.images.is_empty(), "an erase revokes it");
+    }
+
     /// A burst of placements of DIFFERENT images must all be decoded — dropping
     /// the older ones would leave those placements pending, and a pending
     /// placement never reaches a frame. Same-lineage jobs may collapse (that is
@@ -2329,10 +2355,9 @@ mod tests {
             &mut seq,
             (9, 21), // cell px
             Place {
-                cells: None,          // no app-specified cells → derive from px
+                // no app-specified cells → derive from px
+                place: crate::images::Placement::default(),
                 px: Some((400, 402)), // image px
-                hold: false,
-                key: None,
                 ready: None,
             },
         );
