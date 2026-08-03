@@ -815,8 +815,12 @@ function drawBoosted(g, k, draw) {
         g.globalAlpha = 1;
     }
 }
-function drawRowImages(p) {
-    for (const { ref, el } of heldImages.concat(screenImages)) {
+function drawRowImages(p, over) {
+    const layer = heldImages
+        .concat(screenImages)
+        .filter(({ ref }) => (ref.z !== undefined && ref.z >= 0) === over)
+        .sort((a, b) => (a.ref.z ?? 0) - (b.ref.z ?? 0));
+    for (const { ref, el } of layer) {
         const natW = el.naturalWidth;
         const natH = el.naturalHeight;
         if (!el.complete || !natW || !natH)
@@ -831,7 +835,8 @@ function drawRowImages(p) {
         if (bot <= top)
             continue;
         p.g.drawImage(el, 0, (top - iy) / sc, natW, (bot - top) / sc, ix, top, natW * sc, bot - top);
-        p.imgSpans.push([ix, ix + natW * sc]);
+        if (!over)
+            p.imgSpans.push([ix, ix + natW * sc]);
     }
 }
 function drawCellBg(p, cell, bg, x0, x1) {
@@ -998,9 +1003,10 @@ function redrawCanvasRow(r) {
     ctx.beginPath();
     ctx.rect(0, p.y0, canvasEl.width, p.y1 - p.y0);
     ctx.clip();
-    drawRowImages(p);
+    drawRowImages(p, false);
     const row = screen.cells[r];
     if (!row) {
+        drawRowImages(p, true);
         ctx.restore();
         return;
     }
@@ -1043,6 +1049,7 @@ function redrawCanvasRow(r) {
         c += w;
     }
     flushRun(p);
+    drawRowImages(p, true);
     noteBlinkRow(r, p.hasBlink);
     ctx.restore();
 }

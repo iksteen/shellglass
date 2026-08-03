@@ -90,6 +90,7 @@ export interface ImageRef {
   c: number; // left col
   w?: number; // width in cells
   h?: number; // height in cells (rows)
+  z?: number; // stacking order: < 0 under the text, >= 0 over it; absent = under
   k: string; // content address of the image bytes
 }
 // On diff-family messages the cursor is TRI-STATE: absent = unchanged,
@@ -1255,11 +1256,22 @@ function drawBoosted(g: CanvasRenderingContext2D, k: number, draw: () => void): 
   }
 }
 
-// Image slices for this band, under the glyphs. Contain-fit anchored
-// top-left (same math as the hidden <img>'s layout rule), one uniform scale.
-function drawRowImages(p: RowPaint): void {
+// Image slices for this band. Contain-fit anchored top-left (same math as the
+// hidden <img>'s layout rule), one uniform scale.
+//
+// Two passes per row, split on the placement's stacking order (kitty's `z`):
+// `over === false` runs before the cells (under the glyphs, the sixel-style
+// painting every z-less image keeps, and the only pass that registers imgSpans
+// so a written cell can punch through), `over === true` after them, painting
+// the image on top of the text like kitty does for z >= 0. Sorted by z within a
+// pass; ties keep wire order, which is zombies-then-live.
+function drawRowImages(p: RowPaint, over: boolean): void {
   // Held predecessors draw first (under), current images after (over).
-  for (const { ref, el } of heldImages.concat(screenImages)) {
+  const layer = heldImages
+    .concat(screenImages)
+    .filter(({ ref }) => (ref.z !== undefined && ref.z >= 0) === over)
+    .sort((a, b) => (a.ref.z ?? 0) - (b.ref.z ?? 0));
+  for (const { ref, el } of layer) {
     const natW = el.naturalWidth;
     const natH = el.naturalHeight;
     if (!el.complete || !natW || !natH) continue;
@@ -1273,7 +1285,9 @@ function drawRowImages(p: RowPaint): void {
     const bot = Math.min(p.y1, iy + natH * sc);
     if (bot <= top) continue;
     p.g.drawImage(el, 0, (top - iy) / sc, natW, (bot - top) / sc, ix, top, natW * sc, bot - top);
-    p.imgSpans.push([ix, ix + natW * sc]);
+    // Only an under-the-text image can be punched through by a written cell —
+    // one painted over the text covers it, which is the point.
+    if (!over) p.imgSpans.push([ix, ix + natW * sc]);
   }
 }
 
@@ -1516,9 +1530,10 @@ function redrawCanvasRow(r: number): void {
   ctx.beginPath();
   ctx.rect(0, p.y0, canvasEl.width, p.y1 - p.y0);
   ctx.clip();
-  drawRowImages(p);
+  drawRowImages(p, false);
   const row = screen.cells[r];
   if (!row) {
+    drawRowImages(p, true);
     ctx.restore();
     return;
   }
@@ -1564,6 +1579,7 @@ function redrawCanvasRow(r: number): void {
     c += w;
   }
   flushRun(p);
+  drawRowImages(p, true); // z >= 0: over the text, still inside the band clip
   noteBlinkRow(r, p.hasBlink);
   ctx.restore(); // the band clip
 }

@@ -700,6 +700,9 @@ struct Placed {
     /// the erase-by-repaint half of an image's life; this covers the half where
     /// the emitter drops an image without touching the cells.
     key: Option<(u32, u32)>,
+    /// Stacking order the emitter stated, straight onto the wire (see
+    /// [`crate::model::ImagePlacement::z`]).
+    z: Option<i32>,
 }
 
 /// What the producer says about one placement (see
@@ -735,6 +738,7 @@ fn stamp_image(
         hold,
         sticky,
         key,
+        z,
     } = place;
     let (row, col) = parser.screen().cursor_position();
     // Display size in cells. An app-specified footprint is exact; a derived one
@@ -779,6 +783,7 @@ fn stamp_image(
         rows,
         ready,
         key,
+        z,
     });
     id
 }
@@ -1275,6 +1280,7 @@ fn resolve_images(
                         rows: None,
                         ready: None,
                         key: None,
+                        z: None,
                     },
                 ));
                 return false; // every covered cell gone → evict
@@ -1313,6 +1319,7 @@ fn resolve_images(
                 col: p.col,
                 cols: p.cols,
                 rows: p.rows,
+                z: p.z,
                 hash: hash.clone(),
             })
         })
@@ -2415,6 +2422,7 @@ mod tests {
                 },
             )),
             key: None,
+            z: None,
         }]
     }
 
@@ -2493,6 +2501,7 @@ mod tests {
             rows: Some(2.0),
             ready: None,
             key: None,
+            z: None,
         });
 
         // N's cells are gone, but N keeps showing (zombie) while N+1 pends.

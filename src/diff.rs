@@ -2559,6 +2559,7 @@ mod tests {
             col: 2,
             cols: Some(3.0),
             rows: Some(1.0),
+            z: Some(-1),
             hash: "ab".repeat(32),
         });
         let prev = Frame::Screen(grid(&[]));

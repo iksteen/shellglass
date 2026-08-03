@@ -155,6 +155,44 @@ if (MODE === "image") {
   });
 }
 
+// ?mode=imagez: stacking-order self-check. A placement that states its z
+// (kitty's `z=`, which zellij sends on every placement) paints by that order:
+// z >= 0 goes OVER the text (a written cell no longer punches its bg through),
+// z < 0 stays under it like the legacy z-less painting. Two images, one of
+// each, over identical text rows. Green/red convention.
+if (MODE === "imagez") {
+  const d4 = [];
+  for (let i = 0; i < ROWS; i++) d4.push([[pad(i === 2 || i === 8 ? "    OVERWRITE" : "")]]);
+  apply({ d: d4, w: COLS, h: ROWS,
+          i: [{ r: 1, c: 2, w: 10, h: 4, z: 1, k: "ab".repeat(32) },
+              { r: 7, c: 2, w: 10, h: 4, z: -1, k: "ab".repeat(32) }] });
+  benchFlush();
+  const imgs = [...document.querySelectorAll("img.inline-img")];
+  const swapped = () => Promise.all(imgs.map((img) => new Promise((res) => {
+    const check = () => { if (img.src.startsWith("data:") && img.complete) res(null); };
+    img.addEventListener("load", check);
+    check();
+  })));
+  swapped().then(() => {
+    benchRedraw();
+    const scr = document.querySelector("#screen .screen");
+    const canvas = document.querySelector("#screen canvas");
+    const g = canvas.getContext("2d");
+    const cw = (scr.getBoundingClientRect().width / COLS) * devicePixelRatio;
+    const lh = 17 * devicePixelRatio;
+    const px = (x, y) => g.getImageData(Math.round(x), Math.round(y), 1, 1).data;
+    // Same spot on each: the corner of a written cell the image covers.
+    const overPx = px(5 * cw + 1, 2 * lh + 1); // z=1 → image wins
+    const underPx = px(5 * cw + 1, 8 * lh + 1); // z=-1 → text cell's bg wins
+    const over = overPx[0] > 180 && overPx[1] < 60;
+    const under = underPx[0] < 60 && underPx[1] < 60 && underPx[2] < 60;
+    document.getElementById("screen").style.display = "none";
+    const bits = (over ? 1 : 0) + (under ? 2 : 0);
+    document.body.style.background = over && under ? "#00ff00" : `rgb(255, 0, ${bits})`;
+    document.title = "verified-ready";
+  });
+}
+
 // ?mode=cursor (with &cursor=smooth): smooth cursor travel self-check. After
 // a cursor move the static cursor is suppressed (the row repaint leaves no
 // block at the target); the traveling rect lands on the target within ~80ms

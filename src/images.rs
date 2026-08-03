@@ -74,6 +74,9 @@ pub struct Placement {
     /// names them — the handle an `a=d` deletes the placement by. `None` for
     /// every protocol that just draws at the cursor and never revokes.
     pub key: Option<(u32, u32)>,
+    /// Stacking order, when the emitter states one (see
+    /// [`crate::model::ImagePlacement::z`]).
+    pub z: Option<i32>,
 }
 
 /// Pixel dimensions from an encoded image's header (any format the browser takes).
@@ -1017,10 +1020,9 @@ impl Interceptor {
             return Segment::Drop;
         }
         let whole = (x, y, w, h) == (0, 0, iw, ih);
-        // ponytail: `X`/`Y` (sub-cell pixel offsets) and `z` (stacking order)
-        // are ignored — placements are cell-anchored here, so the ceiling is up
-        // to a cell of alignment error; honoring them needs sub-cell placement
-        // coordinates on the wire.
+        // ponytail: `X`/`Y` (sub-cell pixel offsets) are ignored — placements are
+        // cell-anchored here, so the ceiling is up to a cell of alignment error;
+        // honoring them needs sub-cell coordinates on the wire.
         let placement = num("p").unwrap_or(0);
         let place = Placement {
             cells: cells_from(ctrl.get("c"), ctrl.get("r")),
@@ -1029,6 +1031,11 @@ impl Interceptor {
             // doesn't erase it the way it erases a sixel.
             sticky: true,
             key: Some((id, placement)),
+            // Only what the emitter states: a placement with no `z=` keeps the
+            // mirror's legacy under-the-text painting. kitty's own default
+            // (z=0, over the text) would bury the shell prompt our cursor model
+            // deliberately leaves on an image's last row.
+            z: ctrl.get("z").and_then(|v| v.parse().ok()),
         };
         let lineage = hash_bytes(&[id.to_le_bytes(), placement.to_le_bytes()].concat());
         match img.fmt {
