@@ -228,6 +228,12 @@ pub enum DeferredPayload {
         w: u32,
         h: u32,
     },
+    /// An encoded image placed with a partial crop rectangle `(x, y, w, h)`:
+    /// decoding it is the expensive part, so it waits for the worker too.
+    Cropped {
+        bytes: Vec<u8>,
+        crop: (u32, u32, u32, u32),
+    },
 }
 
 /// The worker half of a deferred image: decode/encode to browser-native PNG
@@ -250,7 +256,38 @@ pub fn finish_deferred(payload: &DeferredPayload, fast: bool) -> Option<(Vec<u8>
             w,
             h,
         } => Some((encode_png(*w, *h, *channels, pixels, fast)?, (*w, *h))),
+        DeferredPayload::Cropped { bytes, crop } => {
+            let (pixels, channels, w, h) = decode_png(bytes)?;
+            let (x, y, cw, ch) = *crop;
+            if x + cw > w || y + ch > h {
+                return None; // the rect outgrew the image it was cut from
+            }
+            let cut = crop_pixels(&pixels, (w, h), *crop, channels);
+            Some((encode_png(cw, ch, channels, &cut, fast)?, (cw, ch)))
+        }
     }
+}
+
+/// Decode an encoded image to 8-bit RGB/RGBA pixels — `(pixels, channels, w, h)`.
+/// Only PNG (kitty's `f=100`) and only the two colour types a placement crop
+/// needs: anything else is simply not mirrored, which is always allowed. The
+/// decode is bounded by [`MAX_IMAGE_BYTES`], so a decompression bomb dies here.
+fn decode_png(bytes: &[u8]) -> Option<(Vec<u8>, u8, u32, u32)> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().ok()?;
+    if reader.output_buffer_size()? as u64 > MAX_IMAGE_BYTES {
+        return None;
+    }
+    let mut pixels = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut pixels).ok()?;
+    let channels = match info.color_type {
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        _ => return None,
+    };
+    pixels.truncate(info.buffer_size());
+    Some((pixels, channels, info.width, info.height))
 }
 
 const ITERM: &[u8] = b"\x1b]1337;";
@@ -1103,18 +1140,27 @@ impl Interceptor {
                 } else {
                     3
                 };
-                let bytes = crop(&img.data, (iw, ih), (x, y, w, h), channels);
+                let bytes = crop_pixels(&img.data, (iw, ih), (x, y, w, h), channels);
                 kitty_segment(bytes, img.fmt, Some((w, h)), lineage, place)
             }
-            // ponytail: cropping an encoded image would need a decoder we don't
-            // carry; mirroring it UNCROPPED would paint over what the terminal
-            // clipped away — showing more than the local screen, which the
-            // mirror never does. So a partial crop of an encoded image isn't
-            // mirrored. Upgrade path: the `png` crate's decoder.
+            // The whole image passes through undecoded; a partial crop has to be
+            // decoded, cut and re-encoded, which the worker does off the screen
+            // thread (mirroring it UNCROPPED would paint over what the terminal
+            // clipped away — more than the local screen shows, which the mirror
+            // never does).
             KittyFmt::Png if whole => {
                 kitty_segment(img.data.clone(), img.fmt, Some((w, h)), lineage, place)
             }
-            KittyFmt::Png | KittyFmt::Unsupported => None,
+            KittyFmt::Png => Some(Segment::Deferred(DeferredImage {
+                payload: DeferredPayload::Cropped {
+                    bytes: img.data.clone(),
+                    crop: (x, y, w, h),
+                },
+                px: (w, h),
+                lineage,
+                place,
+            })),
+            KittyFmt::Unsupported => None,
         }
         .unwrap_or(Segment::Drop)
     }
@@ -1122,7 +1168,7 @@ impl Interceptor {
 
 /// Cut a `(x, y, w, h)` pixel rectangle out of a raw `channels`-byte-per-pixel
 /// framebuffer. A row-by-row copy; the whole-image case just clones.
-fn crop(
+fn crop_pixels(
     data: &[u8],
     (iw, _ih): (u32, u32),
     (x, y, w, h): (u32, u32, u32, u32),
@@ -2295,17 +2341,30 @@ mod tests {
     /// decoder — and mirroring it uncropped would paint over what the terminal
     /// clipped away. So it isn't mirrored at all.
     #[test]
-    fn kitty_place_of_an_encoded_image_only_mirrors_the_whole_rect() {
+    fn kitty_place_of_an_encoded_image_crops_through_a_decode() {
+        // A 4x4 RGBA ramp, transmitted ENCODED (f=100) rather than raw.
+        let png = encode_png(4, 4, 4, &ramp_rgba(), true).expect("encode");
         let mut it = Interceptor::new();
-        it.feed(format!("\x1b_Ga=t,f=100,t=d,i=8;{}\x1b\\", png_b64()).as_bytes());
-        assert_eq!(
-            only_images(it.feed(b"\x1b_Ga=p,i=8,p=1,C=1\x1b\\")).len(),
-            1,
-            "whole image places"
-        );
+        it.feed(format!("\x1b_Ga=t,f=100,t=d,i=8;{}\x1b\\", B64.encode(&png)).as_bytes());
+
+        // The whole rect passes through undecoded — the stored bytes verbatim.
+        let whole = only_images(it.feed(b"\x1b_Ga=p,i=8,p=1,C=1\x1b\\"));
+        assert_eq!(whole.len(), 1);
+        assert_eq!(whole[0].bytes, png, "no re-encode for the whole image");
+
+        // A partial rect is decoded, cut and re-encoded — same pixels the raw
+        // path produces for the same crop.
+        let cut = only_images(it.feed(b"\x1b_Ga=p,i=8,p=2,x=1,y=2,w=2,h=1,C=1\x1b\\"));
+        assert_eq!(cut.len(), 1);
+        assert_eq!(cut[0].px, Some((2, 1)));
+        let (pixels, channels, w, h) = decode_png(&cut[0].bytes).expect("decode the crop");
+        assert_eq!((channels, w, h), (4, 2, 1));
+        assert_eq!(pixels, vec![1, 2, 0, 255, 2, 2, 0, 255]);
+
+        // A degenerate rect places nothing at all.
         assert!(
-            only_images(it.feed(b"\x1b_Ga=p,i=8,p=2,x=0,y=0,w=1,h=0,C=1\x1b\\")).is_empty(),
-            "a degenerate/partial rect is not mirrored"
+            only_images(it.feed(b"\x1b_Ga=p,i=8,p=3,x=0,y=0,w=1,h=0,C=1\x1b\\")).is_empty(),
+            "an empty rect is not mirrored"
         );
     }
 
