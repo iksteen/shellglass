@@ -755,7 +755,7 @@ impl HubState {
     /// session it names. Used by the SSH viewer to resolve `ssh <slug>@hub` to the
     /// session's frames (an un-aliased session's slug is its own id, so
     /// `ssh <id>@hub` still works).
-    pub(crate) fn live(&self, slug: &str) -> Option<Arc<diff::Live>> {
+    pub fn live(&self, slug: &str) -> Option<Arc<diff::Live>> {
         let id = self.id_of_view(slug)?;
         let map = self.sessions.lock().unwrap();
         map.get(&id).map(|s| Arc::clone(&s.live))
