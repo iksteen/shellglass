@@ -90,6 +90,9 @@ export interface ImageRef {
   c: number; // left col
   w?: number; // width in cells
   h?: number; // height in cells (rows)
+  x?: number; // sub-cell offset from (c, r), in cells; absent = 0
+  y?: number;
+  z?: number; // stacking order: < 0 under the text, >= 0 over it; absent = under
   k: string; // content address of the image bytes
 }
 // On diff-family messages the cursor is TRI-STATE: absent = unchanged,
@@ -1255,25 +1258,54 @@ function drawBoosted(g: CanvasRenderingContext2D, k: number, draw: () => void): 
   }
 }
 
-// Image slices for this band, under the glyphs. Contain-fit anchored
-// top-left (same math as the hidden <img>'s layout rule), one uniform scale.
-function drawRowImages(p: RowPaint): void {
+// Image slices for this band. Contain-fit anchored top-left (same math as the
+// hidden <img>'s layout rule), one uniform scale.
+//
+// Two passes per row, split on the placement's stacking order (kitty's `z`):
+// `over === false` runs before the cells (under the glyphs, the sixel-style
+// painting every z-less image keeps, and the only pass that registers imgSpans
+// so a written cell can punch through), `over === true` after them, painting
+// the image on top of the text like kitty does for z >= 0. Sorted by z within a
+// pass; ties keep wire order, which is zombies-then-live.
+function drawRowImages(p: RowPaint, over: boolean): void {
   // Held predecessors draw first (under), current images after (over).
-  for (const { ref, el } of heldImages.concat(screenImages)) {
+  const layer = heldImages
+    .concat(screenImages)
+    .filter(({ ref }) => (ref.z !== undefined && ref.z >= 0) === over)
+    .sort((a, b) => (a.ref.z ?? 0) - (b.ref.z ?? 0));
+  for (const { ref, el } of layer) {
     const natW = el.naturalWidth;
     const natH = el.naturalHeight;
     if (!el.complete || !natW || !natH) continue;
-    const sc =
-      ref.w && ref.h
-        ? Math.min((ref.w * cellW * dpr) / natW, (ref.h * cellH * dpr) / natH)
-        : dpr; // no cell box: natural CSS-pixel size
-    const ix = ref.c * cellW * dpr;
-    const iy = ref.r * cellH * dpr;
-    const top = Math.max(p.y0, iy);
-    const bot = Math.min(p.y1, iy + natH * sc);
-    if (bot <= top) continue;
-    p.g.drawImage(el, 0, (top - iy) / sc, natW, (bot - top) / sc, ix, top, natW * sc, bot - top);
-    p.imgSpans.push([ix, ix + natW * sc]);
+    // Fill the stated cell box on BOTH axes, independently. The box is what
+    // the terminal gave the image, so the mirror must occupy the same cells
+    // even though the browser's cell ratio differs; contain-fitting instead
+    // would letterbox, and an emitter that tiles one picture across adjacent
+    // placements (zellij, clipping an image against a floating pane) would
+    // show a growing gap between the tiles.
+    const w = ref.w ? ref.w * cellW * dpr : natW * dpr;
+    const h = ref.h ? ref.h * cellH * dpr : natH * dpr;
+    const ix = (ref.c + (ref.x ?? 0)) * cellW * dpr;
+    const iy = (ref.r + (ref.y ?? 0)) * cellH * dpr;
+    // Snap the whole box to device pixels BEFORE slicing it per row. Cell
+    // boxes are fractional, and a fractional edge antialiases against whatever
+    // is behind it — between two placements tiling one picture that reads as a
+    // hairline crack. Rounding both edges makes one tile's bottom land on the
+    // next one's top exactly, since they are the same number going in.
+    const x0 = Math.round(ix);
+    const x1 = Math.round(ix + w);
+    const yTop = Math.round(iy);
+    const yBot = Math.round(iy + h);
+    const top = Math.max(p.y0, yTop);
+    const bot = Math.min(p.y1, yBot);
+    if (bot <= top || x1 <= x0 || yBot <= yTop) continue;
+    // This band's slice of the source, mapped through the snapped box.
+    const sy0 = ((top - yTop) / (yBot - yTop)) * natH;
+    const sh = ((bot - top) / (yBot - yTop)) * natH;
+    p.g.drawImage(el, 0, sy0, natW, sh, x0, top, x1 - x0, bot - top);
+    // Only an under-the-text image can be punched through by a written cell —
+    // one painted over the text covers it, which is the point.
+    if (!over) p.imgSpans.push([x0, x1]);
   }
 }
 
@@ -1516,9 +1548,10 @@ function redrawCanvasRow(r: number): void {
   ctx.beginPath();
   ctx.rect(0, p.y0, canvasEl.width, p.y1 - p.y0);
   ctx.clip();
-  drawRowImages(p);
+  drawRowImages(p, false);
   const row = screen.cells[r];
   if (!row) {
+    drawRowImages(p, true);
     ctx.restore();
     return;
   }
@@ -1564,6 +1597,7 @@ function redrawCanvasRow(r: number): void {
     c += w;
   }
   flushRun(p);
+  drawRowImages(p, true); // z >= 0: over the text, still inside the band clip
   noteBlinkRow(r, p.hasBlink);
   ctx.restore(); // the band clip
 }
@@ -2138,8 +2172,11 @@ export function attrEscape(s: string): string {
 
 function renderImage(im: ImageRef): string {
   const sized = im.w && im.h;
+  // The sub-cell offset folds into the cell coordinates (both are multiplied by
+  // the cell box in the layout rule), so a copied fragment lands where the
+  // canvas painted it.
   const vars =
-    `--sg-c:${im.c};--sg-r:${im.r}` +
+    `--sg-c:${im.c + (im.x ?? 0)};--sg-r:${im.r + (im.y ?? 0)}` +
     (sized ? `;--sg-w:${im.w};--sg-h:${im.h}` : "");
   // Relative content-addressed URL: resolves under the page directory
   // (subpath-safe) and is immutable, so the browser cache absorbs re-renders
@@ -2334,17 +2371,19 @@ function injectViewerCss(): void {
     // Inline-image layout, sourced from the per-element custom properties —
     // deliberately NOT inline styles, so copied fragments paste at natural
     // size instead of dragging half-parseable ch/var() sizing along (see
-    // renderImage). The .sized box is contain-fitted, anchored top-left: the
-    // emitter sized the cell box for the LOCAL terminal's cell ratio, which
-    // needn't match the browser's, so stretching would distort. The canvas
-    // paints the pixels, so the element itself is hidden — by stylesheet
-    // rule, never inline, so copied fragments paste visible.
+    // renderImage). The .sized box is FILLED, anchored top-left: the cell box
+    // is the rectangle the terminal gave the image, so the mirror occupies the
+    // same cells even though the browser's cell ratio differs — the few
+    // percent of stretch that costs is invisible next to the gap a
+    // contain-fit letterbox leaves between two halves of one tiled picture.
+    // The canvas paints the pixels, so the element itself is hidden — by
+    // stylesheet rule, never inline, so copied fragments paste visible.
     `${s}.screen img.inline-img{position:absolute;` +
     "left:calc(var(--sg-c)*1ch);top:calc(var(--sg-r)*var(--lh));" +
     "z-index:3;pointer-events:none;visibility:hidden}" +
     `${s}.screen img.inline-img.sized{width:calc(var(--sg-w)*1ch);` +
     "height:calc(var(--sg-h)*var(--lh));" +
-    "object-fit:contain;object-position:left top}";
+    "object-fit:fill;object-position:left top}";
   cssRoot.appendChild(css);
 }
 

@@ -51,7 +51,7 @@ impl<T> Grid<T> {
         self.pos = Pos::default();
         self.saved_pos = Pos::default();
         for row in self.drawing_rows_mut() {
-            row.clear(crate::attrs::Attrs::default());
+            row.clear_with_data(crate::attrs::Attrs::default());
         }
         self.scroll_top = 0;
         self.scroll_bottom = self.size.rows - 1;
@@ -465,9 +465,13 @@ impl<T> Grid<T> {
         }
     }
 
+    /// shellglass: a WHOLE-display erase (`CSI 2 J`) is the one erase that also
+    /// takes the images with it — kitty calls `grman_clear` here and nowhere
+    /// else in the erase paths, so a partial ED or any EL leaves placements
+    /// alone (an emitter repainting a line under an image doesn't lose it).
     pub fn erase_all(&mut self, attrs: crate::attrs::Attrs) {
         for row in self.drawing_rows_mut() {
-            row.clear(attrs);
+            row.clear_with_data(attrs);
         }
     }
 

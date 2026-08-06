@@ -815,23 +815,33 @@ function drawBoosted(g, k, draw) {
         g.globalAlpha = 1;
     }
 }
-function drawRowImages(p) {
-    for (const { ref, el } of heldImages.concat(screenImages)) {
+function drawRowImages(p, over) {
+    const layer = heldImages
+        .concat(screenImages)
+        .filter(({ ref }) => (ref.z !== undefined && ref.z >= 0) === over)
+        .sort((a, b) => (a.ref.z ?? 0) - (b.ref.z ?? 0));
+    for (const { ref, el } of layer) {
         const natW = el.naturalWidth;
         const natH = el.naturalHeight;
         if (!el.complete || !natW || !natH)
             continue;
-        const sc = ref.w && ref.h
-            ? Math.min((ref.w * cellW * dpr) / natW, (ref.h * cellH * dpr) / natH)
-            : dpr;
-        const ix = ref.c * cellW * dpr;
-        const iy = ref.r * cellH * dpr;
-        const top = Math.max(p.y0, iy);
-        const bot = Math.min(p.y1, iy + natH * sc);
-        if (bot <= top)
+        const w = ref.w ? ref.w * cellW * dpr : natW * dpr;
+        const h = ref.h ? ref.h * cellH * dpr : natH * dpr;
+        const ix = (ref.c + (ref.x ?? 0)) * cellW * dpr;
+        const iy = (ref.r + (ref.y ?? 0)) * cellH * dpr;
+        const x0 = Math.round(ix);
+        const x1 = Math.round(ix + w);
+        const yTop = Math.round(iy);
+        const yBot = Math.round(iy + h);
+        const top = Math.max(p.y0, yTop);
+        const bot = Math.min(p.y1, yBot);
+        if (bot <= top || x1 <= x0 || yBot <= yTop)
             continue;
-        p.g.drawImage(el, 0, (top - iy) / sc, natW, (bot - top) / sc, ix, top, natW * sc, bot - top);
-        p.imgSpans.push([ix, ix + natW * sc]);
+        const sy0 = ((top - yTop) / (yBot - yTop)) * natH;
+        const sh = ((bot - top) / (yBot - yTop)) * natH;
+        p.g.drawImage(el, 0, sy0, natW, sh, x0, top, x1 - x0, bot - top);
+        if (!over)
+            p.imgSpans.push([x0, x1]);
     }
 }
 function drawCellBg(p, cell, bg, x0, x1) {
@@ -998,9 +1008,10 @@ function redrawCanvasRow(r) {
     ctx.beginPath();
     ctx.rect(0, p.y0, canvasEl.width, p.y1 - p.y0);
     ctx.clip();
-    drawRowImages(p);
+    drawRowImages(p, false);
     const row = screen.cells[r];
     if (!row) {
+        drawRowImages(p, true);
         ctx.restore();
         return;
     }
@@ -1043,6 +1054,7 @@ function redrawCanvasRow(r) {
         c += w;
     }
     flushRun(p);
+    drawRowImages(p, true);
     noteBlinkRow(r, p.hasBlink);
     ctx.restore();
 }
@@ -1400,7 +1412,7 @@ export function attrEscape(s) {
 }
 function renderImage(im) {
     const sized = im.w && im.h;
-    const vars = `--sg-c:${im.c};--sg-r:${im.r}` +
+    const vars = `--sg-c:${im.c + (im.x ?? 0)};--sg-r:${im.r + (im.y ?? 0)}` +
         (sized ? `;--sg-w:${im.w};--sg-h:${im.h}` : "");
     const co = crossOriginImages ? ` crossorigin="anonymous"` : "";
     return `<img class="inline-img${sized ? " sized" : ""}" style="${vars}" alt=""${co} src="${mountBase}images/${attrEscape(im.k)}">`;
@@ -1528,7 +1540,7 @@ function injectViewerCss() {
             "z-index:3;pointer-events:none;visibility:hidden}" +
             `${s}.screen img.inline-img.sized{width:calc(var(--sg-w)*1ch);` +
             "height:calc(var(--sg-h)*var(--lh));" +
-            "object-fit:contain;object-position:left top}";
+            "object-fit:fill;object-position:left top}";
     cssRoot.appendChild(css);
 }
 export function benchInit(el) {

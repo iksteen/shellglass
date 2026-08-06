@@ -49,12 +49,38 @@ pub struct Image {
     pub mime: String,
     /// The image file bytes.
     pub bytes: Vec<u8>,
-    /// Display size in terminal cells (cols, rows) if the app specified one;
-    /// otherwise the browser renders the image at its natural pixel size.
-    pub cells: Option<(u16, u16)>,
     /// Source pixel dimensions (width, height). Used to derive a cell count when
     /// the app gave none, so the cursor advances below a natural-size image.
     pub px: Option<(u32, u32)>,
+    /// How the image is placed on the grid.
+    pub place: Placement,
+}
+
+/// How an image goes onto the grid: everything the producer knows about the
+/// placement that isn't the pixels. The [`Default`] is the plain
+/// draw-at-the-cursor placement sixel and iTerm2 make.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Placement {
+    /// Display size in terminal cells (cols, rows) if the app specified one;
+    /// otherwise the browser renders the image at its natural pixel size.
+    pub cells: Option<(u16, u16)>,
+    /// The placement declared "don't move the cursor" (kitty `a=p,C=1`): stamp
+    /// from the cursor cell downwards without advancing it or scrolling.
+    pub hold: bool,
+    /// The placement outlives text written over its cells, dying only when they
+    /// are erased or scrolled away (kitty's lifetime; see `vt100::PlaceOpts`).
+    pub sticky: bool,
+    /// The kitty `(image id, placement id)` this came from, when the emitter
+    /// names them — the handle an `a=d` deletes the placement by. `None` for
+    /// every protocol that just draws at the cursor and never revokes.
+    pub key: Option<(u32, u32)>,
+    /// Stacking order, when the emitter states one (see
+    /// [`crate::model::ImagePlacement::z`]).
+    pub z: Option<i32>,
+    /// Sub-cell offset in PIXELS (kitty's `X`/`Y`), which the mirror divides by
+    /// its cell size like every other pixel dimension — see
+    /// [`crate::model::ImagePlacement::x_off`].
+    pub off_px: (u16, u16),
 }
 
 /// Pixel dimensions from an encoded image's header (any format the browser takes).
@@ -87,6 +113,10 @@ pub enum Step {
     /// terminal; `.1` is a candidate app response used only by a detached owner
     /// that has cached this protocol from its last attached terminal.
     Query(Vec<u8>, Vec<u8>),
+    /// Placements the emitter revoked (kitty `a=d`): `.0` → the local terminal,
+    /// which drops them itself; the mirror drops the ones `.1` selects, so a
+    /// blanked image never lingers on the web.
+    Delete(Vec<u8>, DeleteSel),
     /// A kitty file/shm transmission we refuse (its payload is a filesystem path /
     /// shm name and the stream is untrusted — the exfiltration vector). SUPPRESSED
     /// from the local terminal (nothing teed); `.0` is a kitty error echoing the
@@ -107,7 +137,8 @@ impl Step {
             | Step::TerminalOnly(b)
             | Step::Image(b, _)
             | Step::Deferred(b, _)
-            | Step::Query(b, _) => Some(b),
+            | Step::Query(b, _)
+            | Step::Delete(b, _) => Some(b),
             Step::Reject(_) => None,
         }
     }
@@ -142,17 +173,48 @@ enum Segment {
     /// A query that draws nothing, with the response a detached virtual terminal
     /// may return from its cached capabilities.
     Query(Vec<u8>),
+    /// The emitter revoked placements it made earlier (kitty `a=d`).
+    Delete(DeleteSel),
+}
+
+/// Which placements an `a=d` revokes. The parser only names them; matching is
+/// the mirror's job (`pty::revokes`), because the geometry forms need the
+/// placement rects and the cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteSel {
+    /// `d=a` — every placement.
+    All,
+    /// `d=i` (one id, optionally one placement) or `d=r` (an id range).
+    Ids {
+        first: u32,
+        last: u32,
+        placement: Option<u32>,
+    },
+    /// `d=c` — placements covering the cursor's cell.
+    Cursor,
+    /// `d=p`/`q`/`x`/`y`/`z` — placements covering the stated column and/or row
+    /// (1-based on the wire, 0-based here), and/or having the stated z.
+    At {
+        col: Option<u16>,
+        row: Option<u16>,
+        z: Option<i32>,
+    },
 }
 
 /// The stamp-now, decode-later form of an image (see [`Segment::Deferred`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeferredImage {
     pub payload: DeferredPayload,
-    /// App-given cell size, if any (else derive from `px`).
-    pub cells: Option<(u16, u16)>,
     /// Pixel dimensions, from cheap metadata (sixel raster attributes, kitty
     /// transmission params) — NOT from decoding.
     pub px: (u32, u32),
+    /// Which stream of images this one belongs to; a queued decode is dropped
+    /// only when a LATER decode with the same lineage arrives (see
+    /// `pty::image_worker`). `0` = the cursor stream — an animation replacing
+    /// itself in place, where only the newest frame is worth decoding.
+    pub lineage: u64,
+    /// How the image is placed on the grid (see [`Image::place`]).
+    pub place: Placement,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +227,12 @@ pub enum DeferredPayload {
         channels: u8,
         w: u32,
         h: u32,
+    },
+    /// An encoded image placed with a partial crop rectangle `(x, y, w, h)`:
+    /// decoding it is the expensive part, so it waits for the worker too.
+    Cropped {
+        bytes: Vec<u8>,
+        crop: (u32, u32, u32, u32),
     },
 }
 
@@ -188,7 +256,38 @@ pub fn finish_deferred(payload: &DeferredPayload, fast: bool) -> Option<(Vec<u8>
             w,
             h,
         } => Some((encode_png(*w, *h, *channels, pixels, fast)?, (*w, *h))),
+        DeferredPayload::Cropped { bytes, crop } => {
+            let (pixels, channels, w, h) = decode_png(bytes)?;
+            let (x, y, cw, ch) = *crop;
+            if x + cw > w || y + ch > h {
+                return None; // the rect outgrew the image it was cut from
+            }
+            let cut = crop_pixels(&pixels, (w, h), *crop, channels);
+            Some((encode_png(cw, ch, channels, &cut, fast)?, (cw, ch)))
+        }
     }
+}
+
+/// Decode an encoded image to 8-bit RGB/RGBA pixels — `(pixels, channels, w, h)`.
+/// Only PNG (kitty's `f=100`) and only the two colour types a placement crop
+/// needs: anything else is simply not mirrored, which is always allowed. The
+/// decode is bounded by [`MAX_IMAGE_BYTES`], so a decompression bomb dies here.
+fn decode_png(bytes: &[u8]) -> Option<(Vec<u8>, u8, u32, u32)> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().ok()?;
+    if reader.output_buffer_size()? as u64 > MAX_IMAGE_BYTES {
+        return None;
+    }
+    let mut pixels = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut pixels).ok()?;
+    let channels = match info.color_type {
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        _ => return None,
+    };
+    pixels.truncate(info.buffer_size());
+    Some((pixels, channels, info.width, info.height))
 }
 
 const ITERM: &[u8] = b"\x1b]1337;";
@@ -235,6 +334,8 @@ pub struct Interceptor {
     kitty: Option<KittyAccum>,
     /// In-flight iTerm2 multipart transfer (`MultipartFile`→`FilePart`*→`FileEnd`).
     iterm: Option<ItermAccum>,
+    /// Transmitted-but-not-yet-placed kitty images, keyed by their `i=`.
+    kitty_store: KittyStore,
     /// Intercept kitty / iTerm2 / sixel sequences. A protocol the local terminal
     /// doesn't render is left in the stream (vt100 sees it, matching the terminal)
     /// rather than consumed into a web image the local terminal wouldn't show — see
@@ -316,12 +417,13 @@ struct KittyAccum {
     /// `t` transmit-only, `d` delete, `f`/`a` animation, `c` compose) draws
     /// nothing at the cursor, so emitting an image for one would show the web
     /// viewer content the local kitty never displayed. The sequence is still
-    /// consumed (accumulated and flushed) so `m=1` chains stay coherent.
-    // ponytail: `a=p` (place a previously-transmitted id) would need an id→image
-    // store keyed on `i=`; until then a t-then-p emitter shows no web image.
-    // `a=d` could evict placements, but per-cell tag erase already covers the
-    // common clears.
+    /// consumed (accumulated and flushed) so `m=1` chains stay coherent. A
+    /// transmit-only image isn't lost: it lands in [`KittyStore`] for the `a=p`
+    /// that places it later.
     display: bool,
+    /// The image id (`i=`) this transfer claims, from the FIRST chunk (only that
+    /// one carries the control keys). It is the key a later `a=p` places by.
+    id: Option<u32>,
     /// Payload outgrew [`MAX_B64_BYTES`] — condemned, same as `ItermAccum::over`.
     over: bool,
     cells: Option<(u16, u16)>,
@@ -337,7 +439,62 @@ struct KittyAccum {
     offset: usize,
 }
 
+/// Images transmitted with an id (`a=t`/`a=T` + `i=`) waiting to be placed by an
+/// `a=p`. Byte-capped, oldest-first eviction: an evicted id simply stops
+/// mirroring (its later placements show nothing — less than the terminal, which
+/// the fidelity rule allows; more would not be).
+#[derive(Default)]
+struct KittyStore {
+    map: std::collections::HashMap<u32, StoredImage>,
+    order: std::collections::VecDeque<u32>,
+    total: usize,
+}
+
+/// A transmitted image, decoded to its post-transmission bytes: a raw
+/// framebuffer for `f=24/32` (croppable by memcpy — what zellij sends) or the
+/// encoded file for `f=100`.
+struct StoredImage {
+    data: Vec<u8>,
+    fmt: KittyFmt,
+    px: (u32, u32),
+}
+
+impl KittyStore {
+    const CAP: usize = 32 << 20;
+
+    fn get(&self, id: u32) -> Option<&StoredImage> {
+        self.map.get(&id)
+    }
+
+    /// Store (or REPLACE — an emitter re-transmits the same id, e.g. one scaled
+    /// variant per destination size) and evict oldest-first back under the cap.
+    fn insert(&mut self, id: u32, image: StoredImage) {
+        self.remove(id);
+        self.total += image.data.len();
+        self.map.insert(id, image);
+        self.order.push_back(id);
+        while self.total > Self::CAP && self.order.len() > 1 {
+            if let Some(old) = self.order.pop_front() {
+                self.remove(old);
+            }
+        }
+    }
+
+    /// Every stored id — what `a=d,d=A` frees.
+    fn ids(&self) -> Vec<u32> {
+        self.order.iter().copied().collect()
+    }
+
+    fn remove(&mut self, id: u32) {
+        if let Some(old) = self.map.remove(&id) {
+            self.total -= old.data.len();
+            self.order.retain(|&queued| queued != id);
+        }
+    }
+}
+
 /// The kitty pixel formats we can turn into something the browser renders.
+#[derive(Clone, Copy)]
 enum KittyFmt {
     /// `f=100`: already an encoded image file — forward as-is.
     Png,
@@ -661,8 +818,8 @@ impl Interceptor {
             image: Image {
                 mime: "image/png".to_string(),
                 bytes: png,
-                cells: None,
                 px: Some(px),
+                place: Placement::default(),
             },
         })
     }
@@ -738,6 +895,14 @@ impl Interceptor {
             };
         }
 
+        // `a=p` places an image transmitted earlier — no payload, no accumulator.
+        if ctrl.get("a").map(String::as_str) == Some("p") {
+            return self.kitty_place(&ctrl);
+        }
+        if ctrl.get("a").map(String::as_str) == Some("d") {
+            return self.kitty_delete(&ctrl);
+        }
+
         // Start an accumulator on the first chunk of a transfer — the one that
         // carries the format/medium/size control keys (continuation chunks only
         // repeat `m`).
@@ -758,6 +923,7 @@ impl Interceptor {
                 payload: String::new(),
                 // kitty's default action is `t` (transmit-only) — absent ⇒ no display.
                 display: ctrl.get("a").map(String::as_str) == Some("T"),
+                id: ctrl.get("i").and_then(|v| v.parse().ok()),
                 over: false,
                 cells: cells_from(ctrl.get("c"), ctrl.get("r")),
                 fmt,
@@ -799,18 +965,235 @@ impl Interceptor {
         if matches!(acc.medium, KittyMedium::File | KittyMedium::Shm) {
             return Segment::Reject(kitty_reject(&ctrl));
         }
-        // A non-display action, an over-cap image, or an unsupported/non-direct
-        // medium is rendered (or ignored) by the local terminal but not mirrored.
-        if !acc.display || acc.over || !matches!(acc.medium, KittyMedium::Direct) {
+        // An over-cap image or an unsupported/non-direct medium is rendered (or
+        // ignored) by the local terminal but not mirrored.
+        if acc.over || !matches!(acc.medium, KittyMedium::Direct) {
             return Segment::Drop;
         }
-        kitty_direct_image(acc).unwrap_or(Segment::Drop)
+        let Some(bytes) = kitty_payload(&acc) else {
+            return Segment::Drop;
+        };
+        // Keep the image for a later `a=p`; `s`/`v` carry the dims of a raw
+        // framebuffer, an encoded file carries its own.
+        let stored = acc.id.zip(acc.px.or_else(|| dims(&bytes)));
+        if !acc.display {
+            // Transmit-only: nothing is drawn now, so nothing is mirrored now.
+            if let Some((id, px)) = stored {
+                self.kitty_store.insert(
+                    id,
+                    StoredImage {
+                        data: bytes,
+                        fmt: acc.fmt,
+                        px,
+                    },
+                );
+            }
+            return Segment::Drop;
+        }
+        if let Some((id, px)) = stored {
+            self.kitty_store.insert(
+                id,
+                StoredImage {
+                    data: bytes.clone(),
+                    fmt: acc.fmt,
+                    px,
+                },
+            );
+        }
+        kitty_segment(
+            bytes,
+            acc.fmt,
+            acc.px,
+            0,
+            Placement {
+                cells: acc.cells,
+                // Same kitty lifetime as `a=p` (see `kitty_place`): a print into
+                // the image's cells doesn't erase it.
+                sticky: true,
+                ..Placement::default()
+            },
+        )
+        .unwrap_or(Segment::Drop)
+    }
+
+    /// Revoke placements (`a=d`). The uppercase form of a selector also frees
+    /// the transmitted image, which we can only do where the id is named
+    /// (`I`/`A`/`R`) — the geometry forms would need a placement→image map, and
+    /// the store is byte-capped anyway, so an unfreed image just ages out.
+    ///
+    /// Two kitty selectors are deliberately not honored:
+    /// - `d=f` deletes animation *frames*, which no placement depends on.
+    /// - `d=n` selects by image NUMBER (`I=`), which the terminal maps to an id
+    ///   in a reply we never see. We therefore never mirror a placement made by
+    ///   number either, so there is nothing stale for it to leave behind.
+    fn kitty_delete(&mut self, ctrl: &std::collections::HashMap<String, String>) -> Segment {
+        let what = ctrl.get("d").map_or("a", String::as_str);
+        let num = |k: &str| ctrl.get(k).and_then(|v| v.parse::<u32>().ok());
+        // Cell coordinates are 1-based on the wire, like CUP's.
+        let cell = |k: &str| num(k).and_then(|v| u16::try_from(v.saturating_sub(1)).ok());
+        let z = ctrl.get("z").and_then(|v| v.parse::<i32>().ok());
+        let ids = match what {
+            "i" | "I" => num("i").map(|id| (id, id)),
+            "r" | "R" => num("x").zip(num("y")),
+            _ => None,
+        };
+        if what.starts_with(['I', 'A', 'R']) {
+            let free: Vec<u32> = match ids {
+                Some((first, last)) => (first..=last).collect(),
+                // `d=A` frees every image this emitter transmitted.
+                None if what == "A" => self.kitty_store.ids(),
+                None => Vec::new(),
+            };
+            for id in free {
+                self.kitty_store.remove(id);
+            }
+        }
+        match what {
+            "i" | "I" | "r" | "R" => match ids {
+                Some((first, last)) => Segment::Delete(DeleteSel::Ids {
+                    first,
+                    last,
+                    placement: num("p"),
+                }),
+                None => Segment::Drop,
+            },
+            "a" | "A" => Segment::Delete(DeleteSel::All),
+            "c" | "C" => Segment::Delete(DeleteSel::Cursor),
+            "p" | "P" => Segment::Delete(DeleteSel::At {
+                col: cell("x"),
+                row: cell("y"),
+                z: None,
+            }),
+            "q" | "Q" => Segment::Delete(DeleteSel::At {
+                col: cell("x"),
+                row: cell("y"),
+                z,
+            }),
+            "x" | "X" => Segment::Delete(DeleteSel::At {
+                col: cell("x"),
+                row: None,
+                z: None,
+            }),
+            "y" | "Y" => Segment::Delete(DeleteSel::At {
+                col: None,
+                row: cell("y"),
+                z: None,
+            }),
+            "z" | "Z" => Segment::Delete(DeleteSel::At {
+                col: None,
+                row: None,
+                z,
+            }),
+            _ => Segment::Drop,
+        }
+    }
+
+    /// Place an image transmitted earlier (`a=p`). The emitter positions the
+    /// cursor itself and hands us a SOURCE-PIXEL crop rectangle (`x,y,w,h`) —
+    /// pre-scaled to the destination, so the crop's pixel size IS the display
+    /// size and the usual `px / cell` derivation gives the cell footprint.
+    fn kitty_place(&self, ctrl: &std::collections::HashMap<String, String>) -> Segment {
+        let num = |k: &str| ctrl.get(k).and_then(|v| v.parse::<u32>().ok());
+        // An id we never saw (evicted, or transmitted before we started
+        // watching) simply isn't mirrored — the tee still draws it locally.
+        let Some(id) = num("i") else {
+            return Segment::Drop;
+        };
+        let Some(img) = self.kitty_store.get(id) else {
+            return Segment::Drop;
+        };
+        let (iw, ih) = img.px;
+        let (x, y) = (num("x").unwrap_or(0).min(iw), num("y").unwrap_or(0).min(ih));
+        let (w, h) = (
+            num("w").unwrap_or(iw - x).min(iw - x),
+            num("h").unwrap_or(ih - y).min(ih - y),
+        );
+        if w == 0 || h == 0 {
+            return Segment::Drop;
+        }
+        let whole = (x, y, w, h) == (0, 0, iw, ih);
+        let placement = num("p").unwrap_or(0);
+        let place = Placement {
+            cells: cells_from(ctrl.get("c"), ctrl.get("r")),
+            hold: ctrl.get("C").map(String::as_str) == Some("1"),
+            // kitty keeps a placement until it is deleted; text drawn over it
+            // doesn't erase it the way it erases a sixel.
+            sticky: true,
+            key: Some((id, placement)),
+            // Only what the emitter states: a placement with no `z=` keeps the
+            // mirror's legacy under-the-text painting. kitty's own default
+            // (z=0, over the text) would bury the shell prompt our cursor model
+            // deliberately leaves on an image's last row.
+            z: ctrl.get("z").and_then(|v| v.parse().ok()),
+            // `X`/`Y` position the image inside its cell — how an emitter tiles
+            // one image across several placements without seams.
+            off_px: (
+                u16::try_from(num("X").unwrap_or(0)).unwrap_or(0),
+                u16::try_from(num("Y").unwrap_or(0)).unwrap_or(0),
+            ),
+        };
+        let lineage = hash_bytes(&[id.to_le_bytes(), placement.to_le_bytes()].concat());
+        match img.fmt {
+            KittyFmt::Rgba | KittyFmt::Rgb => {
+                let channels = if matches!(img.fmt, KittyFmt::Rgba) {
+                    4
+                } else {
+                    3
+                };
+                let bytes = crop_pixels(&img.data, (iw, ih), (x, y, w, h), channels);
+                kitty_segment(bytes, img.fmt, Some((w, h)), lineage, place)
+            }
+            // The whole image passes through undecoded; a partial crop has to be
+            // decoded, cut and re-encoded, which the worker does off the screen
+            // thread (mirroring it UNCROPPED would paint over what the terminal
+            // clipped away — more than the local screen shows, which the mirror
+            // never does).
+            KittyFmt::Png if whole => {
+                kitty_segment(img.data.clone(), img.fmt, Some((w, h)), lineage, place)
+            }
+            KittyFmt::Png => Some(Segment::Deferred(DeferredImage {
+                payload: DeferredPayload::Cropped {
+                    bytes: img.data.clone(),
+                    crop: (x, y, w, h),
+                },
+                px: (w, h),
+                lineage,
+                place,
+            })),
+            KittyFmt::Unsupported => None,
+        }
+        .unwrap_or(Segment::Drop)
     }
 }
 
-/// Decode a completed kitty DIRECT transmission into an image segment, or `None`
-/// on any malformed/over-cap payload (the caller renders it as [`Segment::Drop`]).
-fn kitty_direct_image(acc: KittyAccum) -> Option<Segment> {
+/// Cut a `(x, y, w, h)` pixel rectangle out of a raw `channels`-byte-per-pixel
+/// framebuffer. A row-by-row copy; the whole-image case just clones.
+fn crop_pixels(
+    data: &[u8],
+    (iw, _ih): (u32, u32),
+    (x, y, w, h): (u32, u32, u32, u32),
+    channels: u8,
+) -> Vec<u8> {
+    let px = usize::from(channels);
+    let stride = iw as usize * px;
+    let row = w as usize * px;
+    let mut out = Vec::with_capacity(row * h as usize);
+    for line in 0..h as usize {
+        let start = (y as usize + line) * stride + x as usize * px;
+        match data.get(start..start + row) {
+            Some(slice) => out.extend_from_slice(slice),
+            // A short/truncated framebuffer: pad so the PNG encode still matches
+            // the declared dims instead of failing the whole placement.
+            None => out.resize(row * (line + 1), 0),
+        }
+    }
+    out
+}
+
+/// The bytes a completed kitty DIRECT transmission carries, after base64, the
+/// `S`/`O` window and `o=z` inflation — `None` on any malformed or over-cap
+/// payload (the caller renders that as [`Segment::Drop`]).
+fn kitty_payload(acc: &KittyAccum) -> Option<Vec<u8>> {
     if matches!(acc.fmt, KittyFmt::Unsupported) {
         return None;
     }
@@ -828,23 +1211,32 @@ fn kitty_direct_image(acc: KittyAccum) -> Option<Segment> {
     if bytes.len() as u64 > MAX_IMAGE_BYTES {
         return None;
     }
-    match acc.fmt {
+    Some(bytes)
+}
+
+/// Turn transmitted bytes into the segment that places them. `px` is required
+/// for a raw framebuffer (it has no header); `lineage` groups the decode with
+/// its predecessors (see [`DeferredImage::lineage`]).
+fn kitty_segment(
+    bytes: Vec<u8>,
+    fmt: KittyFmt,
+    px: Option<(u32, u32)>,
+    lineage: u64,
+    place: Placement,
+) -> Option<Segment> {
+    match fmt {
         // PNG passes through undecoded — cheap, stays inline.
         KittyFmt::Png => Some(Segment::Image(Image {
             mime: sniff_mime(&bytes)?.to_string(),
             px: dims(&bytes),
             bytes,
-            cells: acc.cells,
+            place,
         })),
         // Raw framebuffers need a PNG encode — deferred to the worker (dims come
         // from the transmission params, so the placement can be stamped immediately).
         KittyFmt::Rgba | KittyFmt::Rgb => {
-            let (w, h) = acc.px?;
-            let channels = if matches!(acc.fmt, KittyFmt::Rgba) {
-                4
-            } else {
-                3
-            };
+            let (w, h) = px?;
+            let channels = if matches!(fmt, KittyFmt::Rgba) { 4 } else { 3 };
             Some(Segment::Deferred(DeferredImage {
                 payload: DeferredPayload::Raw {
                     pixels: bytes,
@@ -852,8 +1244,9 @@ fn kitty_direct_image(acc: KittyAccum) -> Option<Segment> {
                     w,
                     h,
                 },
-                cells: acc.cells,
                 px: (w, h),
+                lineage,
+                place,
             }))
         }
         KittyFmt::Unsupported => None,
@@ -1081,8 +1474,9 @@ fn sixel_image(seq: &[u8]) -> Option<Segment> {
     if let Some(px) = sixel_raster_dims(seq) {
         return Some(Segment::Deferred(DeferredImage {
             payload: DeferredPayload::Sixel(seq.to_vec()),
-            cells: None,
             px,
+            lineage: 0,
+            place: Placement::default(),
         }));
     }
     let img = icy_sixel::SixelImage::decode(seq).ok()?;
@@ -1094,8 +1488,8 @@ fn sixel_image(seq: &[u8]) -> Option<Segment> {
     Some(Segment::Image(Image {
         mime: "image/png".to_string(),
         bytes: png,
-        cells: None,
         px: Some((w, h)),
+        place: Placement::default(),
     }))
 }
 
@@ -1159,7 +1553,10 @@ fn image_from_b64(base64: String, cells: Option<(u16, u16)>) -> Option<Image> {
         mime: mime.to_string(),
         px: dims(&bytes),
         bytes,
-        cells,
+        place: Placement {
+            cells,
+            ..Placement::default()
+        },
     })
 }
 
@@ -1257,6 +1654,7 @@ fn push_tee(out: &mut Vec<Step>, bytes: &[u8], seg: Segment) {
         Segment::Image(i) => Step::Image(bytes.to_vec(), i),
         Segment::Deferred(d) => Step::Deferred(bytes.to_vec(), d),
         Segment::Query(r) => Step::Query(bytes.to_vec(), r),
+        Segment::Delete(sel) => Step::Delete(bytes.to_vec(), sel),
         Segment::Drop => Step::TerminalOnly(bytes.to_vec()),
         Segment::Reject(r) => Step::Reject(r),
         // Transcode: the tee is the re-encoded bytes, NOT the original sixel.
@@ -1292,13 +1690,14 @@ mod tests {
                     Some(Image {
                         mime: "image/png".to_string(),
                         bytes,
-                        cells: d.cells,
                         px: Some(px),
+                        place: d.place,
                     })
                 }
                 Step::Passthrough(_)
                 | Step::TerminalOnly(_)
                 | Step::Query(_, _)
+                | Step::Delete(_, _)
                 | Step::Reject(_) => None,
             })
             .collect()
@@ -1386,7 +1785,7 @@ mod tests {
         let imgs = only_images(segs);
         assert_eq!(imgs.len(), 1);
         assert_eq!(imgs[0].mime, "image/png");
-        assert_eq!(imgs[0].cells, Some((4, 2)));
+        assert_eq!(imgs[0].place.cells, Some((4, 2)));
         assert_eq!(imgs[0].bytes, B64.decode(&b64).unwrap());
     }
 
@@ -1405,7 +1804,7 @@ mod tests {
         let imgs = only_images(end);
         assert_eq!(imgs.len(), 1);
         assert_eq!(imgs[0].mime, "image/png");
-        assert_eq!(imgs[0].cells, Some((4, 2)));
+        assert_eq!(imgs[0].place.cells, Some((4, 2)));
         assert_eq!(imgs[0].bytes, B64.decode(&b64).unwrap());
     }
 
@@ -1453,7 +1852,7 @@ mod tests {
         let (w, h) = imgs[0].px.unwrap();
         assert_eq!(w, 2);
         assert!(h >= 2);
-        assert_eq!(imgs[0].cells, None);
+        assert_eq!(imgs[0].place.cells, None);
     }
 
     fn sample_sixel() -> Vec<u8> {
@@ -1585,7 +1984,7 @@ mod tests {
         let imgs = only_images(segs);
         assert_eq!(imgs.len(), 1);
         assert_eq!(imgs[0].mime, "image/png");
-        assert_eq!(imgs[0].cells, Some((3, 1)));
+        assert_eq!(imgs[0].place.cells, Some((3, 1)));
     }
 
     #[test]
@@ -1757,6 +2156,230 @@ mod tests {
                 "non-display action rendered an image: {seq:?}"
             );
         }
+    }
+
+    /// A 4×4 RGBA framebuffer whose every pixel is `(x, y, 0, 255)`.
+    fn ramp_rgba() -> Vec<u8> {
+        (0..4u8)
+            .flat_map(|y| (0..4u8).flat_map(move |x| [x, y, 0, 255]))
+            .collect()
+    }
+
+    /// zellij's shape: transmit chunked with an id (nothing drawn yet), then
+    /// place it after positioning the cursor itself (`C=1`).
+    #[test]
+    fn kitty_transmit_then_place_mirrors_the_placement() {
+        let mut it = Interceptor::new();
+        let b64 = B64.encode(ramp_rgba());
+        let (head, tail) = b64.split_at(8);
+        let transmit = format!(
+            "\x1b_Ga=t,q=2,f=32,t=d,i=7,s=4,v=4,m=1;{head}\x1b\\\x1b_Gq=2,m=0;{tail}\x1b\\"
+        );
+        let steps = it.feed(transmit.as_bytes());
+        assert!(
+            only_images(steps.clone()).is_empty(),
+            "a transmit draws nothing"
+        );
+        assert_eq!(
+            tee_bytes(&steps),
+            transmit.as_bytes(),
+            "terminal sees it all"
+        );
+
+        let place = b"\x1b_Ga=p,q=2,i=7,p=1,x=0,y=0,w=4,h=4,X=0,Y=0,z=0,C=1\x1b\\";
+        let steps = it.feed(place);
+        assert_eq!(tee_bytes(&steps), place);
+        let images = only_images(steps);
+        assert_eq!(images.len(), 1, "the placement is mirrored");
+        assert_eq!(images[0].px, Some((4, 4)));
+        assert_eq!(
+            images[0].place.cells, None,
+            "footprint derives from the crop px"
+        );
+        assert!(images[0].place.hold, "C=1 keeps the cursor put");
+        assert_eq!(images[0].place.key, Some((7, 1)));
+    }
+
+    #[test]
+    fn kitty_place_cuts_out_the_source_rect() {
+        let mut it = Interceptor::new();
+        let transmit = format!(
+            "\x1b_Ga=t,f=32,t=d,i=7,s=4,v=4;{}\x1b\\",
+            B64.encode(ramp_rgba())
+        );
+        it.feed(transmit.as_bytes());
+        let steps = it.feed(b"\x1b_Ga=p,i=7,p=2,x=1,y=2,w=2,h=1,C=1\x1b\\");
+        let Some(Step::Deferred(_, d)) = steps.iter().find(|s| matches!(s, Step::Deferred(..)))
+        else {
+            panic!("expected a deferred crop, got {steps:?}");
+        };
+        assert_eq!(d.px, (2, 1));
+        assert_eq!(
+            d.payload,
+            DeferredPayload::Raw {
+                // row y=2, columns x=1..3
+                pixels: vec![1, 2, 0, 255, 2, 2, 0, 255],
+                channels: 4,
+                w: 2,
+                h: 1,
+            }
+        );
+    }
+
+    /// Distinct placements must not collapse into one decode lineage (the pty
+    /// worker supersedes within a lineage), while re-placing the same one does.
+    #[test]
+    fn kitty_placements_carry_distinct_lineages() {
+        let mut it = Interceptor::new();
+        it.feed(
+            format!(
+                "\x1b_Ga=t,f=32,t=d,i=7,s=4,v=4;{}\x1b\\",
+                B64.encode(ramp_rgba())
+            )
+            .as_bytes(),
+        );
+        let lineage = |it: &mut Interceptor, seq: &str| match it.feed(seq.as_bytes()).pop() {
+            Some(Step::Deferred(_, d)) => d.lineage,
+            other => panic!("expected a deferred placement, got {other:?}"),
+        };
+        let a = lineage(&mut it, "\x1b_Ga=p,i=7,p=1,C=1\x1b\\");
+        let b = lineage(&mut it, "\x1b_Ga=p,i=7,p=2,C=1\x1b\\");
+        let a_again = lineage(&mut it, "\x1b_Ga=p,i=7,p=1,C=1\x1b\\");
+        assert_ne!(a, b, "two placements are two images");
+        assert_eq!(a, a_again, "re-placing the same one supersedes it");
+    }
+
+    #[test]
+    fn kitty_delete_selects_placements_and_frees_the_store() {
+        let mut it = Interceptor::new();
+        it.feed(
+            format!(
+                "\x1b_Ga=t,f=32,t=d,i=7,s=4,v=4;{}\x1b\\",
+                B64.encode(ramp_rgba())
+            )
+            .as_bytes(),
+        );
+        let sel = |it: &mut Interceptor, seq: &str| match it.feed(seq.as_bytes()).pop() {
+            Some(Step::Delete(_, sel)) => Some(sel),
+            _ => None,
+        };
+        // Each selector kitty defines, in the shape `pty::revokes` matches on.
+        // (Cell coordinates are 1-based on the wire and 0-based here.)
+        assert_eq!(
+            sel(&mut it, "\x1b_Ga=d,d=i,i=7,p=3\x1b\\"),
+            Some(DeleteSel::Ids {
+                first: 7,
+                last: 7,
+                placement: Some(3)
+            })
+        );
+        assert_eq!(
+            sel(&mut it, "\x1b_Ga=d,d=i,i=7\x1b\\"),
+            Some(DeleteSel::Ids {
+                first: 7,
+                last: 7,
+                placement: None
+            })
+        );
+        assert_eq!(
+            sel(&mut it, "\x1b_Ga=d,d=r,x=3,y=9\x1b\\"),
+            Some(DeleteSel::Ids {
+                first: 3,
+                last: 9,
+                placement: None
+            })
+        );
+        assert_eq!(sel(&mut it, "\x1b_Ga=d,d=a\x1b\\"), Some(DeleteSel::All));
+        assert_eq!(sel(&mut it, "\x1b_Ga=d\x1b\\"), Some(DeleteSel::All));
+        assert_eq!(sel(&mut it, "\x1b_Ga=d,d=c\x1b\\"), Some(DeleteSel::Cursor));
+        assert_eq!(
+            sel(&mut it, "\x1b_Ga=d,d=q,x=4,y=2,z=-1\x1b\\"),
+            Some(DeleteSel::At {
+                col: Some(3),
+                row: Some(1),
+                z: Some(-1)
+            })
+        );
+        assert_eq!(
+            sel(&mut it, "\x1b_Ga=d,d=x,x=4\x1b\\"),
+            Some(DeleteSel::At {
+                col: Some(3),
+                row: None,
+                z: None
+            })
+        );
+        assert_eq!(
+            sel(&mut it, "\x1b_Ga=d,d=z,z=1\x1b\\"),
+            Some(DeleteSel::At {
+                col: None,
+                row: None,
+                z: Some(1)
+            })
+        );
+        // Animation frames revoke no placement, so they are not a delete here.
+        assert_eq!(sel(&mut it, "\x1b_Ga=d,d=f,i=7\x1b\\"), None);
+
+        // The lowercase forms keep the data placeable; `d=I` frees it.
+        assert_eq!(
+            only_images(it.feed(b"\x1b_Ga=p,i=7,p=9,C=1\x1b\\")).len(),
+            1
+        );
+        it.feed(b"\x1b_Ga=d,d=I,i=7\x1b\\");
+        assert!(only_images(it.feed(b"\x1b_Ga=p,i=7,p=9,C=1\x1b\\")).is_empty());
+    }
+
+    #[test]
+    fn kitty_place_of_an_unknown_id_shows_nothing() {
+        let mut it = Interceptor::new();
+        let place = b"\x1b_Ga=p,i=99,p=1,C=1\x1b\\";
+        let steps = it.feed(place);
+        assert!(only_images(steps.clone()).is_empty());
+        assert_eq!(tee_bytes(&steps), place, "the terminal still draws it");
+    }
+
+    /// An encoded image can be placed whole, but a partial crop would need a
+    /// decoder — and mirroring it uncropped would paint over what the terminal
+    /// clipped away. So it isn't mirrored at all.
+    #[test]
+    fn kitty_place_of_an_encoded_image_crops_through_a_decode() {
+        // A 4x4 RGBA ramp, transmitted ENCODED (f=100) rather than raw.
+        let png = encode_png(4, 4, 4, &ramp_rgba(), true).expect("encode");
+        let mut it = Interceptor::new();
+        it.feed(format!("\x1b_Ga=t,f=100,t=d,i=8;{}\x1b\\", B64.encode(&png)).as_bytes());
+
+        // The whole rect passes through undecoded — the stored bytes verbatim.
+        let whole = only_images(it.feed(b"\x1b_Ga=p,i=8,p=1,C=1\x1b\\"));
+        assert_eq!(whole.len(), 1);
+        assert_eq!(whole[0].bytes, png, "no re-encode for the whole image");
+
+        // A partial rect is decoded, cut and re-encoded — same pixels the raw
+        // path produces for the same crop.
+        let cut = only_images(it.feed(b"\x1b_Ga=p,i=8,p=2,x=1,y=2,w=2,h=1,C=1\x1b\\"));
+        assert_eq!(cut.len(), 1);
+        assert_eq!(cut[0].px, Some((2, 1)));
+        let (pixels, channels, w, h) = decode_png(&cut[0].bytes).expect("decode the crop");
+        assert_eq!((channels, w, h), (4, 2, 1));
+        assert_eq!(pixels, vec![1, 2, 0, 255, 2, 2, 0, 255]);
+
+        // A degenerate rect places nothing at all.
+        assert!(
+            only_images(it.feed(b"\x1b_Ga=p,i=8,p=3,x=0,y=0,w=1,h=0,C=1\x1b\\")).is_empty(),
+            "an empty rect is not mirrored"
+        );
+    }
+
+    /// The refactor that added the store must not have opened the file/shm hole:
+    /// a transmit-only over an indirect medium is still refused.
+    #[test]
+    fn kitty_transmit_over_file_medium_is_still_rejected() {
+        let mut it = Interceptor::new();
+        let steps = it.feed(b"\x1b_Ga=t,f=100,t=f,i=5;L3RtcC94\x1b\\");
+        assert!(matches!(steps.as_slice(), [Step::Reject(_)]));
+        assert!(tee_bytes(&steps).is_empty(), "suppressed from the terminal");
+        assert!(
+            only_images(it.feed(b"\x1b_Ga=p,i=5,p=1,C=1\x1b\\")).is_empty(),
+            "nothing was stored to place"
+        );
     }
 
     #[test]
@@ -1951,12 +2574,12 @@ mod tests {
         let s = format!("\x1b]1337;File=inline=1;width=0;height=0:{b64}\x07");
         let imgs = only_images(it.feed(s.as_bytes()));
         assert_eq!(imgs.len(), 1);
-        assert_eq!(imgs[0].cells, None, "zero hint ⇒ natural size");
+        assert_eq!(imgs[0].place.cells, None, "zero hint ⇒ natural size");
         let mut it = Interceptor::new();
         let s = format!("\x1b_Ga=T,f=100,t=d,c=0,r=0;{b64}\x1b\\");
         let imgs = only_images(it.feed(s.as_bytes()));
         assert_eq!(imgs.len(), 1);
-        assert_eq!(imgs[0].cells, None);
+        assert_eq!(imgs[0].place.cells, None);
     }
 
     #[test]

@@ -62,6 +62,21 @@ pub enum MouseProtocolEncoding {
     SgrPixels,
 }
 
+/// shellglass: how [`Screen::place_data_with`] stamps a region. The default
+/// (both `false`) is [`Screen::place_data`]'s sixel behaviour.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
+pub struct PlaceOpts {
+    /// Don't move the cursor and never scroll: the region is stamped downwards
+    /// from the cursor row and clipped at the last one. kitty's `C=1` on `a=p`,
+    /// which zellij emits after positioning the cursor itself.
+    pub hold: bool,
+    /// The stamped slots survive text written into their cells, dying only on
+    /// erase (or when the row scrolls out of the grid) — kitty's placement
+    /// lifetime. Without it a repaint of the covered cells silently drops the
+    /// placement, while the terminal still shows the image.
+    pub sticky: bool,
+}
+
 /// Represents the overall terminal state.
 ///
 /// shellglass: generic over the per-cell data slot `T` (default `()` — see
@@ -631,31 +646,57 @@ impl<T> Screen<T> {
     /// or erased — mirroring a cell-based sixel terminal's own erase
     /// semantics. Cell text and attributes are untouched (overlays draw
     /// *over* cells). A too-wide region is clipped at the right edge.
+    ///
+    /// See [`place_data_with`](Self::place_data_with) for the placements that
+    /// need other cursor or lifetime semantics.
     pub fn place_data(
         &mut self,
         width: u16,
         height: u16,
+        data: impl FnMut(u16, u16) -> T,
+    ) {
+        self.place_data_with(width, height, PlaceOpts::default(), data);
+    }
+
+    /// shellglass: [`place_data`](Self::place_data) with the two knobs a
+    /// graphics protocol richer than sixel needs — see [`PlaceOpts`].
+    pub fn place_data_with(
+        &mut self,
+        width: u16,
+        height: u16,
+        opts: PlaceOpts,
         mut data: impl FnMut(u16, u16) -> T,
     ) {
-        let cols = self.grid().size().cols;
-        let left = self.grid().pos().col.min(cols - 1);
-        let width = width.clamp(1, cols - left);
+        let PlaceOpts { hold, sticky } = opts;
+        let size = self.grid().size();
+        let left = self.grid().pos().col.min(size.cols - 1);
+        let width = width.clamp(1, size.cols - left);
+        let top = self.grid().pos().row;
         for row_off in 0..height.max(1) {
-            if row_off > 0 {
-                self.grid_mut().row_inc_scroll(1);
-            }
-            let row = self.grid().pos().row;
+            let row = if hold {
+                match top.checked_add(row_off) {
+                    Some(row) if row < size.rows => row,
+                    _ => break, // clipped at the bottom, never scrolled
+                }
+            } else {
+                if row_off > 0 {
+                    self.grid_mut().row_inc_scroll(1);
+                }
+                self.grid().pos().row
+            };
             for col_off in 0..width {
                 let pos = crate::grid::Pos {
                     row,
                     col: left + col_off,
                 };
                 if let Some(cell) = self.grid_mut().drawing_cell_mut(pos) {
-                    cell.set_data(Some(data(row_off, col_off)));
+                    cell.set_data(Some(data(row_off, col_off)), sticky);
                 }
             }
         }
-        self.grid_mut().col_set(0);
+        if !hold {
+            self.grid_mut().col_set(0);
+        }
     }
 
     /// Returns whether the text in row `row` should wrap to the next line.

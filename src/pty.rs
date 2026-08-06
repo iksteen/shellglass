@@ -327,34 +327,54 @@ pub fn start(command: &[String], sixel_compat: bool) -> Result<SourceSession> {
     Ok(SourceSession::new(frame_rx, Arc::new(Notifier(msg_tx))))
 }
 
-/// Start the shared newest-wins deferred image worker. Owners provide only the
-/// wake-up callback that routes the ready payload into their own event loop.
+/// One deferred decode: the image's *lineage* (see [`image_worker`]), the
+/// placement to fill, and the payload to decode.
+pub(crate) type ImageJob = (u64, std::num::NonZeroU32, crate::images::DeferredPayload);
+
+/// Start the shared deferred image worker. Owners provide only the wake-up
+/// callback that routes the ready payload into their own event loop.
+///
+/// Newest-wins is per LINEAGE, not global: a queued job is superseded only by a
+/// later job with the same lineage (a video's successive frames at the cursor,
+/// lineage 0), so a burst of placements of *different* images all get decoded.
+/// A globally-newest-wins drain would silently drop all but the last, leaving
+/// those placements pending — and a pending placement never reaches a frame.
 pub(crate) fn image_worker(
     notify: impl Fn(ImageReady) -> bool + Send + 'static,
-) -> mpsc::Sender<(std::num::NonZeroU32, crate::images::DeferredPayload)> {
-    let (job_tx, job_rx) =
-        mpsc::channel::<(std::num::NonZeroU32, crate::images::DeferredPayload)>();
+) -> mpsc::Sender<ImageJob> {
+    let (job_tx, job_rx) = mpsc::channel::<ImageJob>();
     std::thread::spawn(move || {
-        while let Ok(mut job) = job_rx.recv() {
+        while let Ok(job) = job_rx.recv() {
+            let mut jobs = vec![job];
             let mut superseded = false;
-            while let Ok(newer) = job_rx.try_recv() {
-                job = newer;
-                superseded = true;
+            while let Ok(next) = job_rx.try_recv() {
+                match jobs.iter_mut().find(|queued| queued.0 == next.0) {
+                    Some(queued) => {
+                        *queued = next;
+                        superseded = true;
+                    }
+                    None => jobs.push(next),
+                }
             }
-            let Some((png, _px)) = crate::images::finish_deferred(&job.1, superseded) else {
-                continue;
-            };
-            let mime = "image/png".to_string();
-            let hash = crate::proto::content_key(&mime, &png);
-            if !notify(ImageReady {
-                id: job.0,
-                hash,
-                blob: crate::model::ImageBlob {
-                    mime,
-                    bytes: png.into(),
-                },
-            }) {
-                break;
+            // Backpressure: a backlog (superseded frames, or several images
+            // waiting) buys size with the cheap deflate level.
+            let fast = superseded || jobs.len() > 1;
+            for (_, id, payload) in jobs {
+                let Some((png, _px)) = crate::images::finish_deferred(&payload, fast) else {
+                    continue;
+                };
+                let mime = "image/png".to_string();
+                let hash = crate::proto::content_key(&mime, &png);
+                if !notify(ImageReady {
+                    id,
+                    hash,
+                    blob: crate::model::ImageBlob {
+                        mime,
+                        bytes: png.into(),
+                    },
+                }) {
+                    return;
+                }
             }
         }
     });
@@ -675,6 +695,26 @@ struct Placed {
     /// pending until vt100's cell lifetime evicts it — the "skip stale
     /// frames" half of the worker's newest-wins queue.
     ready: Option<(String, crate::model::ImageBlob)>,
+    /// The emitter's `(image id, placement id)`, when it names its placements
+    /// (kitty `a=p`) — the handle its `a=d` revokes this by. Cell tags cover
+    /// the erase-by-repaint half of an image's life; this covers the half where
+    /// the emitter drops an image without touching the cells.
+    key: Option<(u32, u32)>,
+    /// Stacking order the emitter stated, straight onto the wire (see
+    /// [`crate::model::ImagePlacement::z`]).
+    z: Option<i32>,
+    /// Sub-cell offset in cells (see [`crate::model::ImagePlacement::x_off`]).
+    off: (f32, f32),
+}
+
+/// What the producer says about one placement (see
+/// [`images::Placement`](crate::images::Placement)) plus what the mirror needs
+/// to serve it.
+struct Place {
+    place: crate::images::Placement,
+    px: Option<(u32, u32)>,
+    /// The payload when already decoded, `None` while the worker owes it.
+    ready: Option<(String, crate::model::ImageBlob)>,
 }
 
 /// Stamp an image at the cursor and start tracking it. Per-cell tags go into
@@ -686,17 +726,23 @@ struct Placed {
 /// The cell size comes from the app's hint, else from pixel size ÷ cell size
 /// (so a natural-size image still advances the cursor); placement leaves the
 /// cursor at col 0 of the image's last row, where a sixel-scrolling terminal
-/// leaves it. `ready` is the payload when already decoded, `None` while the
-/// worker owes it.
+/// leaves it (unless the placement holds it, see [`Place::hold`]).
 fn stamp_image(
     parser: &mut SgParser,
     images: &mut Vec<Placed>,
     image_seq: &mut std::num::NonZeroU32,
     cell: (u16, u16),
-    cells: Option<(u16, u16)>,
-    px: Option<(u32, u32)>,
-    ready: Option<(String, crate::model::ImageBlob)>,
+    place: Place,
 ) -> std::num::NonZeroU32 {
+    let Place { place, px, ready } = place;
+    let crate::images::Placement {
+        cells,
+        hold,
+        sticky,
+        key,
+        z,
+        off_px,
+    } = place;
     let (row, col) = parser.screen().cursor_position();
     // Display size in cells. An app-specified footprint is exact; a derived one
     // is the TRUE fractional extent (pixels ÷ cell size, NOT rounded up) so the
@@ -724,13 +770,23 @@ fn stamp_image(
     *image_seq = image_seq
         .checked_add(1)
         .unwrap_or(std::num::NonZeroU32::MIN);
+    let tag = |row_off, col_off| ImgCell {
+        id,
+        row_off,
+        col_off,
+    };
     parser
         .screen_mut()
-        .place_data(fw, fh, |row_off, col_off| ImgCell {
-            id,
-            row_off,
-            col_off,
-        });
+        .place_data_with(fw, fh, vt100::PlaceOpts { hold, sticky }, tag);
+    // A named placement is an IDENTITY, not an event: re-placing the same
+    // `(image id, placement id)` moves that one placement, it doesn't add a
+    // second. An emitter moving an image re-places it with the same ids and no
+    // delete (zellij does this every time a floating pane moves), so keeping the
+    // predecessor would smear a copy across the old cells until something
+    // erased them. Sticky tags made that visible; they don't die on a repaint.
+    if key.is_some() {
+        images.retain(|p| p.key != key);
+    }
     images.push(Placed {
         id,
         row: i16::try_from(row).unwrap_or(0),
@@ -738,8 +794,54 @@ fn stamp_image(
         cols,
         rows,
         ready,
+        key,
+        z,
+        // Sub-cell offsets travel as cell fractions, same reason the display
+        // size does: the viewer's cell is its own size, not the terminal's.
+        off: (
+            f32::from(off_px.0) / f32::from(cell.0),
+            f32::from(off_px.1) / f32::from(cell.1),
+        ),
     });
     id
+}
+
+/// Does this `a=d` selector revoke `p`? Only a KEYED placement (one the emitter
+/// named, i.e. kitty) can be revoked — nothing else has an emitter that could.
+/// The geometry forms match against the placement's current rect, so they are
+/// resolved here rather than in the parser, which sees no grid.
+fn revokes(sel: &crate::images::DeleteSel, p: &Placed, cursor: (u16, u16)) -> bool {
+    use crate::images::DeleteSel;
+    let Some((image, placement)) = p.key else {
+        return false;
+    };
+    // The tagged footprint: the ceil of the fractional display extent, exactly
+    // what `stamp_image` handed the parser.
+    let extent = |v: Option<f32>| (v.map_or(1.0, f32::ceil) as i32).max(1);
+    let in_row = |r: u16| {
+        let (r, top) = (i32::from(r), i32::from(p.row));
+        r >= top && r < top + extent(p.rows)
+    };
+    let in_col = |c: u16| {
+        let (c, left) = (i32::from(c), i32::from(p.col));
+        c >= left && c < left + extent(p.cols)
+    };
+    match *sel {
+        DeleteSel::All => true,
+        DeleteSel::Ids {
+            first,
+            last,
+            placement: want,
+        } => (first..=last).contains(&image) && want.is_none_or(|want| want == placement),
+        DeleteSel::Cursor => in_row(cursor.0) && in_col(cursor.1),
+        DeleteSel::At { col, row, z } => {
+            z.is_none_or(|want| p.z == Some(want))
+                && col.is_none_or(in_col)
+                && row.is_none_or(in_row)
+                // `d=z` with no z at all selects nothing rather than everything.
+                && (col.is_some() || row.is_some() || z.is_some())
+        }
+    }
 }
 
 /// Snapshot the PTY screen as a [`Frame`], resolving each tracked image's tagged
@@ -885,7 +987,7 @@ pub(crate) struct ScreenState {
     interceptor: Interceptor,
     cell: (u16, u16),
     image_seq: std::num::NonZeroU32,
-    image_jobs: mpsc::Sender<(std::num::NonZeroU32, crate::images::DeferredPayload)>,
+    image_jobs: mpsc::Sender<ImageJob>,
     primary_da: PrimaryDaQueries,
     profile_known: bool,
     effective_sixel: bool,
@@ -909,7 +1011,7 @@ impl ScreenState {
         caps: Caps,
         cell: (u16, u16),
         transcode: Option<crate::images::GfxProto>,
-        image_jobs: mpsc::Sender<(std::num::NonZeroU32, crate::images::DeferredPayload)>,
+        image_jobs: mpsc::Sender<ImageJob>,
         profile_known: bool,
     ) -> ScreenState {
         ScreenState {
@@ -942,11 +1044,7 @@ impl ScreenState {
     /// A fresh screen at `rows`×`cols` with default caps — the detachable owner,
     /// which probes no terminal.
     #[cfg(all(feature = "push", unix))]
-    pub(crate) fn new(
-        rows: u16,
-        cols: u16,
-        image_jobs: mpsc::Sender<(std::num::NonZeroU32, crate::images::DeferredPayload)>,
-    ) -> ScreenState {
+    pub(crate) fn new(rows: u16, cols: u16, image_jobs: mpsc::Sender<ImageJob>) -> ScreenState {
         Self::with_parser(
             new_parser(rows, cols),
             Caps::default(),
@@ -1011,9 +1109,11 @@ impl ScreenState {
                         &mut self.images,
                         &mut seq,
                         self.cell,
-                        img.cells,
-                        img.px,
-                        ready,
+                        Place {
+                            place: img.place,
+                            px: img.px,
+                            ready,
+                        },
                     );
                     self.image_seq = seq;
                     let _ = id;
@@ -1026,13 +1126,23 @@ impl ScreenState {
                         &mut self.images,
                         &mut seq,
                         self.cell,
-                        d.cells,
-                        Some(d.px),
-                        None,
+                        Place {
+                            place: d.place,
+                            px: Some(d.px),
+                            ready: None,
+                        },
                     );
                     self.image_seq = seq;
-                    let _ = self.image_jobs.send((id, d.payload));
+                    let _ = self.image_jobs.send((d.lineage, id, d.payload));
                     self.dirty = true;
+                }
+                // The emitter dropped these itself; the mirror must not keep
+                // showing what the local screen no longer does.
+                Step::Delete(_, sel) => {
+                    let cursor = self.parser.screen().cursor_position();
+                    let before = self.images.len();
+                    self.images.retain(|p| !revokes(&sel, p, cursor));
+                    self.dirty |= self.images.len() != before;
                 }
                 Step::Query(_, response) => out.queries.extend_from_slice(&response),
                 Step::Reject(response) => out.app.extend_from_slice(&response),
@@ -1226,6 +1336,9 @@ fn resolve_images(
                         cols: None,
                         rows: None,
                         ready: None,
+                        key: None,
+                        z: None,
+                        off: (0.0, 0.0),
                     },
                 ));
                 return false; // every covered cell gone → evict
@@ -1264,6 +1377,9 @@ fn resolve_images(
                 col: p.col,
                 cols: p.cols,
                 rows: p.rows,
+                x_off: (p.off.0 != 0.0).then_some(p.off.0),
+                y_off: (p.off.1 != 0.0).then_some(p.off.1),
+                z: p.z,
                 hash: hash.clone(),
             })
         })
@@ -1894,6 +2010,232 @@ mod tests {
         }
     }
 
+    /// The transfer-then-place round trip through the screen state: a placement
+    /// holds the cursor where the emitter put it, and the emitter's `a=d`
+    /// revokes exactly the placement it names — the mirror must not keep showing
+    /// an image the local terminal has dropped.
+    #[test]
+    fn kitty_placements_hold_the_cursor_and_a_delete_revokes_one() {
+        let (job_tx, _job_rx) = mpsc::channel();
+        let caps = Caps {
+            kitty: true,
+            ..Caps::default()
+        };
+        let mut screen =
+            ScreenState::with_parser(new_parser(24, 80), caps, (10, 20), None, job_tx, true);
+        // 2x2 RGBA transmitted as image 7, then placed twice at chosen cells.
+        let payload =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0u8; 2 * 2 * 4]);
+        screen.feed_output(format!("\x1b_Ga=t,f=32,t=d,i=7,s=2,v=2;{payload}\x1b\\").as_bytes());
+        assert!(screen.images.is_empty(), "a transmit places nothing");
+
+        screen.feed_output(b"\x1b[3;5H\x1b_Ga=p,i=7,p=1,C=1\x1b\\");
+        assert_eq!(
+            screen.parser.screen().cursor_position(),
+            (2, 4),
+            "C=1 holds"
+        );
+        screen.feed_output(b"\x1b[6;1H\x1b_Ga=p,i=7,p=2,C=1\x1b\\");
+        assert_eq!(screen.images.len(), 2);
+        assert_eq!(screen.images[0].key, Some((7, 1)));
+
+        screen.feed_output(b"\x1b_Ga=d,d=i,i=7,p=1\x1b\\");
+        assert_eq!(
+            screen.images.iter().map(|p| p.key).collect::<Vec<_>>(),
+            vec![Some((7, 2))],
+            "only the named placement is revoked"
+        );
+        screen.feed_output(b"\x1b_Ga=d,d=A,i=7\x1b\\");
+        assert!(screen.images.is_empty(), "delete-all revokes the rest");
+    }
+
+    /// The geometry `a=d` selectors resolve against the placement's rect and the
+    /// cursor — kitty's `d=c`, `d=p`/`q`, `d=x`/`y` and `d=z`.
+    #[test]
+    fn geometry_deletes_match_the_placement_rect() {
+        use crate::images::DeleteSel;
+        // A 2x2-cell placement of image 7 at row 3, col 5, stacked at z = 2.
+        let p = Placed {
+            id: std::num::NonZeroU32::MIN,
+            row: 3,
+            col: 5,
+            cols: Some(1.5),
+            rows: Some(2.0),
+            ready: None,
+            key: Some((7, 1)),
+            z: Some(2),
+            off: (0.0, 0.0),
+        };
+        let at = |col, row, z| DeleteSel::At { col, row, z };
+        assert!(revokes(&DeleteSel::All, &p, (0, 0)));
+        assert!(revokes(&DeleteSel::Cursor, &p, (4, 6)), "inside the rect");
+        assert!(!revokes(&DeleteSel::Cursor, &p, (5, 6)), "row below");
+        assert!(!revokes(&DeleteSel::Cursor, &p, (3, 7)), "column right");
+        assert!(revokes(&at(Some(5), Some(3), None), &p, (0, 0)));
+        assert!(!revokes(&at(Some(5), Some(9), None), &p, (0, 0)));
+        assert!(revokes(&at(Some(6), None, None), &p, (0, 0)), "column only");
+        assert!(revokes(&at(None, Some(4), None), &p, (0, 0)), "row only");
+        assert!(revokes(&at(None, None, Some(2)), &p, (0, 0)), "z only");
+        assert!(!revokes(&at(None, None, Some(3)), &p, (0, 0)));
+        assert!(
+            !revokes(&at(Some(5), Some(3), Some(3)), &p, (0, 0)),
+            "z wins"
+        );
+        assert!(revokes(
+            &DeleteSel::Ids {
+                first: 5,
+                last: 9,
+                placement: None
+            },
+            &p,
+            (0, 0)
+        ));
+        assert!(!revokes(
+            &DeleteSel::Ids {
+                first: 7,
+                last: 7,
+                placement: Some(2)
+            },
+            &p,
+            (0, 0)
+        ));
+        // A placement the emitter never named can't be revoked by any of them.
+        let anon = Placed { key: None, ..p };
+        assert!(!revokes(&DeleteSel::All, &anon, (4, 6)));
+    }
+
+    /// kitty's `X`/`Y` place the image inside its cell (how an emitter tiles one
+    /// image across several placements without seams) and `z` stacks it. Both
+    /// reach the frame — the offsets as cell fractions, like every other pixel
+    /// dimension, because the viewer's cell is its own size.
+    #[test]
+    fn kitty_placement_carries_its_offsets_and_z() {
+        let (job_tx, _job_rx) = mpsc::channel();
+        let caps = Caps {
+            kitty: true,
+            ..Caps::default()
+        };
+        let mut screen =
+            ScreenState::with_parser(new_parser(24, 80), caps, (10, 20), None, job_tx, true);
+        let payload =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0u8; 2 * 2 * 4]);
+        screen.feed_output(format!("\x1b_Ga=t,f=32,t=d,i=7,s=2,v=2;{payload}\x1b\\").as_bytes());
+        screen.feed_output(b"\x1b[1;1H\x1b_Ga=p,i=7,p=1,X=5,Y=15,z=-3,C=1\x1b\\");
+        let p = &screen.images[0];
+        assert_eq!(p.z, Some(-3));
+        assert_eq!(p.off, (0.5, 0.75), "5/10 of a cell across, 15/20 down");
+
+        // No X/Y/z at all leaves the placement cell-aligned and unstacked.
+        screen.feed_output(b"\x1b[5;1H\x1b_Ga=p,i=7,p=2,C=1\x1b\\");
+        let p = &screen.images[1];
+        assert_eq!((p.z, p.off), (None, (0.0, 0.0)));
+    }
+
+    /// Re-placing the same `(image id, placement id)` MOVES that placement.
+    /// zellij re-places without deleting whenever a floating pane moves, so a
+    /// mirror that appended instead would leave a copy behind at every step.
+    #[test]
+    fn re_placing_the_same_ids_moves_the_placement() {
+        let (job_tx, _job_rx) = mpsc::channel();
+        let caps = Caps {
+            kitty: true,
+            ..Caps::default()
+        };
+        let mut screen =
+            ScreenState::with_parser(new_parser(24, 80), caps, (10, 20), None, job_tx, true);
+        let payload =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0u8; 2 * 2 * 4]);
+        screen.feed_output(format!("\x1b_Ga=t,f=32,t=d,i=7,s=2,v=2;{payload}\x1b\\").as_bytes());
+        screen.feed_output(b"\x1b[3;5H\x1b_Ga=p,i=7,p=1,C=1\x1b\\");
+        screen.feed_output(b"\x1b[9;9H\x1b_Ga=p,i=7,p=1,C=1\x1b\\");
+        assert_eq!(screen.images.len(), 1, "one placement, moved");
+        assert_eq!((screen.images[0].row, screen.images[0].col), (8, 8));
+
+        // A different placement id is a different placement, even of the same
+        // image — that is how an emitter tiles one image across a pane.
+        screen.feed_output(b"\x1b[1;1H\x1b_Ga=p,i=7,p=2,C=1\x1b\\");
+        assert_eq!(screen.images.len(), 2);
+
+        // And the moved-away cells hold nothing: resolving finds one rect.
+        let mut zombies = Vec::new();
+        resolve_images(screen.parser.screen(), &mut screen.images, &mut zombies);
+        let rows: Vec<i16> = screen.images.iter().map(|p| p.row).collect();
+        assert_eq!(rows, vec![8, 0]);
+    }
+
+    /// kitty keeps a placement until it is deleted: text printed over the image
+    /// leaves it alone (unlike a sixel, which the print erases). zellij repaints
+    /// its pane text constantly, so without this the mirror lost images the
+    /// terminal still showed — wholly, or in the chunks that got repainted.
+    #[test]
+    fn kitty_placements_outlive_a_repaint_of_their_cells() {
+        let (job_tx, _job_rx) = mpsc::channel();
+        let caps = Caps {
+            kitty: true,
+            ..Caps::default()
+        };
+        let mut screen =
+            ScreenState::with_parser(new_parser(24, 80), caps, (10, 20), None, job_tx, true);
+        let payload =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0u8; 2 * 2 * 4]);
+        screen.feed_output(format!("\x1b_Ga=t,f=32,t=d,i=7,s=2,v=2;{payload}\x1b\\").as_bytes());
+        screen.feed_output(b"\x1b[3;5H\x1b_Ga=p,i=7,p=1,C=1\x1b\\");
+        assert_eq!(screen.images.len(), 1);
+
+        // The emitter repaints the very cells the image covers.
+        screen.feed_output(b"\x1b[3;5Hxx\x1b[4;5Hxx");
+        let mut zombies = Vec::new();
+        // (the decode is still owed, so the placement is tracked but not yet
+        // emitted — its survival is what this asserts)
+        resolve_images(screen.parser.screen(), &mut screen.images, &mut zombies);
+        assert_eq!(screen.images.len(), 1, "a repaint doesn't revoke it");
+        assert_eq!(
+            (screen.images[0].row, screen.images[0].col),
+            (2, 4),
+            "still resolves at its cell"
+        );
+
+        // Erasing those cells does drop it — kitty's other half.
+        screen.feed_output(b"\x1b[2J");
+        resolve_images(screen.parser.screen(), &mut screen.images, &mut zombies);
+        assert!(screen.images.is_empty(), "an erase revokes it");
+    }
+
+    /// A burst of placements of DIFFERENT images must all be decoded — dropping
+    /// the older ones would leave those placements pending, and a pending
+    /// placement never reaches a frame. Same-lineage jobs may collapse (that is
+    /// the point), so this only asserts every lineage is answered.
+    #[test]
+    fn deferred_jobs_of_distinct_lineages_all_complete() {
+        let (done_tx, done_rx) = mpsc::channel();
+        let jobs = image_worker(move |ready| done_tx.send(ready.id).is_ok());
+        let raw = |lineage: u64, id: u32| {
+            (
+                lineage,
+                std::num::NonZeroU32::new(id).unwrap(),
+                crate::images::DeferredPayload::Raw {
+                    pixels: vec![0u8; 4],
+                    channels: 4,
+                    w: 1,
+                    h: 1,
+                },
+            )
+        };
+        for id in 1..=4u32 {
+            jobs.send(raw(u64::from(id), id)).unwrap();
+        }
+        let mut seen: Vec<u32> = (0..4)
+            .map(|_| {
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("every lineage answered")
+            })
+            .map(std::num::NonZeroU32::get)
+            .collect();
+        seen.sort_unstable();
+        assert_eq!(seen, vec![1, 2, 3, 4]);
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_raw_mode_keeps_quick_edit_until_mouse_reporting() {
@@ -2192,10 +2534,13 @@ mod tests {
             &mut parser,
             &mut images,
             &mut seq,
-            (9, 21),          // cell px
-            None,             // no app-specified cells → derive from px
-            Some((400, 402)), // image px
-            None,
+            (9, 21), // cell px
+            Place {
+                // no app-specified cells → derive from px
+                place: crate::images::Placement::default(),
+                px: Some((400, 402)), // image px
+                ready: None,
+            },
         );
         let p = &images[0];
         assert!(
@@ -2250,6 +2595,9 @@ mod tests {
                     bytes: bytes::Bytes::new(),
                 },
             )),
+            key: None,
+            z: None,
+            off: (0.0, 0.0),
         }]
     }
 
@@ -2327,6 +2675,9 @@ mod tests {
             cols: Some(4.0),
             rows: Some(2.0),
             ready: None,
+            key: None,
+            z: None,
+            off: (0.0, 0.0),
         });
 
         // N's cells are gone, but N keeps showing (zombie) while N+1 pends.

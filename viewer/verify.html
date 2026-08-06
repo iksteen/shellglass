@@ -131,7 +131,7 @@ if (MODE === "image") {
     const noInline = [...img.style].every((p) => p.startsWith("--sg-"));
     // and the page must still lay it out (through the injected rules)
     const cs = getComputedStyle(img);
-    const laidOut = cs.position === "absolute" && cs.objectFit === "contain";
+    const laidOut = cs.position === "absolute" && cs.objectFit === "fill";
     // copy semantics: the image sits in document order between the rows it
     // spans (so a selection over them carries it), and the copied fragment's
     // src is the EMBEDDED bitmap, not the session-relative URL
@@ -151,6 +151,144 @@ if (MODE === "image") {
       + (imgPx[0] > 180 && imgPx[1] < 60 ? 32 : 0)
       + (txtPx[0] < 60 && txtPx[1] < 60 && txtPx[2] < 60 ? 64 : 0);
     document.body.style.background = pass ? "#00ff00" : `rgb(255, 0, ${bits})`;
+    document.title = "verified-ready";
+  });
+}
+
+// ?mode=imagez: stacking-order self-check. A placement that states its z
+// (kitty's `z=`, which zellij sends on every placement) paints by that order:
+// z >= 0 goes OVER the text (a written cell no longer punches its bg through),
+// z < 0 stays under it like the legacy z-less painting. Two images, one of
+// each, over identical text rows. Green/red convention.
+if (MODE === "imagez") {
+  const d4 = [];
+  for (let i = 0; i < ROWS; i++) d4.push([[pad(i === 2 || i === 8 ? "    OVERWRITE" : "")]]);
+  apply({ d: d4, w: COLS, h: ROWS,
+          i: [{ r: 1, c: 2, w: 10, h: 4, z: 1, k: "ab".repeat(32) },
+              { r: 7, c: 2, w: 10, h: 4, z: -1, k: "ab".repeat(32) }] });
+  benchFlush();
+  const imgs = [...document.querySelectorAll("img.inline-img")];
+  const swapped = () => Promise.all(imgs.map((img) => new Promise((res) => {
+    const check = () => { if (img.src.startsWith("data:") && img.complete) res(null); };
+    img.addEventListener("load", check);
+    check();
+  })));
+  swapped().then(() => {
+    benchRedraw();
+    const scr = document.querySelector("#screen .screen");
+    const canvas = document.querySelector("#screen canvas");
+    const g = canvas.getContext("2d");
+    const cw = (scr.getBoundingClientRect().width / COLS) * devicePixelRatio;
+    const lh = 17 * devicePixelRatio;
+    const px = (x, y) => g.getImageData(Math.round(x), Math.round(y), 1, 1).data;
+    // Same spot on each: the corner of a written cell the image covers.
+    const overPx = px(5 * cw + 1, 2 * lh + 1); // z=1 → image wins
+    const underPx = px(5 * cw + 1, 8 * lh + 1); // z=-1 → text cell's bg wins
+    const over = overPx[0] > 180 && overPx[1] < 60;
+    const under = underPx[0] < 60 && underPx[1] < 60 && underPx[2] < 60;
+    document.getElementById("screen").style.display = "none";
+    const bits = (over ? 1 : 0) + (under ? 2 : 0);
+    document.body.style.background = over && under ? "#00ff00" : `rgb(255, 0, ${bits})`;
+    document.title = "verified-ready";
+  });
+}
+
+// ?mode=imagetile: one picture split across two adjacent placements — what an
+// emitter does when something (a floating pane) clips part of it. The tiles
+// must MEET: each placement fills the cell box it was given, so no seam of
+// background appears between them however tall the first one is. Green/red.
+if (MODE === "imagetile") {
+  const blank = [];
+  for (let i = 0; i < ROWS; i++) blank.push([[pad("")]]);
+  // Rows 1-6 and 7-9, back to back. The second pair tiles HORIZONTALLY across
+  // a fractional boundary (a sub-cell offset), where cell columns are not whole
+  // device pixels — the case that antialiases into a hairline.
+  apply({ d: blank, w: COLS, h: ROWS,
+          i: [{ r: 1, c: 2, w: 8, h: 6, k: "ab".repeat(32) },
+              { r: 7, c: 2, w: 8, h: 3, k: "ab".repeat(32) },
+              { r: 12, c: 2, w: 5.13, h: 3, k: "ab".repeat(32) },
+              { r: 12, c: 7, x: 0.13, w: 5.5, h: 3, k: "ab".repeat(32) }] });
+  benchFlush();
+  const imgs = [...document.querySelectorAll("img.inline-img")];
+  const swapped = () => Promise.all(imgs.map((img) => new Promise((res) => {
+    const check = () => { if (img.complete && img.naturalWidth) res(null); };
+    img.addEventListener("load", check);
+    check();
+  })));
+  swapped().then(() => {
+    benchRedraw();
+    const scr = document.querySelector("#screen .screen");
+    const canvas = document.querySelector("#screen canvas");
+    const g = canvas.getContext("2d");
+    const cw = (scr.getBoundingClientRect().width / COLS) * devicePixelRatio;
+    const lh = 17 * devicePixelRatio;
+    const px = (x, y) => g.getImageData(Math.round(x), Math.round(y), 1, 1).data;
+    // Scan EVERY device pixel row across the seam — a hairline crack is one
+    // row of background between the tiles, which a coarser sample walks past.
+    let red = true;
+    for (let y = Math.round(2 * lh); y < Math.round(9 * lh); y++) {
+      const p = px(3.5 * cw, y);
+      if (!(p[0] > 180 && p[1] < 60)) red = false;
+    }
+    // ...and the last row of the second tile is still covered (it fills its box).
+    const tail = px(3.5 * cw, 9.5 * lh);
+    const filled = tail[0] > 180 && tail[1] < 60;
+    // The horizontal pair: every device column across their shared fractional
+    // edge must match the tiles' interior. A fractional edge leaves no
+    // background showing — both tiles blend half-coverage into the same
+    // column, which reads as a hairline of the WRONG SHADE — so compare
+    // against the interior colour rather than merely asking for "reddish".
+    // (Headless Firefox at dpr=1 has not been made to reproduce that blend
+    //  here; the assertion stands as the invariant the snapping guarantees.)
+    const ref = px(4 * cw, 13.5 * lh);
+    let seam = true;
+    for (let x = Math.round(3 * cw); x < Math.round(12 * cw); x++) {
+      const p = px(x, 13.5 * lh);
+      if (Math.abs(p[0] - ref[0]) > 12 || Math.abs(p[2] - ref[2]) > 12) seam = false;
+    }
+    document.getElementById("screen").style.display = "none";
+    const bits = (red ? 1 : 0) + (filled ? 2 : 0) + (seam ? 4 : 0);
+    document.body.style.background =
+      red && filled && seam ? "#00ff00" : `rgb(255, 0, ${bits})`;
+    document.title = "verified-ready";
+  });
+}
+
+// ?mode=imagemove: a placement that MOVES (same content address, new cell)
+// must leave nothing behind on the cells it left — the smear a moving floating
+// pane would show. Green/red convention.
+if (MODE === "imagemove") {
+  const blank = [];
+  for (let i = 0; i < ROWS; i++) blank.push([[pad("")]]);
+  const K = "ab".repeat(32);
+  apply({ d: blank, w: COLS, h: ROWS, i: [{ r: 1, c: 2, w: 6, h: 3, k: K }] });
+  benchFlush();
+  const img = document.querySelector("img.inline-img");
+  // Wait for the data: swap too: only a fully decoded predecessor is eligible
+  // to be held, so moving before that would prove nothing.
+  const loaded = () => new Promise((res) => {
+    const check = () => {
+      if (img.complete && img.naturalWidth && img.src.startsWith("data:")) res(null);
+    };
+    img.addEventListener("load", check);
+    check();
+  });
+  loaded().then(() => {
+    // Same picture, nudged one row down — a drag step, so the old and new
+    // rectangles overlap, which is when the bridge would kick in.
+    apply({ d: blank, w: COLS, h: ROWS, i: [{ r: 2, c: 2, w: 6, h: 3, k: K }] });
+    benchFlush();
+    benchRedraw();
+    const scr = document.querySelector("#screen .screen");
+    const canvas = document.querySelector("#screen canvas");
+    const g = canvas.getContext("2d");
+    const cw = (scr.getBoundingClientRect().width / COLS) * devicePixelRatio;
+    const lh = 17 * devicePixelRatio;
+    const px = (x, y) => g.getImageData(Math.round(x), Math.round(y), 1, 1).data;
+    const old = px(3.5 * cw, 1.5 * lh); // the row it left: must be clear
+    const gone = old[3] < 40 || (old[0] < 60 && old[1] < 60);
+    document.getElementById("screen").style.display = "none";
+    document.body.style.background = gone ? "#00ff00" : "#ff0000";
     document.title = "verified-ready";
   });
 }

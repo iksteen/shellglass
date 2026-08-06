@@ -7,6 +7,10 @@ const CONTENT_BYTES: usize = 22;
 
 const IS_WIDE: u8 = 0b1000_0000;
 const IS_WIDE_CONTINUATION: u8 = 0b0100_0000;
+// shellglass: the data slot survives text written into this cell (see
+// Cell::set_data). Rides a spare bit of `len` — the length itself needs 5 bits
+// for at most CONTENT_BYTES, so no carry can reach this one.
+const STICKY_DATA: u8 = 0b0010_0000;
 const LEN_BITS: u8 = 0b0001_1111;
 
 /// Represents a single terminal cell.
@@ -16,6 +20,10 @@ const LEN_BITS: u8 = 0b0001_1111;
 /// [`Screen::place_data`](crate::Screen::place_data); the slot dies with the
 /// cell's contents (overwrite/erase), so its lifetime rides the terminal's own
 /// cell semantics — shellglass stores its inline-image overlay tag here.
+/// A STICKY slot ([`PlaceOpts`](crate::PlaceOpts)) survives text written over
+/// the cell and dies only on erase, which is how kitty graphics placements
+/// behave (printing over one leaves the image alone) as opposed to a sixel,
+/// which the print erases.
 /// Equality deliberately ignores the slot: two cells that render identically
 /// are equal; the data is consumer metadata, not part of the picture.
 #[derive(Clone, Debug)]
@@ -29,7 +37,9 @@ const _: () = assert!(std::mem::size_of::<Cell<()>>() == 44);
 
 impl<T> PartialEq<Self> for Cell<T> {
     fn eq(&self, other: &Self) -> bool {
-        if self.len != other.len {
+        // shellglass: the sticky-data bit lives in `len` but is slot metadata,
+        // not picture — mask it out so equality still ignores the slot.
+        if self.len | STICKY_DATA != other.len | STICKY_DATA {
             return false;
         }
         if self.attrs != other.attrs {
@@ -57,8 +67,13 @@ impl<T> Cell<T> {
     }
 
     pub(crate) fn set(&mut self, c: char, a: crate::attrs::Attrs) {
-        self.len = 0;
-        self.data = None; // shellglass: overwriting text drops the data slot
+        // shellglass: overwriting text drops the data slot — unless the slot is
+        // sticky, which outlives everything but an erase.
+        let sticky = self.len & STICKY_DATA;
+        self.len = sticky;
+        if sticky == 0 {
+            self.data = None;
+        }
         self.append_char(0, c);
         // strings in this context should always be an arbitrary character
         // followed by zero or more zero-width characters, so we should only
@@ -89,11 +104,24 @@ impl<T> Cell<T> {
     }
 
     pub(crate) fn clear(&mut self, attrs: crate::attrs::Attrs) {
-        self.len = 0;
+        // shellglass: a sticky slot outlives an erase of the cell's text, the
+        // way kitty keeps a graphics placement through EL and a partial ED
+        // (only a whole-display erase drops its images — see `drop_data`).
+        let sticky = self.len & STICKY_DATA;
+        self.len = sticky;
         self.attrs = attrs;
         // shellglass: an erased cell keeps drawing attrs (bg) but must never
-        // be a clickable link, and erasing drops the data slot.
+        // be a clickable link, and erasing drops a non-sticky data slot.
         self.attrs.link = None;
+        if sticky == 0 {
+            self.data = None;
+        }
+    }
+
+    // shellglass: drop the data slot no matter how sticky it is — the wipe a
+    // whole-display erase performs (kitty's `grman_clear`).
+    pub(crate) fn drop_data(&mut self) {
+        self.len &= !STICKY_DATA;
         self.data = None;
     }
 
@@ -105,8 +133,14 @@ impl<T> Cell<T> {
     }
 
     // shellglass: stamp (or clear) the data slot without touching the cell's
-    // text or attributes — overlays draw *over* cells.
-    pub(crate) fn set_data(&mut self, data: Option<T>) {
+    // text or attributes — overlays draw *over* cells. `sticky` keeps the slot
+    // through text written into the cell (an erase still drops it).
+    pub(crate) fn set_data(&mut self, data: Option<T>, sticky: bool) {
+        if sticky && data.is_some() {
+            self.len |= STICKY_DATA;
+        } else {
+            self.len &= !STICKY_DATA;
+        }
         self.data = data;
     }
 

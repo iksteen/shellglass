@@ -60,6 +60,45 @@ fn overwrite_and_erase_kill_the_data() {
     assert_eq!(tag(&vt, 0, 2), None);
 }
 
+// shellglass: a STICKY slot outlives both text written into its cell and an
+// erase of that text — kitty's placement lifetime, where only a WHOLE-display
+// erase (`CSI 2 J`, its `grman_clear`) takes the images with it. It still
+// rides scrolling.
+#[test]
+fn sticky_data_survives_overwrite_and_line_erase() {
+    let sticky = vt100::PlaceOpts {
+        sticky: true,
+        ..Default::default()
+    };
+    let mut vt = parser(4, 10);
+    vt.screen_mut()
+        .place_data_with(4, 1, sticky, |dr, dc| (7, dr, dc));
+    vt.process(b"\x1b[1;1Hxy");
+    assert_eq!(tag(&vt, 0, 0), Some((7, 0, 0)), "overwrite keeps it");
+    assert_eq!(tag(&vt, 0, 1), Some((7, 0, 1)));
+    // An EL — what an emitter repainting a line under an image sends — keeps it.
+    vt.process(b"\x1b[1;3H\x1b[K");
+    assert_eq!(tag(&vt, 0, 2), Some((7, 0, 2)), "line erase keeps it");
+    // So does a PARTIAL display erase (ED 0/1).
+    vt.process(b"\x1b[1;1H\x1b[J\x1b[1J");
+    assert_eq!(tag(&vt, 0, 0), Some((7, 0, 0)), "partial ED keeps it");
+    // The whole-display erase is the one that takes images with it.
+    vt.process(b"\x1b[2J");
+    assert_eq!(tag(&vt, 0, 0), None);
+
+    // Re-stamped non-sticky, the slot goes back to dying on a write.
+    vt.screen_mut().place_data(2, 1, |dr, dc| (8, dr, dc));
+    vt.process(b"\x1b[1;1Hz");
+    assert_eq!(tag(&vt, 0, 0), None);
+
+    // A written-over sticky cell still rides a scroll.
+    vt.process(b"\x1b[2;1H");
+    vt.screen_mut()
+        .place_data_with(1, 1, sticky, |dr, dc| (9, dr, dc));
+    vt.process(b"\x1b[2;1Hq\x1b[4;1H\r\n"); // write over it, then scroll a line
+    assert_eq!(tag(&vt, 0, 0), Some((9, 0, 0)));
+}
+
 #[test]
 fn data_rides_scroll_and_line_edits() {
     let mut vt = parser(4, 10);
@@ -86,6 +125,28 @@ fn taller_than_screen_scrolls_while_placing() {
     assert_eq!(tag(&vt, 0, 0), Some((7, 2, 0)));
     assert_eq!(tag(&vt, 1, 0), Some((7, 3, 0)));
     assert_eq!(tag(&vt, 2, 0), Some((7, 4, 0)));
+}
+
+// shellglass: the held form (kitty `a=p,C=1`) stamps downwards from the cursor
+// without moving it and without scrolling — a region running past the last row
+// is clipped there, so a placement on the bottom rows can't shift the screen.
+#[test]
+fn held_placement_neither_moves_the_cursor_nor_scrolls() {
+    let mut vt = parser(3, 10);
+    vt.process(b"top\x1b[3;2H"); // last row, column 1
+    let held = vt100::PlaceOpts {
+        hold: true,
+        ..Default::default()
+    };
+    vt.screen_mut()
+        .place_data_with(2, 4, held, |dr, dc| (7, dr, dc));
+    assert_eq!(vt.screen().cursor_position(), (2, 1));
+    assert_eq!(vt.screen().contents(), "top", "nothing scrolled off");
+    assert_eq!(tag(&vt, 2, 1), Some((7, 0, 0)));
+    assert_eq!(tag(&vt, 2, 2), Some((7, 0, 1)));
+    // Rows 1-3 of the region fell off the bottom edge; nothing wrapped.
+    assert_eq!(tag(&vt, 0, 1), None);
+    assert_eq!(tag(&vt, 1, 1), None);
 }
 
 #[test]

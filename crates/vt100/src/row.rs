@@ -33,6 +33,16 @@ impl<T> Row<T> {
         self.wrapped = false;
     }
 
+    // shellglass: clear, and drop even the sticky data slots (see
+    // `Cell::drop_data`).
+    pub fn clear_with_data(&mut self, attrs: crate::attrs::Attrs) {
+        for cell in &mut self.cells {
+            cell.clear(attrs);
+            cell.drop_data();
+        }
+        self.wrapped = false;
+    }
+
     fn cells(&self) -> impl Iterator<Item = &crate::Cell<T>> {
         self.cells.iter()
     }
