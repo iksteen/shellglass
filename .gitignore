@@ -2,3 +2,4 @@
 /.env
 /rewatch.toml
 /.rewatch-trigger
+__pycache__/
