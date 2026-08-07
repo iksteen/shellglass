@@ -141,15 +141,19 @@ pub async fn run(
                 }
                 ws
             }
-            Err(ConnErr::Forbidden) => bail!(
-                "hub rejected this key: register its session id on the hub \
-                 (run `print-id --key <secret>`, add it to the hub's --allow)"
-            ),
+            Err(ConnErr::Forbidden) => {
+                return Err(fatal(
+                    sink_status,
+                    "hub rejected this key: register its session id on the hub \
+                     (run `print-id --key <secret>`, add it to the hub's --allow)"
+                        .to_string(),
+                ));
+            }
             // Wire-protocol mismatch (HTTP 426): fatal like a bad key — retrying
             // can't reconcile versions, the operator must upgrade a side. The
             // message is our own literals + integers + a NEUTERED hub version, so
             // it is control-char-free and length-bounded (see `incompat_message`).
-            Err(ConnErr::Incompatible(msg)) => bail!("{msg}"),
+            Err(ConnErr::Incompatible(msg)) => return Err(fatal(sink_status, msg)),
             Err(ConnErr::Retry(cause)) => {
                 if !down {
                     report_down(sink_status, cause);
@@ -178,6 +182,27 @@ pub async fn run(
         }
     }
     Ok(())
+}
+
+/// A hub failure retrying can't fix (a rejected key, a wire skew). Hands the
+/// terminal back before the error propagates.
+///
+/// Before any source starts, `sink_status` is `None` and this is a clean exit —
+/// the terminal is still cooked and the caller sees what it always did. Once one
+/// is live (immediately under `eager_start`, or after a successful connect that a
+/// later reconnect gets 403'd on), the command is running in raw mode and `run` is
+/// about to return to a caller that has no way to stop it: announce through the
+/// same pause the notifier uses for an outage, so exiting on the error leaves a
+/// usable terminal behind instead of a raw one. A `passive` source deliberately
+/// owns that decision itself and stays untouched — same contract as an outage.
+///
+/// `msg` is our own literals plus, for a 426, a neutered hub version — the same
+/// guarantee [`report_down`] relies on for anything reaching a raw terminal.
+fn fatal(sink_status: Option<&dyn SinkStatus>, msg: String) -> anyhow::Error {
+    if let Some(status) = sink_status {
+        status.hub_down(&msg);
+    }
+    anyhow::anyhow!(msg)
 }
 
 /// Report the hub as down: pause+announce in the terminal (PTY running) or log to
@@ -564,6 +589,33 @@ mod tests {
         // Missing bounds (e.g. the header-less classify path) → generic message.
         assert!(!generic_incompat_message().chars().any(char::is_control));
         assert!(incompat_message(&HeaderMap::new()).contains("426"));
+    }
+
+    // A permanent failure with a live source must hand the terminal back before the
+    // error escapes — otherwise a caller that exits on it (the CLI does) leaves the
+    // command running in raw mode. Before any source exists there is nothing to hand
+    // back and the behavior is unchanged.
+    #[test]
+    fn fatal_pauses_a_live_terminal_before_returning() {
+        use crate::source::SinkStatus;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Spy(Mutex<Vec<String>>);
+        impl SinkStatus for Spy {
+            fn hub_down(&self, reason: &str) {
+                self.0.lock().unwrap().push(reason.to_string());
+            }
+        }
+
+        let spy = Spy::default();
+        let err = super::fatal(Some(&spy), "hub rejected this key".to_string());
+        assert_eq!(spy.0.lock().unwrap().as_slice(), ["hub rejected this key"]);
+        assert_eq!(err.to_string(), "hub rejected this key");
+
+        // No source yet: nothing to announce to, same error out.
+        let err = super::fatal(None, "hub rejected this key".to_string());
+        assert_eq!(err.to_string(), "hub rejected this key");
     }
 
     #[test]

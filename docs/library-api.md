@@ -51,7 +51,13 @@ SSE and SSH viewers, stops source-forwarding tasks, and flushes an active
 recording before returning, so the same runtime can start another server.
 
 For a hub, `api::push` takes the same source factory and a `PushOptions`. The
-factory is invoked only after the authenticated WebSocket upgrade succeeds.
+factory is invoked only after the authenticated WebSocket upgrade succeeds, so a
+down or misconfigured hub is reported before the source starts. Set
+`eager_start` to invoke it immediately instead, for an embedder whose source is
+the point whether or not a hub is ever reachable — registering and streaming
+then happen entirely in the background. A source that owns a terminal will still
+pause and announce it during an outage; `pty::start`'s `passive` flag turns that
+off for an embedder that manages its own terminal.
 
 Library-only Cargo features avoid compiling the built-in PTY producer:
 

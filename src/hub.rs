@@ -754,7 +754,8 @@ impl HubState {
     /// The `Live` publisher for a public view slug, if a client has registered the
     /// session it names. Used by the SSH viewer to resolve `ssh <slug>@hub` to the
     /// session's frames (an un-aliased session's slug is its own id, so
-    /// `ssh <id>@hub` still works).
+    /// `ssh <id>@hub` still works), and public so an embedder hosting its own hub
+    /// can reach a session's frames the same way.
     pub fn live(&self, slug: &str) -> Option<Arc<diff::Live>> {
         let id = self.id_of_view(slug)?;
         let map = self.sessions.lock().unwrap();
